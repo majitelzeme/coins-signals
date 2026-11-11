@@ -39,7 +39,7 @@ function fmtPrice(p) {
 const fmtPct = v => v == null || !isFinite(v) ? '—' : (v >= 0 ? '+' : '') + v.toFixed(2) + '%';
 const pctCls = v => v >= 0 ? 'up' : 'dn';
 function fmtBig(n) { if (!n) return '—'; const u = [[1e12,'T'],[1e9,'B'],[1e6,'M'],[1e3,'K']]; for (const [v, s] of u) if (n >= v) return '$' + (n / v).toFixed(2) + s; return '$' + n.toFixed(0); }
-function timeAgo(ts) { const s = Math.round((Date.now() - ts) / 1000); if (s < 10) return 'just now'; if (s < 60) return s + 's ago'; if (s < 3600) return Math.round(s / 60) + ' min ago'; return Math.round(s / 3600) + ' h ago'; }
+function timeAgo(ts) { const s = Math.round((Date.now() - ts) / 1000); if (s < 10) return 'just now'; if (s < 60) return s + 's ago'; if (s < 3600) return Math.round(s / 60) + ' min ago'; if (s < 172800) return Math.round(s / 3600) + ' h ago'; return Math.round(s / 86400) + ' d ago'; }
 function toast(msg, ms = 3200) { const t = $('#toast'); t.textContent = msg; t.hidden = false; clearTimeout(toast._t); toast._t = setTimeout(() => t.hidden = true, ms); }
 class HttpError extends Error { constructor(status, url) { super('HTTP ' + status); this.status = status; this.url = url; } }
 async function getJSON(url, timeout = 12000) {
@@ -138,7 +138,7 @@ function analyze(closes, barsPerDay = 24) {
 }
 
 // ---------- data ----------
-const state = { coins: [], ts: 0, source: '', stale: false, filter: 'all', q: '', sort: 'score', loading: false, tf: '7d' };
+const state = { err: null, coins: [], ts: 0, source: '', stale: false, filter: 'all', q: '', sort: 'score', loading: false, tf: '7d' };
 const favs = () => ls.get('favs', []);
 const isFav = id => favs().includes(id);
 function toggleFav(id) { const f = favs(); const i = f.indexOf(id); i >= 0 ? f.splice(i, 1) : f.unshift(id); ls.set('favs', f); return i < 0; }
@@ -146,7 +146,7 @@ function toggleFav(id) { const f = favs(); const i = f.indexOf(id); i >= 0 ? f.s
 function enrich(c) {
   const sig = c.spark && c.spark.length >= 55 ? analyze(c.spark, 24) : null;
   if (sig) delete sig.series; // keep list lean
-  return { ...c, sig };
+  const out = { ...c, sig }; out.swing = swingSignal(out); return out;
 }
 async function fromCoinGecko() {
   const url = `${CG}/coins/markets?vs_currency=usd&category=meme-token&order=market_cap_desc&per_page=${PER_PAGE}&page=1&sparkline=true&price_change_percentage=24h,7d`;
@@ -215,7 +215,7 @@ const badge = s => s ? `<span class="badge b-${s.code}">${s.label}</span>` : '<s
 const barColor = s => !s ? 'transparent' : ({ SB: 'var(--sb)', B: 'var(--b)', H: 'transparent', S: 'var(--s)', SS: 'var(--ss)' })[s.code];
 function sparkSVG(a, w = 64, h = 24) {
   if (!a || a.length < 2) return ''; const step = Math.max(1, Math.floor(a.length / 48)); const pts = a.filter((_, i) => i % step === 0 || i === a.length - 1);
-  const mn = Math.min(...pts), mx = Math.max(...pts), rg = mx - mn || 1; const col = pts[pts.length - 1] >= pts[0] ? '#2ee6a0' : '#ff5470';
+  const mn = Math.min(...pts), mx = Math.max(...pts), rg = mx - mn || 1; const col = pts[pts.length - 1] >= pts[0] ? '#32d074' : '#ff5a52';
   const d = pts.map((v, i) => `${(i / (pts.length - 1) * w).toFixed(1)},${(h - 2 - (v - mn) / rg * (h - 4)).toFixed(1)}`).join(' ');
   return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><polyline points="${d}" fill="none" stroke="${col}" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/></svg>`;
 }
@@ -228,10 +228,10 @@ function rowHTML(c) {
     <div class="rt"><div style="display:flex;gap:8px;align-items:center">${sparkSVG(c.spark)}<span class="px">${fmtPrice(c.price)}</span></div>
       <div style="display:flex;gap:6px;align-items:center"><span class="chg ${pctCls(c.ch24)}">${fmtPct(c.ch24)}</span>${badge(s)}</div></div></a>`;
 }
-const DISCLAIMER = `<div class="disclaimer"><b>Not financial advice.</b> Signals are automated technical indicators (RSI, moving averages, MACD, momentum) computed from past prices. They can be wrong, especially in volatile markets. Memecoins are extremely volatile. Do your own research and never invest more than you can afford to lose.</div>`;
+const DISCLAIMER = `<div class="disclaimer"><b>Not financial advice. Nothing here predicts price.</b> Memecoins are extremely risky and many fresh tokens are rugs or scams that go to zero. Scores are automated momentum, buy-pressure and indicator readings from past data and are often wrong. Do your own research and only risk money you can afford to lose completely.</div>`;
 function metaHTML() {
-  return `<div class="meta"><span class="live"><span class="dot ${state.stale ? 'stale' : ''}"></span>${state.ts ? 'Updated ' + timeAgo(state.ts) : 'Loading…'} · ${esc(state.source || '')}</span>
-    <button class="chip" id="sortBtn" style="padding:4px 10px;font-size:12px">Sort: ${({ score: 'Signal', rank: 'Market cap', ch24: '24h %' })[state.sort]}</button></div>`;
+  return `<div class="meta"><span class="live"><span class="dot ${state.stale ? 'stale' : ''}"></span><span class="upd" data-ts="${state.ts || ''}">${state.ts ? 'Updated ' + timeAgo(state.ts) : 'Loading…'}</span>&nbsp;· ${esc(state.source || '')}</span>
+    <button class="chip sm" id="sortBtn" >Sort: ${({ score: 'Swing', rank: 'Market cap', ch24: '24h %' })[state.sort]}</button></div>`;
 }
 function sorted(list) {
   const l = [...list];
@@ -243,66 +243,466 @@ function sorted(list) {
 function skeleton(n = 8) { return '<div class="list">' + Array.from({ length: n }, () => '<div class="skel"></div>').join('') + '</div>'; }
 function bindSort() { const b = $('#sortBtn'); if (b) b.onclick = () => { state.sort = ({ score: 'rank', rank: 'ch24', ch24: 'score' })[state.sort]; ls.set('sort', state.sort); render(); }; }
 
+
+// ---------- DEX data (DexScreener + GeckoTerminal, keyless) ----------
+const DS = 'https://api.dexscreener.com';
+const GT = 'https://api.geckoterminal.com/api/v2';
+const FAST_TTL = 45 * 1000, FAST_REFRESH = 60 * 1000, LIVE_REFRESH = 20 * 1000, PAIR_TTL = 60 * 1000;
+const FAST_CHAINS = ['solana', 'base', 'bsc', 'ethereum'];
+const GT_NET = { solana: 'solana', base: 'base', bsc: 'bsc', eth: 'ethereum' };
+const CHAIN_LABEL = { solana: 'SOL', base: 'BASE', bsc: 'BSC', ethereum: 'ETH', arbitrum: 'ARB', polygon: 'POL', avalanche: 'AVAX', ton: 'TON', sui: 'SUI', tron: 'TRX', hyperliquid: 'HYPE', robinhood: 'HOOD', elysium: 'ELYS', abstract: 'ABS', monad: 'MON' };
+const chainName = c => CHAIN_LABEL[c] || String(c || '').toUpperCase().slice(0, 6);
+// quote / major tokens that are never "fresh memecoins"
+const NOT_MEME = new Set(['so11111111111111111111111111111111111111112', 'epjfwdd5aufqssqem2qn1xzybapc8g4wegggkzwytdt1v', 'es9vmfrzacermjfrf4h2fyd4kconky11mcce8benwnyb',
+  '0x4200000000000000000000000000000000000006', '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c', '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2',
+  '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913', '0x55d398326f99059ff775485246999027b3197955', '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d',
+  '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48', '0xdac17f958d2ee523a2206206994597c13d831ec7']);
+const dexIcon = i => !i ? '' : /^https?:/.test(i) ? i : `https://cdn.dexscreener.com/cms/images/${encodeURIComponent(i)}?width=64&height=64&fit=crop&quality=95&format=auto`;
+const tkey = (chain, addr) => chain + ':' + String(addr).toLowerCase();
+function fmtAge(ms) { if (!ms || ms < 0) return '—'; const m = ms / 60000; if (m < 60) return Math.max(1, Math.round(m)) + 'm'; const h = m / 60; if (h < 48) return (h < 10 ? h.toFixed(1) : Math.round(h)) + 'h'; return Math.round(h / 24) + 'd'; }
+const shortAddr = a => a && a.length > 12 ? a.slice(0, 4) + '…' + a.slice(-4) : a || '';
+const buysSells = t => ({ b: (t && t.buys) || 0, s: (t && t.sells) || 0 });
+const buyRatio = t => { const { b, s } = buysSells(t); return b + s ? b / (b + s) : 0.5; };
+
+async function dsTokens(chain, addrs) {
+  const out = [];
+  for (let i = 0; i < addrs.length; i += 30) {
+    try { const d = await getJSON(`${DS}/tokens/v1/${encodeURIComponent(chain)}/${addrs.slice(i, i + 30).join(',')}`); if (Array.isArray(d)) out.push(...d); }
+    catch (e) { console.warn('dexscreener tokens', chain, e.message); }
+  }
+  return out;
+}
+const pairCache = new Map(); // key -> {pair, ts}
+/** Best (most liquid) pair for each requested token. tokens: [{chain, addr}] */
+async function pairsFor(tokens, maxAge = PAIR_TTL) {
+  const want = new Set(tokens.map(t => tkey(t.chain, t.addr)));
+  const by = {};
+  tokens.forEach(t => { const c = pairCache.get(tkey(t.chain, t.addr)); if (!c || Date.now() - c.ts > maxAge) (by[t.chain] ||= new Set()).add(t.addr); });
+  const res = await Promise.all(Object.entries(by).map(([ch, s]) => dsTokens(ch, [...s])));
+  const best = new Map();
+  for (const p of res.flat()) {
+    if (!p || !p.baseToken) continue; const k = tkey(p.chainId, p.baseToken.address); if (!want.has(k)) continue;
+    const q = best.get(k); if (!q || ((p.liquidity && p.liquidity.usd) || 0) > ((q.liquidity && q.liquidity.usd) || 0)) best.set(k, p);
+  }
+  best.forEach((p, k) => pairCache.set(k, { pair: p, ts: Date.now() }));
+  const out = new Map(); want.forEach(k => { const c = pairCache.get(k); if (c) out.set(k, c.pair); });
+  return out;
+}
+function pairLinks(p, extra) {
+  const info = (p && p.info) || {}; const L = [];
+  (info.socials || []).forEach(s => L.push({ type: s.type || s.platform || 'link', url: s.url }));
+  (info.websites || []).forEach(w => L.push({ type: 'website', url: w.url, label: w.label }));
+  (extra || []).forEach(l => { if (l && l.url && !L.some(x => x.url === l.url)) L.push({ type: l.type || (/(^|\.)(x|twitter)\.com/i.test(l.url) ? 'twitter' : 'website'), url: l.url, label: l.label }); });
+  return L.filter(l => /^https?:\/\//i.test(l.url));
+}
+const xHandle = url => { const m = /(?:x|twitter)\.com\/(?:#!\/)?@?([A-Za-z0-9_]{1,15})(?:[/?#]|$)/i.exec(url || ''); return m && !/^(i|home|search|intent|share)$/i.test(m[1]) ? m[1] : null; };
+function linksHTML(links, compact) {
+  return links.slice(0, 5).map(l => {
+    const h = l.type === 'twitter' ? xHandle(l.url) : null;
+    const txt = l.type === 'twitter' ? (h ? '𝕏 @' + h : '𝕏') : l.type === 'telegram' ? 'Telegram' : l.type === 'discord' ? 'Discord' : l.type === 'website' ? (compact ? 'Web' : 'Website') : (l.label || l.type);
+    return `<a class="lk ${l.type === 'twitter' ? 'x' : ''}" href="${esc(l.url)}" target="_blank" rel="noopener noreferrer">${esc(txt)}</a>`;
+  }).join('');
+}
+
+// ---------- Fast: momentum + buy pressure scanner ----------
+/**
+ * Momentum score 0–100 (50 = neutral). Raw points:
+ *   Momentum   ±30 : 5m (±8, 5% = full), 1h (±14, 25% = full), 6h (±8, 60% = full)
+ *   Buy pressure ±30 : buy share of txns in 5m (±12) and 1h (±18)
+ *   Turnover   0–20 : 1h volume / liquidity (50% = full)
+ *   Activity   0–10 : 1h txn count (log scale, 1000 = full)
+ *   Buzz       0–10 : DexScreener boost (+6), socials listed (+4)
+ */
+function fastScore(p) {
+  const pc = p.priceChange || {}, tx = p.txns || {}, v = p.volume || {}, liq = (p.liquidity && p.liquidity.usd) || 0;
+  const m5 = +pc.m5 || 0, h1 = +pc.h1 || 0, h6 = +pc.h6 || 0;
+  const F = [];
+  const mom = clamp(m5 / 5, -1, 1) * 8 + clamp(h1 / 25, -1, 1) * 14 + clamp(h6 / 60, -1, 1) * 8;
+  F.push({ k: 'Momentum', pts: +mom.toFixed(1), txt: `Price ${fmtPct(m5)} 5m · ${fmtPct(h1)} 1h · ${fmtPct(h6)} 6h` });
+  const r5 = buyRatio(tx.m5), r1 = buyRatio(tx.h1);
+  const bp = (r5 - 0.5) * 2 * 12 + (r1 - 0.5) * 2 * 18;
+  F.push({ k: 'Buy pressure', pts: +bp.toFixed(1), txt: `Buys ${Math.round(r1 * 100)}% of 1h trades, ${Math.round(r5 * 100)}% of 5m` });
+  const turn = liq ? (v.h1 || 0) / liq : 0; const vl = clamp(turn / 0.5, 0, 1) * 20;
+  F.push({ k: 'Volume', pts: +vl.toFixed(1), txt: `1h volume ${fmtBig(v.h1 || 0)} = ${(turn * 100).toFixed(0)}% of liquidity` });
+  const n1 = buysSells(tx.h1).b + buysSells(tx.h1).s; const act = clamp(Math.log10(n1 + 1) / 3, 0, 1) * 10;
+  F.push({ k: 'Activity', pts: +act.toFixed(1), txt: `${n1.toLocaleString('en-US')} trades in the last hour` });
+  const hasSoc = ((p.info && p.info.socials) || []).length > 0; const boosted = (p.boosts && p.boosts.active) || 0;
+  const buzz = (boosted ? 6 : 0) + (hasSoc ? 4 : 0);
+  F.push({ k: 'Buzz', pts: buzz, txt: (boosted ? `Boosted on DexScreener (${boosted})` : 'Not boosted') + (hasSoc ? ', socials listed' : ', no socials listed') });
+  const raw = mom + bp + vl + act + buzz;
+  const score = Math.round(clamp((raw + 60) / 160 * 100, 0, 100));
+  const [label, code] = score >= 70 ? ['🔥 HOT', 'SB'] : score >= 57 ? ['HEATING UP', 'B'] : score > 43 ? ['MIXED', 'H'] : score > 30 ? ['COOLING', 'S'] : ['DUMPING', 'SS'];
+  return { score, label, code, factors: F };
+}
+/** Risk points → HIGH / VERY HIGH / EXTREME (a fresh memecoin is never "low risk"). */
+function fastRisk(p, now = Date.now()) {
+  const pc = p.priceChange || {}, tx = p.txns || {}, liq = (p.liquidity && p.liquidity.usd) || 0, fdv = p.fdv || p.marketCap || 0;
+  let pts = 0; const why = [];
+  const ageH = p.pairCreatedAt ? (now - p.pairCreatedAt) / 36e5 : 999;
+  if (ageH < 1) { pts += 3; why.push('under 1 hour old'); } else if (ageH < 6) { pts += 2; why.push('under 6 hours old'); } else if (ageH < 24) { pts += 1; why.push('under 1 day old'); }
+  if (liq < 30e3) { pts += 3; why.push('very thin liquidity'); } else if (liq < 75e3) { pts += 2; why.push('thin liquidity'); } else if (liq < 200e3) { pts += 1; why.push('modest liquidity'); }
+  const fl = liq ? fdv / liq : 99;
+  if (fl > 50) { pts += 3; why.push(`FDV is ${fl.toFixed(0)}× liquidity`); } else if (fl > 20) { pts += 2; why.push(`FDV is ${fl.toFixed(0)}× liquidity`); } else if (fl > 10) { pts += 1; why.push(`FDV is ${fl.toFixed(0)}× liquidity`); }
+  const t1 = buysSells(tx.h1); if (t1.s > t1.b * 1.3) { pts += 2; why.push('more sells than buys (1h)'); }
+  if ((+pc.m5 || 0) < -10 || (+pc.h1 || 0) < -25) { pts += 2; why.push('sharp drop in progress'); }
+  if ((+pc.h1 || 0) > 200 || (+pc.h6 || 0) > 500) { pts += 1; why.push('parabolic move, pullbacks are violent'); }
+  if (!((p.info && p.info.socials) || []).length) { pts += 2; why.push('no socials listed'); }
+  const [label, cls] = pts >= 8 ? ['EXTREME', 'rx'] : pts >= 4 ? ['VERY HIGH', 'rv'] : ['HIGH', 'rh'];
+  return { pts, label, cls, why, ageH };
+}
+const riskBadge = r => `<span class="risk ${r.cls}">⚠ ${r.label}</span>`;
+function fastPlan(p, risk) {
+  const price = +p.priceUsd; if (!price) return null;
+  const sp = risk.label === 'EXTREME' ? 0.25 : risk.label === 'VERY HIGH' ? 0.2 : 0.15;
+  return { price, stop: price * (1 - sp), tp1: price * (1 + sp * 1.5), tp2: price * (1 + sp * 3), sp };
+}
+const fast = { items: [], ts: 0, loading: false, err: null, age: 72, chain: 'all', sort: 'score' };
+function toFastItem(p, meta) {
+  const s = fastScore(p), r = fastRisk(p);
+  return { key: tkey(p.chainId, p.baseToken.address), chain: p.chainId, addr: p.baseToken.address, name: p.baseToken.name, symbol: p.baseToken.symbol,
+    icon: (p.info && p.info.imageUrl) || dexIcon(meta && meta.icon), pair: p, sig: s, risk: r, src: (meta && meta.src) || [] };
+}
+async function loadFast(force = false) {
+  const c = ls.get('fast');
+  if (!force && c && Date.now() - c.ts < FAST_TTL) { fast.items = c.items.map(i => toFastItem(i.pair, i)); fast.ts = c.ts; return; }
+  const meta = new Map();
+  const add = (chain, addr, src, extra) => {
+    if (!FAST_CHAINS.includes(chain) || !addr || NOT_MEME.has(String(addr).toLowerCase())) return;
+    const k = tkey(chain, addr); const m = meta.get(k) || { chain, addr, src: [] };
+    if (!m.src.includes(src)) m.src.push(src); if (extra && extra.icon && !m.icon) m.icon = extra.icon; meta.set(k, m);
+  };
+  const [prof, bl, bt, g1, g2] = await Promise.allSettled([
+    getJSON(DS + '/token-profiles/latest/v1'), getJSON(DS + '/token-boosts/latest/v1'), getJSON(DS + '/token-boosts/top/v1'),
+    getJSON(GT + '/networks/trending_pools?duration=1h&include=base_token'), getJSON(GT + '/networks/trending_pools?duration=6h&include=base_token')]);
+  if (prof.value) prof.value.forEach(x => add(x.chainId, x.tokenAddress, 'new profile', x));
+  if (bl.value) bl.value.forEach(x => add(x.chainId, x.tokenAddress, 'boosted', x));
+  if (bt.value) bt.value.forEach(x => add(x.chainId, x.tokenAddress, 'top boosted', x));
+  [g1, g2].forEach(g => g.value && (g.value.data || []).forEach(pl => {
+    const id = pl.relationships && pl.relationships.base_token && pl.relationships.base_token.data && pl.relationships.base_token.data.id; if (!id) return;
+    const net = id.slice(0, id.indexOf('_')), addr = id.slice(id.indexOf('_') + 1); if (GT_NET[net]) add(GT_NET[net], addr, 'trending');
+  }));
+  if (!meta.size) {
+    if (c) { fast.items = c.items.map(i => toFastItem(i.pair, i)); fast.ts = c.ts; toast('Offline or rate-limited — showing cached fresh coins'); return; }
+    throw new Error('Could not reach DexScreener / GeckoTerminal');
+  }
+  const pairs = await pairsFor([...meta.values()], FAST_TTL);
+  const items = [];
+  pairs.forEach((p, k) => { if (p && +p.priceUsd > 0 && p.pairCreatedAt) items.push(toFastItem(p, meta.get(k))); });
+  fast.items = items; fast.ts = Date.now();
+  ls.set('fast', { ts: fast.ts, items: items.map(i => ({ pair: i.pair, icon: i.icon, src: i.src })) });
+}
+function fastVisible() {
+  const now = Date.now();
+  let l = fast.items.filter(i => ((i.pair.liquidity && i.pair.liquidity.usd) || 0) >= 20e3 && ((i.pair.volume && i.pair.volume.h24) || 0) >= 10e3);
+  if (fast.age) l = l.filter(i => now - i.pair.pairCreatedAt < fast.age * 36e5);
+  if (fast.chain !== 'all') l = l.filter(i => i.chain === fast.chain);
+  const by = { score: (a, b) => b.sig.score - a.sig.score, h1: (a, b) => (+b.pair.priceChange.h1 || 0) - (+a.pair.priceChange.h1 || 0), age: (a, b) => b.pair.pairCreatedAt - a.pair.pairCreatedAt, risk: (a, b) => a.risk.pts - b.risk.pts };
+  return l.sort(by[fast.sort] || by.score);
+}
+function fastRowHTML(i) {
+  const p = i.pair, pc = p.priceChange || {}, t1 = buysSells(p.txns && p.txns.h1), now = Date.now();
+  return `<a class="row frow" href="#/t/${encodeURIComponent(i.chain)}/${encodeURIComponent(i.addr)}"><span class="bar" style="background:${barColor(i.sig)}"></span>
+    ${avatar({ symbol: i.symbol, image: i.icon })}
+    <div class="nm"><div class="t"><span class="nmx">${esc(i.symbol)}</span><span class="ch">${chainName(i.chain)}</span><span class="age">${fmtAge(now - p.pairCreatedAt)}</span></div>
+      <div class="r">Liq ${fmtBig(p.liquidity && p.liquidity.usd)} · MC ${fmtBig(p.marketCap || p.fdv)} · <span class="up">${t1.b}</span>/<span class="dn">${t1.s}</span> b/s 1h</div>
+      <div class="pcs"><span class="${pctCls(+pc.m5)}">5m ${fmtPct(+pc.m5)}</span><span class="${pctCls(+pc.h1)}">1h ${fmtPct(+pc.h1)}</span><span class="${pctCls(+pc.h24)}">24h ${fmtPct(+pc.h24)}</span></div></div>
+    <div class="rt"><span class="px">${fmtPrice(+p.priceUsd)}</span>${badge(i.sig)}${riskBadge(i.risk)}</div></a>`;
+}
+function renderFast() {
+  if (!fast.ts) { app.innerHTML = fast.err ? errHTML(fast.err) : skeleton(); return; }
+  const l = fastVisible();
+  const chains = ['all', ...FAST_CHAINS.filter(c => fast.items.some(i => i.chain === c))];
+  app.innerHTML = `<div class="intro">⚡ <b>Fast flips</b> · fresh pairs (minutes–hours trades) ranked by momentum, buy pressure and volume. Liquidity ≥ $20K. Not predictions.</div>
+    <div class="chips">${[[6, '< 6h'], [24, '< 24h'], [72, '< 72h'], [0, 'Any age']].map(([a, t]) => `<button class="chip ${fast.age === a ? 'on' : ''}" data-age="${a}">${t}</button>`).join('')}</div>
+    <div class="chips">${chains.map(c => `<button class="chip sm ${fast.chain === c ? 'on' : ''}" data-ch="${c}">${c === 'all' ? 'All chains' : chainName(c)}</button>`).join('')}</div>
+    <div class="meta"><span class="live"><span class="dot"></span><span class="upd" data-ts="${fast.ts}">Updated ${timeAgo(fast.ts)}</span> · ${l.length} coins</span>
+      <button class="chip sm" id="fsort">Sort: ${({ score: 'Momentum', h1: '1h %', age: 'Newest', risk: 'Lowest risk' })[fast.sort]}</button></div>
+    <div class="list">${l.map(fastRowHTML).join('') || `<div class="empty">No fresh coins pass the filters right now.<br>Try a longer age window.</div>`}</div>
+    ${DISCLAIMER}`;
+  app.querySelectorAll('[data-age]').forEach(b => b.onclick = () => { fast.age = +b.dataset.age; ls.set('fastAge', fast.age); renderFast(); });
+  app.querySelectorAll('[data-ch]').forEach(b => b.onclick = () => { fast.chain = b.dataset.ch; renderFast(); });
+  $('#fsort').onclick = () => { fast.sort = ({ score: 'h1', h1: 'age', age: 'risk', risk: 'score' })[fast.sort]; ls.set('fastSort', fast.sort); renderFast(); };
+}
+
+// ---------- Live feed (J7Tracker-style) ----------
+const live = { items: ls.get('live', []), ts: 0, loading: false, err: null, chain: 'all', boot: Date.now(), fresh: new Set() };
+async function loadLive() {
+  const [pr, bo] = await Promise.allSettled([getJSON(DS + '/token-profiles/latest/v1'), getJSON(DS + '/token-boosts/latest/v1')]);
+  if (!pr.value && !bo.value) { if (live.items.length) { toast('Live feed offline — retrying'); return; } throw new Error('Could not reach DexScreener'); }
+  const now = Date.now(); const map = new Map(live.items.map(i => [i.key, i])); const firstLoad = !live.items.length;
+  const incoming = [];
+  (pr.value || []).forEach(x => incoming.push({ x, kind: 'new' }));
+  (bo.value || []).forEach(x => incoming.push({ x, kind: 'boost' }));
+  incoming.forEach(({ x, kind }, idx) => {
+    if (!x || !x.tokenAddress) return; const k = tkey(x.chainId, x.tokenAddress); let it = map.get(k);
+    if (!it) { it = { key: k, chain: x.chainId, addr: x.tokenAddress, seen: now - idx * 1000, kinds: [] }; map.set(k, it); if (!firstLoad) live.fresh.add(k); }
+    else if (kind === 'boost' && x.amount && x.totalAmount && x.totalAmount !== it.boostTotal && !firstLoad) { it.seen = now; live.fresh.add(k); }
+    if (!it.kinds.includes(kind)) it.kinds.push(kind);
+    if (x.icon) it.icon = dexIcon(x.icon); if (x.description) it.desc = x.description; if (x.links) it.links = x.links; if (x.url) it.url = x.url;
+    if (kind === 'boost') { it.boost = x.amount || it.boost; it.boostTotal = x.totalAmount || it.boostTotal; }
+  });
+  live.items = [...map.values()].sort((a, b) => b.seen - a.seen).slice(0, 120);
+  // pair stats for the newest 60
+  try {
+    const pairs = await pairsFor(live.items.slice(0, 60), PAIR_TTL);
+    live.items.forEach(i => { const p = pairs.get(i.key); if (p) { i.p = { price: +p.priceUsd, liq: p.liquidity && p.liquidity.usd, mc: p.marketCap || p.fdv, h1: p.priceChange && p.priceChange.h1, m5: p.priceChange && p.priceChange.m5, created: p.pairCreatedAt, name: p.baseToken.name, symbol: p.baseToken.symbol, url: p.url, img: p.info && p.info.imageUrl, tx: p.txns && p.txns.h1 }; } });
+  } catch (e) { console.warn('live pairs', e); }
+  live.ts = Date.now();
+  ls.set('live', live.items.map(i => ({ ...i })));
+}
+function liveCardHTML(i, now) {
+  const p = i.p || {}; const sym = p.symbol || shortAddr(i.addr); const links = pairLinks(null, i.links);
+  const t = buysSells(p.tx); const isNew = live.fresh.has(i.key);
+  return `<div class="lcard ${isNew ? 'new' : ''}" data-k="${esc(i.key)}">
+    <div class="lhead">${avatar({ symbol: sym, image: i.icon || p.img })}
+      <a class="lt" href="#/t/${encodeURIComponent(i.chain)}/${encodeURIComponent(i.addr)}"><div class="t"><b>${esc(sym)}</b>${p.name ? `<span class="sub">${esc(p.name)}</span>` : ''}</div>
+        <div class="tags"><span class="ch">${chainName(i.chain)}</span>${i.kinds.includes('boost') ? `<span class="tag boost">⚡ Boost${i.boostTotal ? ' ' + i.boostTotal : ''}</span>` : ''}${i.kinds.includes('new') ? '<span class="tag np">New profile</span>' : ''}<span class="seen" data-seen="${i.seen}">${timeAgo(i.seen)}</span></div></a>
+      <button class="cp" data-ca="${esc(i.addr)}" aria-label="Copy contract address">CA</button></div>
+    ${i.desc ? `<div class="desc">${esc(i.desc)}</div>` : ''}
+    ${i.p ? `<div class="lstats"><span>${fmtPrice(p.price)}</span><span>Liq ${fmtBig(p.liq)}</span><span>MC ${fmtBig(p.mc)}</span><span class="${pctCls(+p.h1)}">1h ${fmtPct(+p.h1)}</span><span>Age ${fmtAge(now - p.created)}</span>${p.tx ? `<span><span class="up">${t.b}</span>/<span class="dn">${t.s}</span></span>` : ''}</div>` : '<div class="lstats"><span class="mut">loading pair stats…</span></div>'}
+    <div class="links">${linksHTML(links, true)}<a class="lk" href="${esc(i.url || 'https://dexscreener.com/' + i.chain + '/' + i.addr)}" target="_blank" rel="noopener noreferrer">Chart</a></div></div>`;
+}
+function renderLive() {
+  if (!live.items.length) { app.innerHTML = live.err ? errHTML(live.err) : skeleton(); return; }
+  const chains = {}; live.items.forEach(i => chains[i.chain] = (chains[i.chain] || 0) + 1);
+  const ch = ['all', ...Object.keys(chains).sort((a, b) => chains[b] - chains[a])];
+  if (!ch.includes(live.chain)) live.chain = 'all';
+  const l = live.items.filter(i => live.chain === 'all' || i.chain === live.chain); const now = Date.now();
+  app.innerHTML = `<div class="intro">📡 <b>Live feed</b> · new token profiles and boosts on DexScreener as they appear, refreshed every 20s. Tap 𝕏 to open the coin’s account.</div>
+    <div class="chips">${ch.map(c => `<button class="chip sm ${live.chain === c ? 'on' : ''}" data-lc="${c}">${c === 'all' ? 'All' : chainName(c)}<span class="n">${c === 'all' ? live.items.length : chains[c]}</span></button>`).join('')}</div>
+    <div class="meta"><span class="live"><span class="dot pulse"></span><span class="upd" data-ts="${live.ts}">${live.ts ? 'Updated ' + timeAgo(live.ts) : 'Connecting…'}</span></span><span>${l.length} tokens</span></div>
+    <div class="feed">${l.map(i => liveCardHTML(i, now)).join('') || '<div class="empty">Nothing on this chain yet.</div>'}</div>
+    ${DISCLAIMER}`;
+  live.fresh.clear();
+  app.querySelectorAll('[data-lc]').forEach(b => b.onclick = () => { live.chain = b.dataset.lc; renderLive(); });
+}
+
+// ---------- token detail (fast / live) ----------
+async function renderToken(chain, addr) {
+  const k = tkey(chain, addr);
+  let it = fast.items.find(i => i.key === k);
+  let p = it ? it.pair : (pairCache.get(k) || {}).pair;
+  const draw = () => {
+    if (!p) { app.innerHTML = `<div class="empty">No trading pair found for this token yet.<br><br><a class="chip" href="https://dexscreener.com/${esc(chain)}/${esc(addr)}" target="_blank" rel="noopener">Open on DexScreener</a></div>`; return; }
+    const s = fastScore(p), r = fastRisk(p), plan = fastPlan(p, r), pc = p.priceChange || {}, v = p.volume || {}, tx = p.txns || {}, now = Date.now();
+    const liveIt = live.items.find(i => i.key === k);
+    const links = pairLinks(p, liveIt && liveIt.links); const fav = isDexFav(k);
+    $('#title').innerHTML = `<span class="logo"></span>${esc(p.baseToken.symbol)}`;
+    const tr = (lbl, t) => { const x = buysSells(t); const tot = x.b + x.s || 1; return `<div class="bsr"><small>${lbl}</small><div class="bsbar"><i style="width:${(x.b / tot * 100).toFixed(0)}%"></i></div><span><b class="up">${x.b}</b> / <b class="dn">${x.s}</b></span></div>`; };
+    app.innerHTML = `
+      <div class="dhead">${avatar({ symbol: p.baseToken.symbol, image: (p.info && p.info.imageUrl) || (it && it.icon) || (liveIt && liveIt.icon) })}<div><h1>${esc(p.baseToken.name)}</h1><div class="sub">${esc(p.baseToken.symbol)} · ${chainName(chain)} · ${esc(p.dexId || '')} · age ${fmtAge(now - p.pairCreatedAt)}</div></div>
+        <button class="star ${fav ? 'on' : ''}" id="favBtn" aria-label="Add to watchlist">${STAR}</button></div>
+      <div class="pxline"><span class="bigpx">${fmtPrice(+p.priceUsd)}</span><span class="chg ${pctCls(+pc.m5)}">5m ${fmtPct(+pc.m5)}</span><span class="chg ${pctCls(+pc.h1)}">1h ${fmtPct(+pc.h1)}</span><span class="chg ${pctCls(+pc.h24)}">24h ${fmtPct(+pc.h24)}</span></div>
+      <div class="links big">${linksHTML(links)}<button class="lk cp" data-ca="${esc(addr)}">Copy CA ${esc(shortAddr(addr))}</button></div>
+      <div class="tf">
+        <div class="card"><small>Momentum</small><div style="margin-top:6px">${badge(s)}</div><div class="note" style="margin-top:6px">Score ${s.score}/100</div></div>
+        <div class="card"><small>Risk</small><div style="margin-top:6px">${riskBadge(r)}</div><div class="note" style="margin-top:6px">${r.pts} risk points</div></div>
+      </div>
+      <div class="card"><h3>Chart</h3><div class="embed"><iframe src="https://dexscreener.com/${encodeURIComponent(chain)}/${encodeURIComponent(p.pairAddress)}?embed=1&theme=dark&trades=0&info=0" title="DexScreener chart" loading="lazy"></iframe></div></div>
+      <div class="card"><h3>Stats</h3><div class="ind">
+        <div class="lv"><small>Liquidity</small><b>${fmtBig(p.liquidity && p.liquidity.usd)}</b></div>
+        <div class="lv"><small>Market cap / FDV</small><b>${fmtBig(p.marketCap)} / ${fmtBig(p.fdv)}</b></div>
+        <div class="lv"><small>Volume 1h</small><b>${fmtBig(v.h1)}</b></div>
+        <div class="lv"><small>Volume 24h</small><b>${fmtBig(v.h24)}</b></div>
+        <div class="lv"><small>Pair age</small><b>${fmtAge(now - p.pairCreatedAt)}</b></div>
+        <div class="lv"><small>6h change</small><b class="${pctCls(+pc.h6)}">${fmtPct(+pc.h6)}</b></div>
+      </div>${tr('Buys / sells 5m', tx.m5)}${tr('Buys / sells 1h', tx.h1)}${tr('Buys / sells 24h', tx.h24)}</div>
+      <div class="card"><h3>Why this momentum score</h3><ul class="factors">${s.factors.map(f => `<li><span>${esc(f.txt)}</span><span class="pts ${f.pts > 0 ? 'up' : f.pts < 0 ? 'dn' : ''}">${f.pts > 0 ? '+' : ''}${f.pts}</span></li>`).join('')}</ul></div>
+      <div class="card"><h3>Risk flags</h3>${r.why.length ? `<ul class="flags">${r.why.map(w => `<li>⚠ ${esc(w)}</li>`).join('')}</ul>` : '<div class="note" style="margin:0">No extra flags — still a memecoin: high risk.</div>'}
+        <div class="note">Not checked here: mint/freeze authority, LP lock, holder concentration, honeypot tax. Check those on the chart page before buying.</div></div>
+      ${plan ? `<div class="card"><h3>Example quick-flip exit plan</h3><div class="levels">
+        <div class="lv s"><small>Stop</small><b>${fmtPrice(plan.stop)}</b><br><small>−${(plan.sp * 100).toFixed(0)}%</small></div>
+        <div class="lv t"><small>Take part</small><b>${fmtPrice(plan.tp1)}</b><br><small>+${(plan.sp * 150).toFixed(0)}%</small></div>
+        <div class="lv t"><small>Take rest</small><b>${fmtPrice(plan.tp2)}</b><br><small>+${(plan.sp * 300).toFixed(0)}%</small></div></div>
+        <div class="note">Hold: minutes to hours. Example levels from the risk level (wider stop for riskier coins), not a prediction — fresh memecoins can drop 90% in seconds and stops may not fill.</div></div>` : ''}
+      ${DISCLAIMER}
+      <div class="note">Data: DexScreener · pair ${esc(shortAddr(p.pairAddress))} · <a href="${esc(p.url)}" target="_blank" rel="noopener">open full chart</a></div>`;
+    $('#favBtn').onclick = e => { const on = toggleDexFav({ key: k, chain, addr, symbol: p.baseToken.symbol, name: p.baseToken.name, icon: (p.info && p.info.imageUrl) || '' }); e.currentTarget.classList.toggle('on', on); toast(on ? 'Added to watchlist' : 'Removed from watchlist', 1500); };
+  };
+  if (p) draw(); else app.innerHTML = skeleton(3);
+  try { const m = await pairsFor([{ chain, addr }], p ? PAIR_TTL : 0); const np = m.get(k); if (np && location.hash === `#/t/${encodeURIComponent(chain)}/${encodeURIComponent(addr)}`) { const changed = !p || np !== p; p = np; if (changed) draw(); } else if (!p) draw(); }
+  catch (e) { if (!p) draw(); }
+}
+
+// ---------- Slow: 1–3 day swing setups for established memecoins ----------
+/**
+ * Swing score (−100…100): half of the hourly indicator score, plus
+ *   4h trend (EMA9 vs EMA21 on 4h bars) ±20, 4h EMA21 slope ±10, 7d trend ±15,
+ *   pullback-in-uptrend bonus +10, overextension penalties (24h > +35% −15, RSI > 75 −10).
+ */
+function swingSignal(c) {
+  const s = c.sig; if (!s || !c.spark || c.spark.length < 90) return null;
+  const sp = c.spark, b4 = []; for (let i = sp.length - 1; i >= 0; i -= 4) b4.unshift(sp[i]);
+  const e9 = ema(b4, 9), e21 = ema(b4, 21), n = b4.length;
+  const F = []; F.push({ pts: Math.round(s.score * 0.5), txt: `hourly indicators ${s.score > 0 ? '+' : ''}${s.score}` });
+  const up = last(e9) > last(e21); F.push({ pts: up ? 20 : -20, txt: up ? '4h trend up (EMA9 > EMA21)' : '4h trend down (EMA9 < EMA21)' });
+  const sl = e21[n - 1] != null && e21[n - 4] != null ? e21[n - 1] - e21[n - 4] : 0; F.push({ pts: sl > 0 ? 10 : -10, txt: sl > 0 ? '4h EMA21 rising' : '4h EMA21 falling' });
+  const w = clamp((c.ch7d || 0) / 30, -1, 1) * 15; F.push({ pts: Math.round(w), txt: `${fmtPct(c.ch7d)} over 7d` });
+  if (up && c.ch24 < -3 && c.ch24 > -12) F.push({ pts: 10, txt: 'healthy pullback inside an uptrend' });
+  if (c.ch24 > 25) F.push({ pts: -15, txt: `already +${c.ch24.toFixed(0)}% today (chasing risk)` });
+  if (s.rsi > 75) F.push({ pts: -10, txt: `RSI ${s.rsi.toFixed(0)} overbought` });
+  const score = Math.round(clamp(F.reduce((a, f) => a + f.pts, 0), -100, 100));
+  const [label, code] = score >= 45 ? ['STRONG BUY', 'SB'] : score >= 15 ? ['BUY', 'B'] : score > -15 ? ['HOLD', 'H'] : score > -45 ? ['SELL', 'S'] : ['STRONG SELL', 'SS'];
+  const dir = Math.sign(score); const reason = F.filter(f => dir ? Math.sign(f.pts) === dir : true).sort((a, b) => Math.abs(b.pts) - Math.abs(a.pts)).slice(0, 3).map(f => f.txt).join(', ');
+  const price = c.price || sp[sp.length - 1], atr = s.atr, lo = s.swingLow;
+  let lv;
+  if (code === 'SB' || code === 'B') { const stop = Math.max(Math.min(lo - 0.25 * atr, price - 1.5 * atr), price - 3 * atr, price * 0.8); lv = { mode: 'long', entry: [price - 0.5 * atr, price], stop, tp: price + 2 * (price - stop), hold: code === 'SB' ? '1–3 days' : '1–2 days' }; }
+  else if (code === 'H') { const eHi = price - 0.5 * atr, eLo = Math.max(price - 1.5 * atr, lo); const stop = Math.min(eLo, eHi) - 1.2 * atr; lv = { mode: 'dip', entry: [Math.min(eLo, eHi), eHi], stop, tp: eHi + 2 * (eHi - stop), hold: 'wait for dip, then 1–2 days' }; }
+  else lv = { mode: 'avoid', entry: [lo, lo + 0.5 * atr], stop: lo - 1.5 * atr, tp: price + atr, hold: 'avoid for now' };
+  return { score, label, code, reason: reason.charAt(0).toUpperCase() + reason.slice(1), factors: F, levels: lv };
+}
+function slowRowHTML(c) {
+  const w = c.swing, L = w && w.levels;
+  return `<a class="row" href="#/coin/${encodeURIComponent(c.id)}"><span class="bar" style="background:${barColor(w)}"></span>
+    ${avatar(c)}
+    <div class="nm"><div class="t"><span class="nmx">${esc(c.name)}</span>${c.name.toLowerCase() !== String(c.symbol).toLowerCase() ? `<span class="sym">${esc(c.symbol)}</span>` : ''}${c.rank ? `<span class="rk">#${c.rank}</span>` : ''}</div>
+      <div class="r">${w ? esc(w.reason) : 'Not enough data'}</div></div>
+    <div class="rt"><div style="display:flex;gap:8px;align-items:center">${sparkSVG(c.spark)}<span class="px">${fmtPrice(c.price)}</span></div>
+      <div style="display:flex;gap:6px;align-items:center"><span class="chg ${pctCls(c.ch24)}">${fmtPct(c.ch24)}</span>${badge(w)}</div></div>
+    ${L && L.mode !== 'avoid' ? `<div class="plan"><span>Entry <b class="e">${fmtPrice(L.entry[1])}</b></span><span>Stop <b class="dn">${fmtPrice(L.stop)}</b></span><span>Target <b class="up">${fmtPrice(L.tp)}</b></span><span class="hold">⏱ ${esc(L.hold)}</span></div>` : ''}</a>`;
+}
+
 // ---------- screens ----------
-function renderHome() {
-  if (!state.coins.length) { app.innerHTML = skeleton(); return; }
+function errHTML(e) { return `<div class="empty">Couldn't load data.<br><small>${esc(e && e.message || e)}</small><br><br><button class="chip on" onclick="refresh()">Try again</button></div>`; }
+const dexFavs = () => ls.get('dexfavs', []);
+const isDexFav = k => dexFavs().some(f => f.key === k);
+function toggleDexFav(t) { const f = dexFavs(); const i = f.findIndex(x => x.key === t.key); i >= 0 ? f.splice(i, 1) : f.unshift(t); ls.set('dexfavs', f); return i < 0; }
+function sortedSlow(list) {
+  const l = [...list];
+  if (state.sort === 'score') l.sort((a, b) => (b.swing ? b.swing.score : -999) - (a.swing ? a.swing.score : -999));
+  else if (state.sort === 'rank') l.sort((a, b) => (a.rank || 999) - (b.rank || 999));
+  else l.sort((a, b) => (b.ch24 || 0) - (a.ch24 || 0));
+  return l;
+}
+function renderSlow() {
+  if (!state.coins.length) { app.innerHTML = state.err ? errHTML(state.err) : skeleton(); return; }
   const all = state.coins;
-  const buys = all.filter(c => c.sig && (c.sig.code === 'SB' || c.sig.code === 'B'));
-  const sells = all.filter(c => c.sig && (c.sig.code === 'SS' || c.sig.code === 'S'));
+  const buys = all.filter(c => c.swing && (c.swing.code === 'SB' || c.swing.code === 'B'));
+  const sells = all.filter(c => c.swing && (c.swing.code === 'SS' || c.swing.code === 'S'));
   const avg = all.reduce((s, c) => s + (c.ch24 || 0), 0) / all.length;
   let list = state.filter === 'buy' ? buys : state.filter === 'sell' ? sells : all;
   const q = state.q.trim().toLowerCase();
   if (q) list = list.filter(c => c.name.toLowerCase().includes(q) || c.symbol.toLowerCase().includes(q));
-  list = sorted(list);
+  list = sortedSlow(list);
   const focused = document.activeElement && document.activeElement.id === 'q';
-  app.innerHTML = `
+  app.innerHTML = `<div class="intro">🐢 <b>Slow swings</b> · established memecoins, 1–3 day holds. Signals favour the 4h/daily trend. Each buy setup shows entry, stop, target and hold time.</div>
     <div class="summary">
-      <div class="stat"><small>Buy signals</small><b class="up">${buys.length}</b></div>
-      <div class="stat"><small>Sell signals</small><b class="dn">${sells.length}</b></div>
+      <div class="stat"><small>Swing buys</small><b class="up">${buys.length}</b></div>
+      <div class="stat"><small>Swing sells</small><b class="dn">${sells.length}</b></div>
       <div class="stat"><small>Avg 24h</small><b class="${pctCls(avg)}">${fmtPct(avg)}</b></div>
     </div>
     <label class="search"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
-      <input id="q" type="search" placeholder="Search coins" value="${esc(state.q)}" autocomplete="off" enterkeyhint="search"></label>
+      <input id="q" type="search" placeholder="Search memecoins" value="${esc(state.q)}" autocomplete="off" enterkeyhint="search"></label>
     <div class="chips">
-      ${[['all', 'All', all.length], ['buy', 'Buy signals', buys.length], ['sell', 'Sell signals', sells.length]].map(([k, l, n]) => `<button class="chip ${state.filter === k ? 'on' : ''}" data-f="${k}">${l}<span class="n">${n}</span></button>`).join('')}
+      ${[['all', 'All', all.length], ['buy', 'Swing buys', buys.length], ['sell', 'Avoid / sell', sells.length]].map(([k, l, n]) => `<button class="chip ${state.filter === k ? 'on' : ''}" data-f="${k}">${l}<span class="n">${n}</span></button>`).join('')}
     </div>
     ${metaHTML()}
-    <div class="list">${list.map(rowHTML).join('') || '<div class="empty">No coins match.</div>'}</div>
+    <div class="list">${list.map(slowRowHTML).join('') || '<div class="empty">No coins match.</div>'}</div>
     ${DISCLAIMER}`;
-  const qi = $('#q'); qi.oninput = e => { state.q = e.target.value; renderHome(); };
+  const qi = $('#q'); qi.oninput = e => { state.q = e.target.value; renderSlow(); };
   if (focused) { qi.focus(); qi.setSelectionRange(qi.value.length, qi.value.length); }
-  app.querySelectorAll('[data-f]').forEach(b => b.onclick = () => { state.filter = b.dataset.f; renderHome(); });
+  app.querySelectorAll('[data-f]').forEach(b => b.onclick = () => { state.filter = b.dataset.f; renderSlow(); });
   bindSort();
 }
+let watchPairs = null;
 function renderWatch() {
-  const f = favs();
-  if (!state.coins.length) { app.innerHTML = skeleton(4); return; }
+  const f = favs(), df = dexFavs();
   const list = f.map(id => state.coins.find(c => c.id === id)).filter(Boolean);
+  const dRows = df.map(t => { const c = pairCache.get(t.key); return c ? toFastItem(c.pair, { icon: t.icon }) : null; });
   app.innerHTML = `<h2 style="margin:4px 2px 10px;font-size:20px">Watchlist</h2>
-    ${list.length ? metaHTML() + '<div class="list">' + sorted(list).map(rowHTML).join('') + '</div>' :
-      `<div class="empty"><div style="font-size:40px;margin-bottom:8px">⭐</div>No favorites yet.<br>Open any coin and tap the star to add it here.</div>`}
-    ${f.length > list.length ? `<div class="note">${f.length - list.length} saved coin(s) are outside the current top list.</div>` : ''}
+    ${!f.length && !df.length ? `<div class="empty"><div style="font-size:40px;margin-bottom:8px">⭐</div>No favorites yet.<br>Open any coin (Fast, Slow or Live) and tap the star to add it here.</div>` : ''}
+    ${df.length ? `<div class="sec">⚡ Fresh coins</div><div class="list">${dRows.map((r, i) => r ? fastRowHTML(r) : `<a class="row" href="#/t/${encodeURIComponent(df[i].chain)}/${encodeURIComponent(df[i].addr)}">${avatar({ symbol: df[i].symbol, image: df[i].icon })}<div class="nm"><div class="t">${esc(df[i].symbol)}</div><div class="r">loading…</div></div><div></div></a>`).join('')}</div>` : ''}
+    ${f.length ? `<div class="sec">🐢 Swing coins</div>${list.length ? metaHTML() + '<div class="list">' + sortedSlow(list).map(slowRowHTML).join('') + '</div>' : (state.coins.length ? '' : skeleton(2))}` : ''}
+    ${state.coins.length && f.length > list.length ? `<div class="note">${f.length - list.length} saved coin(s) are outside the current top list.</div>` : ''}
     ${DISCLAIMER}`;
   bindSort();
+  if (df.length && (!watchPairs || Date.now() - watchPairs > PAIR_TTL)) { watchPairs = Date.now(); pairsFor(df).then(() => { if (route().name === 'watch') renderWatch(); }).catch(() => {}); }
 }
 function renderAbout() {
   app.innerHTML = `<div class="about">
-    <h2>How the signals work</h2>
-    <p>Each memecoin gets a score from −100 to +100, recalculated from live prices every time data refreshes. The list uses the last 7 days of hourly prices (short-term). The coin screen also shows a 90-day daily (swing) view.</p>
+    <h2>How it works</h2>
+    <div class="card warn"><b>Nothing here predicts price.</b> The app scans live market data for momentum, buy pressure and buzz and shows the risk. Many fresh memecoins are rugs or go to zero within hours. Only trade money you can afford to lose completely.</div>
+    <h2>⚡ Fast (quick flips)</h2>
+    <p>Pulls fresh tokens from DexScreener (latest token profiles, latest and top boosts) and GeckoTerminal trending pools on Solana, Base, BSC and Ethereum, then loads each token's most liquid pair. Shown only if liquidity ≥ $20K and 24h volume ≥ $10K. Age filter: under 6h / 24h / 72h.</p>
     <div class="card"><ul class="factors">
-      <li><span><b>RSI(14)</b>: below 30 oversold, above 70 overbought</span><span class="pts">±2</span></li>
-      <li><span><b>SMA20 vs SMA50</b>: trend direction + fresh crossovers</span><span class="pts">±2</span></li>
-      <li><span><b>Price vs SMA20</b></span><span class="pts">±0.5</span></li>
-      <li><span><b>MACD(12,26,9)</b>: histogram sign, slope, fresh cross</span><span class="pts">±2</span></li>
-      <li><span><b>Momentum</b>: % change over the window</span><span class="pts">±1.5</span></li>
+      <li><span><b>Momentum</b>: 5m, 1h, 6h price change</span><span class="pts">±30</span></li>
+      <li><span><b>Buy pressure</b>: share of buys in 5m and 1h trades</span><span class="pts">±30</span></li>
+      <li><span><b>Turnover</b>: 1h volume vs liquidity</span><span class="pts">0–20</span></li>
+      <li><span><b>Activity</b>: number of trades in the last hour</span><span class="pts">0–10</span></li>
+      <li><span><b>Buzz</b>: DexScreener boost, socials listed</span><span class="pts">0–10</span></li>
     </ul></div>
-    <p>Score ≥ 45 <span class="badge b-SB">STRONG BUY</span> · ≥ 15 <span class="badge b-B">BUY</span> · −15…15 <span class="badge b-H">HOLD</span> · ≤ −15 <span class="badge b-S">SELL</span> · ≤ −45 <span class="badge b-SS">STRONG SELL</span></p>
-    <p><b>Entry / stop / target</b>: based on recent swing low/high and an ATR-style volatility estimate (average daily move). Buy setups use a 2:1 reward-to-risk target.</p>
-    <p><b>Data</b>: CoinGecko public API (live, updated every 3 minutes), with Binance public market data as a backup. Data is cached on your phone so the app still opens offline.</p>
-    <p><b>Install</b>: Android Chrome → menu ⋮ → <i>Install app</i>. iPhone Safari → Share → <i>Add to Home Screen</i>.</p>
+    <p>Score 0–100: ≥ 70 <span class="badge b-SB">🔥 HOT</span> · ≥ 57 <span class="badge b-B">HEATING UP</span> · 44–56 <span class="badge b-H">MIXED</span> · ≥ 31 <span class="badge b-S">COOLING</span> · lower <span class="badge b-SS">DUMPING</span></p>
+    <p><b>Risk</b> is never "low" for these. Points for: very young pair, thin liquidity, FDV many times liquidity, more sells than buys, sharp drop, parabolic pump, no socials. <span class="risk rh">⚠ HIGH</span> <span class="risk rv">⚠ VERY HIGH</span> <span class="risk rx">⚠ EXTREME</span>. The app does <i>not</i> check mint authority, LP locks, holders or honeypot taxes. Check those on the chart page.</p>
+    <h2>🐢 Slow (1–3 day swings)</h2>
+    <p>Established memecoins from CoinGecko's meme category (Binance as backup). Swing score = half the hourly indicator score (RSI, SMA20/50, MACD, momentum) + 4h trend (EMA9 vs EMA21) ±20 + 4h trend slope ±10 + 7-day trend ±15, a bonus for a pullback inside an uptrend, and penalties for coins already up 25%+ today or overbought. Buy setups show an entry zone, a stop under recent swing lows, a 2:1 target and a suggested hold time.</p>
+    <h2>📡 Live (J7Tracker-style)</h2>
+    <p>A live stream of tokens that just got a DexScreener profile or boost, refreshed every 20 seconds, with new ones highlighted. Tap 𝕏 to open the coin's X account in the X app, <b>CA</b> to copy the contract address, Chart for DexScreener. A boost is <i>paid</i> promotion, not proof of quality.</p>
+    <p class="mut">Live tweet tracking (like J7Tracker's tweet feed) needs paid X/J7 API keys, so this app links to each token's X account instead of streaming tweets.</p>
+    <p><b>Data</b>: DexScreener and GeckoTerminal public APIs (fresh coins), CoinGecko and Binance (swing coins). Updates automatically while the app is open: Live every 20s, Fast every 60s, Slow every 3 minutes. Last data is cached so the app still opens offline.</p>
+    <p><b>Install</b>: iPhone Safari → Share → <i>Add to Home Screen</i>. Android Chrome → menu ⋮ → <i>Install app</i>.</p>
     ${DISCLAIMER}</div>`;
 }
 
+// ---------- router ----------
+const TITLES = { fast: 'Fast flips', slow: 'Slow swings', live: 'Live feed', watch: 'Watchlist', about: 'How it works' };
+function route() {
+  const h = location.hash || '#/';
+  if (h.startsWith('#/coin/')) return { name: 'coin', id: decodeURIComponent(h.slice(7)) };
+  if (h.startsWith('#/t/')) { const [c, a] = h.slice(4).split('/'); return { name: 'token', chain: decodeURIComponent(c || ''), addr: decodeURIComponent(a || '') }; }
+  const n = h.slice(2); return { name: TITLES[n] ? n : 'fast' };
+}
+let lastRoute = '';
+function render() {
+  const r = route(); const detail = r.name === 'coin' || r.name === 'token';
+  document.querySelectorAll('.tabbar a').forEach(a => a.classList.toggle('on', a.dataset.tab === r.name));
+  $('#backBtn').hidden = !detail;
+  if (!detail) $('#title').innerHTML = '<span class="logo"></span>' + (r.name === 'fast' ? 'Memecoin Signals' : TITLES[r.name]);
+  const key = r.name + (r.id || r.addr || '');
+  if (key !== lastRoute) { window.scrollTo(0, 0); app.style.animation = 'none'; void app.offsetWidth; app.style.animation = ''; if (r.name === 'coin' && !lastRoute.startsWith('coin')) state.tf = '7d'; lastRoute = key; }
+  if (r.name === 'coin') renderDetail(r.id); else if (r.name === 'token') renderToken(r.chain, r.addr);
+  else if (r.name === 'slow') renderSlow(); else if (r.name === 'live') renderLive(); else if (r.name === 'watch') renderWatch(); else if (r.name === 'about') renderAbout(); else renderFast();
+  schedule();
+}
+window.addEventListener('hashchange', render);
+$('#backBtn').onclick = () => { if (history.length > 1) history.back(); else location.hash = '#/'; };
+
+// ---------- refresh ----------
+const busy = () => state.loading || fast.loading || live.loading;
+const spin = () => $('#refreshBtn').classList.toggle('spin', busy());
+async function run(mod, fn, rerender) {
+  if (mod.loading) return; mod.loading = true; spin();
+  try { await fn(); mod.err = null; if (rerender()) render(); }
+  catch (e) { console.warn('refresh failed', e); mod.err = e; if (rerender()) render(); }
+  finally { mod.loading = false; spin(); }
+}
+const on = (...names) => () => names.includes(route().name);
+const refreshSlow = (force = true) => run(state, () => loadMarkets(force), on('slow', 'watch', 'coin'));
+const refreshFast = (force = true) => run(fast, () => loadFast(force), on('fast', 'watch'));
+const refreshLive = () => run(live, loadLive, on('live'));
+async function refresh() { const n = route().name; if (n === 'live') return refreshLive(); if (n === 'fast' || n === 'token') { if (n === 'token') render(); return refreshFast(true); } if (n === 'watch') { watchPairs = null; refreshFast(true); } return refreshSlow(true); }
+window.refresh = refresh;
+$('#refreshBtn').onclick = () => refresh();
+function schedule() {
+  if (document.visibilityState !== 'visible') return; const n = route().name, now = Date.now();
+  if (n === 'live' && now - live.ts > LIVE_REFRESH) refreshLive();
+  if ((n === 'fast' || n === 'watch') && now - fast.ts > FAST_REFRESH) refreshFast(true);
+  if ((n === 'slow' || n === 'watch' || n === 'coin') && now - state.ts > AUTO_REFRESH) refreshSlow(true);
+}
+setInterval(schedule, 5000);
+document.addEventListener('visibilitychange', schedule);
+setInterval(() => {
+  document.querySelectorAll('.upd[data-ts]').forEach(el => { const t = +el.dataset.ts; if (t) el.textContent = 'Updated ' + timeAgo(t); });
+  document.querySelectorAll('.seen[data-seen]').forEach(el => el.textContent = timeAgo(+el.dataset.seen));
+  const m = document.querySelector('.meta .live .slow-upd'); if (m && state.ts) m.textContent = 'Updated ' + timeAgo(state.ts) + ' · ' + state.source;
+}, 5000);
+window.addEventListener('online', () => refresh());
+// copy contract address (event delegation)
+function copyText(t) {
+  if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(t);
+  const a = document.createElement('textarea'); a.value = t; a.style.position = 'fixed'; a.style.opacity = '0'; document.body.appendChild(a); a.select();
+  try { document.execCommand('copy'); } finally { a.remove(); } return Promise.resolve();
+}
+document.addEventListener('click', e => { const b = e.target.closest('[data-ca]'); if (!b) return; e.preventDefault(); e.stopPropagation(); copyText(b.dataset.ca).then(() => toast('Contract address copied', 1500), () => toast(b.dataset.ca, 6000)); });
 // ---------- detail ----------
 async function renderDetail(id) {
   let coin = state.coins.find(c => c.id === id);
@@ -325,9 +725,10 @@ async function renderDetail(id) {
         <div class="card"><small>Short-term (1h)</small><div style="margin-top:6px">${badge(short)}</div><div class="note" style="margin-top:6px">Score ${short ? short.score : '—'}</div></div>
         <div class="card"><small>Swing (1D, 90d)</small><div style="margin-top:6px">${hist ? badge(swing) : '<span class="badge b-H">loading…</span>'}</div><div class="note" style="margin-top:6px">Score ${swing ? swing.score : '—'}</div></div>
       </div>
+      ${coin.swing ? swingPlanCard(coin.swing) : ''}
       <div class="card"><h3>Price chart <div class="seg"><button data-tf="7d" class="${tf === '7d' ? 'on' : ''}">7D · 1h</button><button data-tf="90d" class="${tf === '90d' ? 'on' : ''}">90D · 1D</button></div></h3>
         <div class="chartwrap"><canvas class="chart" id="chart"></canvas><div class="tip" id="tip" hidden></div></div>
-        <div class="legend"><span><i style="background:#e8edf7"></i>Price</span><span><i style="background:#ffc24b"></i>SMA20</span><span><i style="background:#a78bfa"></i>SMA50</span><span><i style="background:#5aa9ff"></i>Entry</span><span><i style="background:#ff5470"></i>Stop</span><span><i style="background:#2ee6a0"></i>Target</span></div>
+        <div class="legend"><span><i style="background:#f2f2f4"></i>Price</span><span><i style="background:#d9b25f"></i>SMA20</span><span><i style="background:#9b8cf0"></i>SMA50</span><span><i style="background:#5e9eff"></i>Entry</span><span><i style="background:#ff5a52"></i>Stop</span><span><i style="background:#32d074"></i>Target</span></div>
       </div>
       ${sig ? signalCard(sig, tf) : '<div class="card">Not enough history to compute signals.</div>'}
       ${DISCLAIMER}
@@ -347,15 +748,15 @@ async function renderDetail(id) {
   }
 }
 function gaugeSVG(score, code) {
-  const col = ({ SB: '#00d68f', B: '#2ee6a0', H: '#8b97b3', S: '#ff7a8a', SS: '#ff3b5c' })[code];
+  const col = ({ SB: '#2bb866', B: '#32d074', H: '#8e8e93', S: '#ff7b73', SS: '#e5484d' })[code];
   const a = (score + 100) / 200; const R = 34, C = Math.PI * R;
-  return `<svg class="gauge" viewBox="0 0 84 84"><path d="M8 52 A34 34 0 0 1 76 52" stroke="#24304d" stroke-width="8" fill="none" stroke-linecap="round"/>
+  return `<svg class="gauge" viewBox="0 0 84 84"><path d="M8 52 A34 34 0 0 1 76 52" stroke="#26262b" stroke-width="8" fill="none" stroke-linecap="round"/>
     <path d="M8 52 A34 34 0 0 1 76 52" stroke="${col}" stroke-width="8" fill="none" stroke-linecap="round" stroke-dasharray="${(a * C).toFixed(1)} ${C.toFixed(1)}"/>
-    <text x="42" y="50" text-anchor="middle" fill="#e8edf7" font-size="19" font-weight="800" style="stroke:none">${score > 0 ? '+' : ''}${score}</text>
-    <text x="42" y="66" text-anchor="middle" fill="#8b97b3" font-size="9" font-weight="700" style="stroke:none">SCORE</text></svg>`;
+    <text x="42" y="50" text-anchor="middle" fill="#f2f2f4" font-size="19" font-weight="800" style="stroke:none">${score > 0 ? '+' : ''}${score}</text>
+    <text x="42" y="66" text-anchor="middle" fill="#8e8e93" font-size="9" font-weight="700" style="stroke:none">SCORE</text></svg>`;
 }
 function signalCard(s, tf) {
-  const col = ({ SB: '#3dfcb4', B: '#2ee6a0', H: '#b7c1d9', S: '#ff7a8a', SS: '#ff6b84' })[s.code];
+  const col = ({ SB: '#32d074', B: '#32d074', H: '#aeaeb2', S: '#ff7b73', SS: '#ff6b63' })[s.code];
   const L = s.levels;
   const titles = L.mode === 'long' ? ['Entry zone', 'Stop-loss', 'Take-profit'] : L.mode === 'dip' ? ['Buy-the-dip zone', 'Stop-loss', 'Take-profit'] : ['Re-entry (support)', 'Stop if holding', 'Resistance'];
   const note = L.mode === 'long' ? `Reward/risk ≈ ${L.rr.toFixed(1)} : 1. Stop sits below the recent swing low / volatility band.` :
@@ -394,40 +795,40 @@ function drawChart(cv, times, closes, sig, tf) {
   const y = v => pTop + (1 - (v - mn) / (mx - mn)) * pH;
   g.font = '10px -apple-system,system-ui,sans-serif'; g.textBaseline = 'middle';
   // grid
-  g.strokeStyle = 'rgba(36,48,77,.7)'; g.lineWidth = 1; g.fillStyle = '#8b97b3';
+  g.strokeStyle = 'rgba(60,60,67,.7)'; g.lineWidth = 1; g.fillStyle = '#8e8e93';
   for (let k = 0; k <= 4; k++) { const v = mn + (mx - mn) * k / 4, yy = y(v); g.beginPath(); g.moveTo(pad.l, yy); g.lineTo(W - pad.r, yy); g.stroke(); g.fillText(fmtPrice(v).replace('$', ''), W - pad.r + 6, yy); }
   // entry zone band
-  g.fillStyle = 'rgba(90,169,255,.12)'; g.fillRect(pad.l, y(L.entry[1]), W - pad.l - pad.r, y(L.entry[0]) - y(L.entry[1]));
+  g.fillStyle = 'rgba(94,158,255,.12)'; g.fillRect(pad.l, y(L.entry[1]), W - pad.l - pad.r, y(L.entry[0]) - y(L.entry[1]));
   const hline = (v, c) => { g.save(); g.setLineDash([4, 4]); g.strokeStyle = c; g.lineWidth = 1.2; g.beginPath(); g.moveTo(pad.l, y(v)); g.lineTo(W - pad.r, y(v)); g.stroke(); g.restore();
-    g.fillStyle = c; g.beginPath(); g.roundRect ? g.roundRect(W - pad.r + 2, y(v) - 8, pad.r - 3, 16, 4) : g.rect(W - pad.r + 2, y(v) - 8, pad.r - 3, 16); g.fill(); g.fillStyle = '#0b0f1a'; g.font = 'bold 9.5px -apple-system,system-ui,sans-serif'; g.fillText(fmtPrice(v).replace('$', ''), W - pad.r + 5, y(v)); g.font = '10px -apple-system,system-ui,sans-serif'; };
+    g.fillStyle = c; g.beginPath(); g.roundRect ? g.roundRect(W - pad.r + 2, y(v) - 8, pad.r - 3, 16, 4) : g.rect(W - pad.r + 2, y(v) - 8, pad.r - 3, 16); g.fill(); g.fillStyle = '#000000'; g.font = 'bold 9.5px -apple-system,system-ui,sans-serif'; g.fillText(fmtPrice(v).replace('$', ''), W - pad.r + 5, y(v)); g.font = '10px -apple-system,system-ui,sans-serif'; };
   // area under price
   const upc = closes[n - 1] >= closes[0];
-  const grad = g.createLinearGradient(0, pTop, 0, pTop + pH); grad.addColorStop(0, upc ? 'rgba(46,230,160,.28)' : 'rgba(255,84,112,.25)'); grad.addColorStop(1, 'rgba(0,0,0,0)');
+  const grad = g.createLinearGradient(0, pTop, 0, pTop + pH); grad.addColorStop(0, upc ? 'rgba(50,208,116,.28)' : 'rgba(255,90,82,.25)'); grad.addColorStop(1, 'rgba(0,0,0,0)');
   g.beginPath(); closes.forEach((v, i) => i ? g.lineTo(x(i), y(v)) : g.moveTo(x(i), y(v))); g.lineTo(x(n - 1), pTop + pH); g.lineTo(x(0), pTop + pH); g.closePath(); g.fillStyle = grad; g.fill();
   const line = (arr, c, w) => { g.beginPath(); let st = false; arr.forEach((v, i) => { if (v == null) return; st ? g.lineTo(x(i), y(v)) : (g.moveTo(x(i), y(v)), st = true); }); g.strokeStyle = c; g.lineWidth = w; g.stroke(); };
-  line(s50, '#a78bfa', 1.3); line(s20, '#ffc24b', 1.3); line(closes, upc ? '#2ee6a0' : '#ff5470', 2);
-  hline(L.stop, '#ff5470'); hline(L.tp, '#2ee6a0'); hline(L.entry[1], '#5aa9ff');
+  line(s50, '#9b8cf0', 1.3); line(s20, '#d9b25f', 1.3); line(closes, upc ? '#32d074' : '#ff5a52', 2);
+  hline(L.stop, '#ff5a52'); hline(L.tp, '#32d074'); hline(L.entry[1], '#5e9eff');
   // last price dot
-  g.fillStyle = '#e8edf7'; g.beginPath(); g.arc(x(n - 1), y(closes[n - 1]), 3.5, 0, 7); g.fill();
+  g.fillStyle = '#f2f2f4'; g.beginPath(); g.arc(x(n - 1), y(closes[n - 1]), 3.5, 0, 7); g.fill();
   // RSI panel
   const ry = v => rTop + (1 - v / 100) * rH;
-  g.fillStyle = 'rgba(167,139,250,.08)'; g.fillRect(pad.l, ry(70), W - pad.l - pad.r, ry(30) - ry(70));
-  g.strokeStyle = 'rgba(36,48,77,.9)'; [30, 70].forEach(v => { g.beginPath(); g.moveTo(pad.l, ry(v)); g.lineTo(W - pad.r, ry(v)); g.stroke(); });
-  g.fillStyle = '#8b97b3'; g.fillText('RSI ' + sig.rsi.toFixed(0), W - pad.r + 6, rTop + rH / 2); g.fillText('70', W - pad.r + 6, ry(70)); g.fillText('30', W - pad.r + 6, ry(30));
-  g.beginPath(); let st = false; r.forEach((v, i) => { if (v == null) return; st ? g.lineTo(x(i), ry(v)) : (g.moveTo(x(i), ry(v)), st = true); }); g.strokeStyle = '#a78bfa'; g.lineWidth = 1.4; g.stroke();
+  g.fillStyle = 'rgba(155,140,240,.08)'; g.fillRect(pad.l, ry(70), W - pad.l - pad.r, ry(30) - ry(70));
+  g.strokeStyle = 'rgba(60,60,67,.9)'; [30, 70].forEach(v => { g.beginPath(); g.moveTo(pad.l, ry(v)); g.lineTo(W - pad.r, ry(v)); g.stroke(); });
+  g.fillStyle = '#8e8e93'; g.fillText('RSI ' + sig.rsi.toFixed(0), W - pad.r + 6, rTop + rH / 2); g.fillText('70', W - pad.r + 6, ry(70)); g.fillText('30', W - pad.r + 6, ry(30));
+  g.beginPath(); let st = false; r.forEach((v, i) => { if (v == null) return; st ? g.lineTo(x(i), ry(v)) : (g.moveTo(x(i), ry(v)), st = true); }); g.strokeStyle = '#9b8cf0'; g.lineWidth = 1.4; g.stroke();
   // MACD panel
   const hs = m.hist.filter(v => v != null), ml = m.macd.filter(v => v != null); const am = Math.max(...hs.map(Math.abs), ...ml.map(Math.abs)) || 1;
   const my = v => mTop + mH / 2 - v / am * mH / 2; const bw = Math.max(1, (W - pad.l - pad.r) / n * 0.7);
-  m.hist.forEach((v, i) => { if (v == null) return; g.fillStyle = v >= 0 ? 'rgba(46,230,160,.65)' : 'rgba(255,84,112,.65)'; g.fillRect(x(i) - bw / 2, Math.min(my(0), my(v)), bw, Math.abs(my(v) - my(0)) || 1); });
+  m.hist.forEach((v, i) => { if (v == null) return; g.fillStyle = v >= 0 ? 'rgba(50,208,116,.65)' : 'rgba(255,90,82,.65)'; g.fillRect(x(i) - bw / 2, Math.min(my(0), my(v)), bw, Math.abs(my(v) - my(0)) || 1); });
   const mline = (arr, c) => { g.beginPath(); let s = false; arr.forEach((v, i) => { if (v == null) return; s ? g.lineTo(x(i), my(v)) : (g.moveTo(x(i), my(v)), s = true); }); g.strokeStyle = c; g.lineWidth = 1.2; g.stroke(); };
-  mline(m.macd, '#5aa9ff'); mline(m.signal, '#ffc24b');
-  g.fillStyle = '#8b97b3'; g.fillText('MACD', W - pad.r + 6, mTop + mH / 2);
+  mline(m.macd, '#5e9eff'); mline(m.signal, '#d9b25f');
+  g.fillStyle = '#8e8e93'; g.fillText('MACD', W - pad.r + 6, mTop + mH / 2);
   // crosshair interaction
   const tip = $('#tip'); const snapshot = g.getImageData(0, 0, cv.width, cv.height);
   const move = ev => {
     const rect = cv.getBoundingClientRect(); const px = (ev.touches ? ev.touches[0].clientX : ev.clientX) - rect.left;
     const i = clamp(Math.round((px - pad.l) / (W - pad.l - pad.r) * (n - 1)), 0, n - 1);
-    g.putImageData(snapshot, 0, 0); g.save(); g.strokeStyle = 'rgba(232,237,247,.4)'; g.setLineDash([3, 3]); g.beginPath(); g.moveTo(x(i), pTop); g.lineTo(x(i), mTop + mH); g.stroke(); g.restore();
+    g.putImageData(snapshot, 0, 0); g.save(); g.strokeStyle = 'rgba(242,242,244,.4)'; g.setLineDash([3, 3]); g.beginPath(); g.moveTo(x(i), pTop); g.lineTo(x(i), mTop + mH); g.stroke(); g.restore();
     g.fillStyle = '#fff'; g.beginPath(); g.arc(x(i), y(closes[i]), 3.5, 0, 7); g.fill();
     const d = new Date(times[i]);
     tip.hidden = false; tip.style.left = clamp(x(i), 70, W - 70) + 'px';
@@ -437,40 +838,20 @@ function drawChart(cv, times, closes, sig, tf) {
   cv.onmousemove = move; cv.onmouseleave = end; cv.ontouchstart = move; cv.ontouchmove = move; cv.ontouchend = end;
 }
 
-// ---------- router ----------
-function route() { const h = location.hash || '#/'; if (h.startsWith('#/coin/')) return { name: 'coin', id: decodeURIComponent(h.slice(7)) }; if (h === '#/watch') return { name: 'watch' }; if (h === '#/about') return { name: 'about' }; return { name: 'home' }; }
-let lastRoute = '';
-function render() {
-  const r = route();
-  document.querySelectorAll('.tabbar a').forEach(a => a.classList.toggle('on', a.dataset.tab === (r.name === 'coin' ? '' : r.name)));
-  $('#backBtn').hidden = r.name !== 'coin';
-  if (r.name !== 'coin') $('#title').innerHTML = '<span class="logo"></span>Memecoin Signals';
-  const key = r.name + (r.id || '');
-  if (key !== lastRoute) { window.scrollTo(0, 0); if (r.name === 'coin' && !lastRoute.startsWith('coin')) state.tf = '7d'; lastRoute = key; }
-  if (r.name === 'coin') renderDetail(r.id); else if (r.name === 'watch') renderWatch(); else if (r.name === 'about') renderAbout(); else renderHome();
+function swingPlanCard(w) {
+  const L = w.levels; const t = L.mode === 'long' ? ['Entry zone', 'Stop-loss', 'Target'] : L.mode === 'dip' ? ['Buy-the-dip zone', 'Stop-loss', 'Target'] : ['Support (re-entry)', 'Stop if holding', 'Resistance'];
+  return `<div class="card"><h3>Slow swing plan ${badge(w)}</h3>
+    <div class="why" style="margin-bottom:10px">${esc(w.reason)}</div>
+    <div class="levels"><div class="lv e"><small>${t[0]}</small><b>${fmtPrice(L.entry[0])}<br>– ${fmtPrice(L.entry[1])}</b></div>
+      <div class="lv s"><small>${t[1]}</small><b>${fmtPrice(L.stop)}</b></div><div class="lv t"><small>${t[2]}</small><b>${fmtPrice(L.tp)}</b></div></div>
+    <div class="note">⏱ Suggested hold: <b>${esc(L.hold)}</b>. Swing score ${w.score > 0 ? '+' : ''}${w.score} (4h/daily trend weighted). Not a prediction.</div></div>`;
 }
-window.addEventListener('hashchange', render);
-$('#backBtn').onclick = () => { if (history.length > 1) history.back(); else location.hash = '#/'; };
-
-// ---------- refresh ----------
-async function refresh(force = true) {
-  if (state.loading) return; state.loading = true; $('#refreshBtn').classList.add('spin');
-  try { await loadMarkets(force); render(); }
-  catch (e) { console.warn('refresh failed', e); if (!state.coins.length) app.innerHTML = `<div class="empty">Couldn't load market data.<br><small>${esc(e.message)}</small><br><br><button class="chip on" onclick="refresh()">Try again</button></div>`; else toast('Refresh failed — showing previous data'); }
-  finally { state.loading = false; $('#refreshBtn').classList.remove('spin'); }
-}
-window.refresh = refresh;
-$('#refreshBtn').onclick = () => refresh(true);
-setInterval(() => { if (document.visibilityState === 'visible') refresh(true); }, AUTO_REFRESH);
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && Date.now() - state.ts > AUTO_REFRESH) refresh(true); });
-setInterval(() => { const m = document.querySelector('.meta .live'); if (m && state.ts) m.lastChild.textContent = 'Updated ' + timeAgo(state.ts) + ' · ' + state.source; }, 15000);
-window.addEventListener('online', () => refresh(true));
 
 // pull-to-refresh
 (() => { let y0 = null, dy = 0; const ptr = $('#ptr');
   addEventListener('touchstart', e => { y0 = window.scrollY <= 0 && !e.target.closest('canvas') ? e.touches[0].clientY : null; dy = 0; }, { passive: true });
   addEventListener('touchmove', e => { if (y0 == null) return; dy = e.touches[0].clientY - y0; if (dy > 0) ptr.style.height = Math.min(dy * 0.5, 60) + 'px'; }, { passive: true });
-  addEventListener('touchend', () => { if (y0 == null) return; if (dy > 90) { ptr.style.height = '48px'; refresh(true).finally(() => ptr.style.height = '0'); } else ptr.style.height = '0'; y0 = null; });
+  addEventListener('touchend', () => { if (y0 == null) return; if (dy > 90) { ptr.style.height = '48px'; refresh().finally(() => ptr.style.height = '0'); } else ptr.style.height = '0'; y0 = null; });
 })();
 
 // install prompt
@@ -486,7 +867,14 @@ window.addEventListener('online', () => refresh(true));
 
 // ---------- boot ----------
 state.sort = ls.get('sort', 'score');
-const cached = ls.get('markets'); if (cached) Object.assign(state, cached, { stale: true });
+fast.age = ls.get('fastAge', 72); fast.sort = ls.get('fastSort', 'score');
+const cached = ls.get('markets'); if (cached) { Object.assign(state, cached, { stale: true }); state.coins = state.coins.map(c => c.swing ? c : { ...c, swing: swingSignal(c) }); }
+const cf = ls.get('fast'); if (cf) { try { fast.items = cf.items.map(i => toFastItem(i.pair, i)); fast.ts = cf.ts; } catch { } }
 render();
-refresh(false);
-if ('serviceWorker' in navigator) addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(e => console.warn('SW', e)));
+refreshSlow(false);
+if (route().name !== 'fast') refreshFast(false);
+if ('serviceWorker' in navigator) addEventListener('load', () => {
+  const had = !!navigator.serviceWorker.controller; let reloaded = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => { if (had && !reloaded) { reloaded = true; location.reload(); } });
+  navigator.serviceWorker.register('sw.js').then(r => r.update && r.update()).catch(e => console.warn('SW', e));
+});

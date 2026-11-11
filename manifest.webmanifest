@@ -1,14 +1,14 @@
 {
   "name": "Memecoin Signals",
   "short_name": "MemeSignals",
-  "description": "Memecoins ranked by live technical buy/sell signals. Not financial advice.",
+  "description": "Memecoin momentum scanner: fast flips, slow swings and a live launch feed. Not financial advice.",
   "id": "./",
   "start_url": "./#/",
   "scope": "./",
   "display": "standalone",
   "orientation": "portrait",
-  "background_color": "#0b0f1a",
-  "theme_color": "#0b0f1a",
+  "background_color": "#000000",
+  "theme_color": "#000000",
   "categories": ["finance"],
   "icons": [
     { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },

@@ -1,11 +1,13 @@
-const VERSION = 'memesignals-v1';
+const VERSION = 'memesignals-v2';
 const SHELL = ['./', './index.html', './styles.css', './app.js', './manifest.webmanifest',
   './icons/icon-192.png', './icons/icon-512.png', './icons/icon-maskable-512.png',
   './icons/apple-touch-icon.png', './icons/favicon-32.png'];
 const IMG_CACHE = 'coinsignals-img';
 
+async function trim(cache, max = 250) { const keys = await cache.keys(); for (let i = 0; i < keys.length - max; i++) await cache.delete(keys[i]); }
+
 self.addEventListener('install', e => {
-  e.waitUntil(caches.open(VERSION).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
+  e.waitUntil(caches.open(VERSION).then(c => c.addAll(SHELL.map(u => new Request(u, { cache: 'reload' })))).then(() => self.skipWaiting()));
 });
 self.addEventListener('activate', e => {
   e.waitUntil(caches.keys().then(keys => Promise.all(
@@ -31,9 +33,9 @@ self.addEventListener('fetch', e => {
     e.respondWith(caches.open(IMG_CACHE).then(async cache => {
       const hit = await cache.match(req);
       if (hit) return hit;
-      try { const r = await fetch(req); if (r.ok || r.type === 'opaque') cache.put(req, r.clone()); return r; }
+      try { const r = await fetch(req); if (r.ok || r.type === 'opaque') { await cache.put(req, r.clone()); trim(cache); } return r; }
       catch { return new Response('', { status: 504 }); }
     }));
   }
-  // API calls go straight to network; the app caches data in localStorage.
+  // API calls (DexScreener, GeckoTerminal, CoinGecko, Binance) go straight to network; the app caches data in localStorage.
 });

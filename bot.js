@@ -12,7 +12,8 @@
   const STORE = 'bot:v1';
   const WAL = 'bot:wallet';
   const SCAN_MS = 20000;
-  const TICK_MS = 2000;
+  const TICK_MS = 1000;
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
 
   const bot = {
     settings: S.cloneDefaults(),
@@ -44,7 +45,9 @@
     pub: null,
     hasPin: false,
     liveBal: { sol: 0, tokens: [], usd: 0 },
-    view: 'term'
+    view: 'term',
+    rejectTally: {},
+    _skipSave: false
   };
 
   function idleAgents() {
@@ -62,16 +65,35 @@
     positions: bot.positions, trades: bot.trades, equity: bot.equity.slice(-4000),
     dayKey: bot.dayKey, dayStartEquity: bot.dayStartEquity,
     consecLosses: bot.consecLosses, cooldownUntil: bot.cooldownUntil,
+    tokenCooldownUntil: bot.tokenCooldownUntil || {},
     scanned: bot.scanned, lastFlash: bot.lastFlash, tf: bot.tf
   });
 
-  function save() { try { ls.set(STORE, persistable()); } catch (e) { console.warn('bot save', e); } }
+  function save() { if (bot._skipSave) return; try { ls.set(STORE, persistable()); } catch (e) { console.warn('bot save', e); } }
+  function migrateSettings(s) {
+    const out = Object.assign(S.cloneDefaults(), s || {});
+    if (!s) return out;
+    if (s.minLiq === 30000 || s.minLiq === 12000) out.minLiq = S.DEFAULTS.minLiq;
+    if (s.minAgeMin === 25) out.minAgeMin = S.DEFAULTS.minAgeMin;
+    if (s.maxImpactPct === 2) out.maxImpactPct = S.DEFAULTS.maxImpactPct;
+    if (s.scoreScans === 3) out.scoreScans = S.DEFAULTS.scoreScans;
+    if (s.max1hChg === 300) out.max1hChg = S.DEFAULTS.max1hChg;
+    if (s.liqDropPct === 0.30) out.liqDropPct = S.DEFAULTS.liqDropPct;
+    if (s.posPct === 0.10) out.posPct = S.DEFAULTS.posPct;
+    if (s.maxOpen === 2) out.maxOpen = S.DEFAULTS.maxOpen;
+    if (s.maxAgeH === 72) out.maxAgeH = S.DEFAULTS.maxAgeH;
+    if (s.minScore === 62) out.minScore = S.DEFAULTS.minScore;
+    if (s.minLiqMcRatio === 0.06) out.minLiqMcRatio = S.DEFAULTS.minLiqMcRatio;
+    return out;
+  }
   function load() {
     const s = ls.get(STORE);
     if (!s) return;
     Object.assign(bot, s);
-    bot.settings = Object.assign(S.cloneDefaults(), s.settings || {});
+    bot.settings = migrateSettings(s.settings || {});
     bot.agents = idleAgents();
+    bot.rejectTally = bot.rejectTally || {};
+    bot.tokenCooldownUntil = bot.tokenCooldownUntil || {};
     if (bot.settings.mode !== 'LIVE') bot.settings.mode = 'PAPER';
   }
 
@@ -148,8 +170,12 @@
     } finally { clearTimeout(t); }
   }
 
+  const jupGate = { until: 0, minMs: 400, last: 0 };
   async function jup(path, opts) {
     const o = opts || {};
+    if (Date.now() < jupGate.until) throw new Error('Jupiter backoff');
+    const wait = jupGate.last + jupGate.minMs - Date.now();
+    if (wait > 0) await sleep(wait);
     let last;
     for (const base of [JUP, JUP2]) {
       try {
@@ -157,7 +183,15 @@
         const init = { method: o.method || 'GET', headers: { accept: 'application/json' } };
         if (o.body) { init.method = 'POST'; init.headers['content-type'] = 'application/json'; init.body = JSON.stringify(o.body); }
         const r = await fetch(url, init);
+        jupGate.last = Date.now();
+        if (r.status === 429) {
+          jupGate.until = Date.now() + 12000;
+          jupGate.minMs = Math.min(2500, (jupGate.minMs || 400) * 1.6);
+          last = new Error('Jupiter 429');
+          continue;
+        }
         if (!r.ok) { last = new Error('Jupiter ' + r.status); continue; }
+        jupGate.minMs = Math.max(350, (jupGate.minMs || 400) * 0.92);
         return await r.json();
       } catch (e) { last = e; }
     }
@@ -258,28 +292,63 @@
     return bot.liveBal;
   }
 
-  const sleep = ms => new Promise(r => setTimeout(r, ms));
-
-  async function dsPair(chain, pairAddr) {
-    const d = await getJSON('https://api.dexscreener.com/latest/dex/pairs/' + encodeURIComponent(chain) + '/' + encodeURIComponent(pairAddr), 8000);
-    return (d && (d.pair || (d.pairs && d.pairs[0]))) || null;
+  const dsCache = {};
+  async function dsPair(chain, pairAddr, critical) {
+    const key = chain + ':' + pairAddr;
+    const ttl = critical ? 600 : 2000;
+    const hit = dsCache[key];
+    if (hit && Date.now() - hit.ts < ttl) return hit.d;
+    const d = await getJSON('https://api.dexscreener.com/latest/dex/pairs/' + encodeURIComponent(chain) + '/' + encodeURIComponent(pairAddr), 8000, critical ? { critical: true } : undefined);
+    const pair = (d && (d.pair || (d.pairs && d.pairs[0]))) || null;
+    dsCache[key] = { ts: Date.now(), d: pair };
+    return pair;
+  }
+  async function dsBestPair(mint, hintAddr, critical) {
+    const key = 'tok:' + mint;
+    const ttl = critical ? 600 : 2000;
+    const hit = dsCache[key];
+    let pairs;
+    if (hit && Date.now() - hit.ts < ttl) pairs = hit.d;
+    else {
+      const d = await getJSON('https://api.dexscreener.com/latest/dex/tokens/' + encodeURIComponent(mint), 8000, critical ? { critical: true } : undefined);
+      pairs = ((d && d.pairs) || []).filter(p => (p.chainId || p.chain) === 'solana');
+      dsCache[key] = { ts: Date.now(), d: pairs };
+    }
+    if (!pairs || !pairs.length) {
+      if (hintAddr) return dsPair('solana', hintAddr, critical);
+      return null;
+    }
+    pairs = pairs.slice().sort((a, b) => ((b.liquidity && +b.liquidity.usd) || 0) - ((a.liquidity && +a.liquidity.usd) || 0));
+    return pairs[0];
   }
   async function rugReport(mint) {
     const hit = bot.rugCache[mint];
-    if (hit && Date.now() - hit.ts < 120000) return hit.d;
+    if (hit && Date.now() - hit.ts < 360000) return hit.d;
     const d = await getJSON(RUG + encodeURIComponent(mint) + '/report', 12000);
     bot.rugCache[mint] = { ts: Date.now(), d };
     return d;
   }
+  const gtCache = {};
   async function gtTicks(pairAddr) {
     try {
+      const hit = gtCache[pairAddr];
+      if (hit && Date.now() - hit.ts < 180000) return hit.d;
       const d = await getJSON('https://api.geckoterminal.com/api/v2/networks/solana/pools/' + encodeURIComponent(pairAddr) + '/ohlcv/minute?aggregate=1&limit=60&currency=usd&token=base', 10000);
       const list = (d && d.data && d.data.attributes && d.data.attributes.ohlcv_list) || [];
-      return list.map(r => ({ t: +r[0], px: +r[4], vol: +r[5] || 1 }));
+      const out = list.map(r => ({ t: +r[0], px: +r[4], vol: +r[5] || 1 }));
+      gtCache[pairAddr] = { ts: Date.now(), d: out };
+      return out;
     } catch { return []; }
   }
 
-  function lastPx(p) { return (bot._px && bot._px[p.mint]) || p.peakPx || p.entryPx; }
+  function midPx(p) { return (bot._px && bot._px[p.mint]) || p.peakPx || p.entryPx; }
+  function lastPx(p) {
+    const ds = bot._px && bot._px[p.mint];
+    const j = bot._jupPx && bot._jupPx[p.mint];
+    const cands = [ds, j].filter(x => x > 0);
+    if (cands.length) return Math.min.apply(null, cands);
+    return p.peakPx || p.entryPx;
+  }
   function equityNow() {
     if (bot.settings.mode === 'LIVE' && bot.liveBal) {
       const pos = bot.positions.reduce((s, p) => s + p.amount * lastPx(p), 0);
@@ -309,17 +378,44 @@
   }
   function solanaFastItems() { return (fast.items || []).filter(i => i.chain === 'solana'); }
 
+  async function jupSellMark(p) {
+    bot._jupPx = bot._jupPx || {};
+    bot._jupTs = bot._jupTs || {};
+    try {
+      const raw = rawAmount(p, p.amount);
+      const q = await jupQuote(p.mint, WSOL, raw, bot.settings.slippageBps);
+      if (!q.ok || !p.amount) return null;
+      const usd = (q.outAmount / 1e9) * (bot.solPx || 0);
+      const px = usd / p.amount;
+      if (px > 0) { bot._jupPx[p.mint] = px; bot._jupTs[p.mint] = Date.now(); }
+      p._jupMark = { px, usd, impactPct: q.impactPct, ts: Date.now() };
+      return p._jupMark;
+    } catch (e) { return null; }
+  }
   async function refreshPositionPrices() {
     bot._px = bot._px || {};
+    bot._pxTs = bot._pxTs || {};
+    bot._jupPx = bot._jupPx || {};
     await Promise.all(bot.positions.map(async p => {
       try {
-        if (!p.pairAddress) return;
-        const pair = await dsPair('solana', p.pairAddress);
-        if (!pair) return;
-        const px = +pair.priceUsd;
-        if (px) bot._px[p.mint] = px;
-        p._pair = pair;
-        p._mc = pairMc(pair);
+        let pair = null;
+        try { pair = await dsBestPair(p.mint, p.pairAddress, true); } catch (e) { console.warn('px ds', e); }
+        if (!pair && p.pairAddress) { try { pair = await dsPair('solana', p.pairAddress, true); } catch {} }
+        if (pair) {
+          const px = +pair.priceUsd;
+          if (px) { bot._px[p.mint] = px; bot._pxTs[p.mint] = Date.now(); }
+          p._pair = pair;
+          p._mc = pairMc(pair);
+          if (pair.pairAddress) p.pairAddress = pair.pairAddress;
+          p._quoteLiq = S.quoteLiqUsd(pair, bot.solPx, null);
+        } else {
+          p._pairGone = !p._pair;
+        }
+        const mid = midPx(p);
+        const alreadyDown = mid && p.entryPx && mid / p.entryPx - 1 <= -0.04;
+        const stale = !bot._pxTs[p.mint] || (Date.now() - bot._pxTs[p.mint] > 2500);
+        const due = !bot._jupTs || !bot._jupTs[p.mint] || (Date.now() - bot._jupTs[p.mint] > 2000);
+        if (stale || alreadyDown || due || !pair) await jupSellMark(p);
       } catch (e) { console.warn('px', e); }
     }));
   }
@@ -328,9 +424,27 @@
     if (!bot.positions.length) { bot.agents.brain.detail = 'watching'; bot.agents.brain.status = 'idle'; return; }
     const now = Date.now();
     for (const pos of bot.positions.slice()) {
+      if (!pos._rugTs || now - pos._rugTs > 15000) {
+        pos._rugTs = now;
+        try {
+          const rug = await rugReport(pos.mint);
+          pos._rug = rug;
+          if (rug && rug.rugged) pos._rugged = true;
+          const qRug = S.quoteLiqUsd(pos._pair, bot.solPx, rug);
+          if (qRug) pos._quoteLiq = pos._quoteLiq ? Math.min(pos._quoteLiq, qRug) : qRug;
+        } catch {}
+      }
+      const mid = midPx(pos);
       const px = lastPx(pos);
-      const d = S.decideExit(pos, px, now, bot.settings, pos._pair);
-      pos.peakPx = Math.max(pos.peakPx || pos.entryPx, px);
+      const d = S.decideExit(pos, mid, now, bot.settings, pos._pair, {
+        jupPx: bot._jupPx && bot._jupPx[pos.mint],
+        quoteLiqUsd: pos._quoteLiq,
+        solPx: bot.solPx,
+        rug: pos._rug,
+        rugged: !!pos._rugged,
+        pairGone: !!pos._pairGone && !pos._pair
+      });
+      pos.peakPx = Math.max(pos.peakPx || pos.entryPx, mid || pos.entryPx);
       bot.agents.brain.status = 'hot';
       bot.agents.brain.token = pos;
       if (d.action === 'hold') { bot.agents.brain.detail = pos.tpTaken ? 'trailing' : 'holding'; continue; }
@@ -377,6 +491,9 @@
         frac
       });
       if (res.closed) S.recordLossStreak(bot, res.pnl, bot.settings, Date.now());
+      if (kind === 'stop' || reason === 'liquidity' || reason === 'sell_spike') {
+        S.armTokenCooldown(bot, pos.mint, bot.settings, Date.now());
+      }
       bot.agents.executor.detail = kind === 'stop' ? ('stopped −$' + Math.abs(res.pnl).toFixed(2)) : ('sold ' + (mult.toFixed(2)) + 'x');
       bot.agents.brain.detail = bot.agents.executor.detail;
       bot.agents.brain.status = kind === 'stop' ? 'danger' : 'hot';
@@ -471,13 +588,23 @@
         costUsd = usd;
       }
       const id = 'p' + Date.now() + Math.random().toString(16).slice(2, 6);
+      const rugHit = bot.rugCache[mint] && bot.rugCache[mint].d;
+      if (rugHit && rugHit.token && isFinite(+rugHit.token.decimals)) decimals = +rugHit.token.decimals;
+      let pairAddr = p.pairAddress;
+      try {
+        const best = await dsBestPair(mint, pairAddr, true);
+        if (best && best.pairAddress) { pairAddr = best.pairAddress; item.pair = best; }
+      } catch {}
+      const used = item.pair || p;
+      const quoteLiq = S.quoteLiqUsd(used, bot.solPx || solPx, rugHit);
       S.applyBuy(bot, {
-        id, mint, symbol: item.symbol, icon: item.icon, px: fillPx, mc: pairMc(p),
-        liq: (p.liquidity && p.liquidity.usd) || 0, amount, costUsd, t: Date.now(),
-        pairAddress: p.pairAddress
+        id, mint, symbol: item.symbol, icon: item.icon, px: fillPx, mc: pairMc(used),
+        liq: (used.liquidity && used.liquidity.usd) || 0, quoteLiq, amount, costUsd, t: Date.now(),
+        pairAddress: pairAddr
       });
       const pos = bot.positions[bot.positions.length - 1];
       pos.decimals = decimals;
+      pos.entryQuoteLiq = quoteLiq;
       addTrade({
         id: 't' + id, t: Date.now(), kind: 'buy', mint, symbol: item.symbol, icon: item.icon,
         usd: costUsd, qty: amount, px: fillPx, mc: pairMc(p), agent: 'Executor', note: 'bought'
@@ -497,24 +624,55 @@
     }
   }
 
+  function noteReject(reasons) {
+    bot.rejectTally = bot.rejectTally || {};
+    const r0 = (reasons && reasons[0]) || 'unknown';
+    let bucket = r0;
+    if (/^liq|liquidity/.test(r0)) bucket = 'liquidity';
+    else if (/young|too new/.test(r0)) bucket = 'too new';
+    else if (/too old/.test(r0)) bucket = 'too old';
+    else if (/mint/.test(r0)) bucket = 'mint authority';
+    else if (/freeze/.test(r0)) bucket = 'freeze authority';
+    else if (/LP not/.test(r0)) bucket = 'LP unlocked';
+    else if (/danger risks|rugcheck/.test(r0)) bucket = 'rugcheck flags';
+    else if (/holders/.test(r0)) bucket = 'holder concentration';
+    else if (/buy impact/.test(r0)) bucket = 'buy impact';
+    else if (/honeypot|sell quote|sell impact/.test(r0)) bucket = 'honeypot / sell quote';
+    else if (/score not yet|score dipped/.test(r0)) bucket = 'score stability';
+    else if (/EMA|VWAP|local top|momentum|parabolic|1h |5m |no price|chasing/.test(r0)) bucket = 'momentum: ' + r0;
+    else if (/buy count|not rising/.test(r0)) bucket = 'buy count not rising';
+    else if (/extreme/i.test(r0)) bucket = 'extreme risk';
+    else if (/quote failed|Jupiter/.test(r0)) bucket = 'quote failed';
+    else if (/rugcheck failed/.test(r0)) bucket = 'rugcheck failed';
+    else if (/no safe/.test(r0)) bucket = 'no scan candidates';
+    else if (/quote liquidity|total liquidity|liq\/mcap/.test(r0)) bucket = 'thin exit liquidity';
+    else if (/dev holds/.test(r0)) bucket = 'dev holdings';
+    else if (/insiders|sniper/.test(r0)) bucket = 'insiders/snipers';
+    else if (/5m dump/.test(r0)) bucket = '5m dump';
+    else if (/token cooldown/.test(r0)) bucket = 'token cooldown';
+    bot.rejectTally[bucket] = (bot.rejectTally[bucket] || 0) + 1;
+  }
   async function scanAndMaybeEnter() {
     bot.equityUsd = equityNow();
+    pushEquity(bot.equityUsd);
     await ensureFast();
     const now = Date.now();
     const items = solanaFastItems();
     bot.scanned += items.length;
     const scanned = S.scanCandidates(items, now, bot.settings);
+    (scanned.whySkip || []).forEach(w => noteReject(w.reasons));
     bot.agents.scanner.status = 'hot';
     bot.agents.scanner.n = bot.scanned;
     bot.agents.scanner.detail = fmtCount(scanned.scanned) + ' pools';
-    const gate = S.canOpenMore(bot, bot.settings, now);
+    const gate = S.canOpenMore(bot, bot.settings, now, { solPx: bot.solPx, reserveUsd: reserveUsd() });
     if (!gate.ok) { bot.agents.analyst.detail = gate.reason; bot.agents.analyst.status = 'idle'; return; }
     if (bot.cashUsd - reserveUsd() < 2) { bot.agents.analyst.detail = 'need more cash / reserve'; return; }
-    const top = scanned.candidates.slice(0, 6);
+    const top = scanned.candidates.slice(0, 5);
     bot.agents.analyst.status = 'hot';
-    if (!top.length) { bot.agents.analyst.detail = 'no safe candidates'; return; }
+    if (!top.length) { bot.agents.analyst.detail = 'no safe candidates'; noteReject(['no safe candidates']); return; }
     for (const it of top) {
       if (bot.positions.some(p => p.mint === it.addr)) continue;
+      if (S.tokenOnCooldown(bot, it.addr, now)) { noteReject(['token cooldown']); continue; }
       const hist = bot.scoreHist[it.addr] || (bot.scoreHist[it.addr] = []);
       hist.push(it.sig.score);
       if (hist.length > 8) hist.shift();
@@ -522,12 +680,20 @@
       bot.agents.analyst.score = it.sig.score;
       bot.agents.analyst.detail = it.symbol + ' score ' + it.sig.score;
       let rug = null, ticks = bot.ticks[it.addr] || [];
-      try { rug = await rugReport(it.addr); } catch (e) { bot.agents.analyst.detail = 'rugcheck failed'; continue; }
+      try { rug = await rugReport(it.addr); } catch (e) { bot.agents.analyst.detail = 'rugcheck failed'; noteReject(['rugcheck failed']); continue; }
       if (ticks.length < 12 && it.pair.pairAddress) {
         try { ticks = await gtTicks(it.pair.pairAddress); bot.ticks[it.addr] = ticks; } catch {}
       }
+      const pre = S.analyzeSafety({
+        item: it, rug, priorScores: hist, ticks, now, skipQuotes: true, solPx: bot.solPx
+      }, bot.settings);
+      if (!pre.ok) {
+        noteReject(pre.reasons);
+        bot.agents.analyst.detail = (it.symbol + ' rejected: ' + pre.reasons[0]).slice(0, 52);
+        continue;
+      }
       const solPx = await solPrice();
-      const usd = S.positionUsd(equityNow(), bot.settings, reserveUsd());
+      const usd = S.positionUsd(equityNow(), bot.settings, reserveUsd(), bot.solPx || solPx);
       if (usd < 1) { bot.agents.analyst.detail = 'size too small'; return; }
       const lamports = Math.floor((usd / solPx) * 1e9);
       let quoteBuy, quoteSell;
@@ -535,15 +701,20 @@
         quoteBuy = await jupQuote(WSOL, it.addr, lamports, bot.settings.slippageBps);
         const out = quoteBuy.ok ? quoteBuy.outAmount : Math.floor((usd / +it.pair.priceUsd) * 1e6);
         quoteSell = await jupQuote(it.addr, WSOL, Math.max(1, out), bot.settings.slippageBps);
-      } catch (e) { bot.agents.analyst.detail = 'quote failed'; continue; }
+      } catch (e) { bot.agents.analyst.detail = 'quote failed'; noteReject(['quote failed']); continue; }
       const prev = bot.buyerHist[it.addr];
       const h1b = ((it.pair.txns || {}).h1 || {}).buys;
       const verdict = S.analyzeSafety({
         item: it, rug, quoteBuy, quoteSell, priorScores: hist, ticks, now,
-        buyerTrend: prev ? { prevH1Buys: prev.h1 } : null
+        buyerTrend: prev ? { prevH1Buys: prev.h1 } : null,
+        solPx
       }, bot.settings);
       bot.buyerHist[it.addr] = { h1: h1b, t: now };
-      if (!verdict.ok) { bot.agents.analyst.detail = (it.symbol + ' rejected: ' + verdict.reasons[0]).slice(0, 52); continue; }
+      if (!verdict.ok) {
+        noteReject(verdict.reasons);
+        bot.agents.analyst.detail = (it.symbol + ' rejected: ' + verdict.reasons[0]).slice(0, 52);
+        continue;
+      }
       await executeBuy(it, usd);
       return;
     }
@@ -565,8 +736,13 @@
   }
   async function scanLoop() {
     if (!bot.running) return;
-    try { await scanAndMaybeEnter(); if (route().name === 'bot') patchLiveUI(); }
-    catch (e) { console.warn('bot scan', e); }
+    try {
+      const eq = equityNow();
+      bot.equityUsd = eq;
+      pushEquity(eq);
+      await scanAndMaybeEnter();
+      if (route().name === 'bot') patchLiveUI();
+    } catch (e) { console.warn('bot scan', e); }
   }
   function startTimers() {
     stopTimers();
@@ -647,15 +823,16 @@
 
   function agentIcon(name, status) {
     const col = { scanner: '#2ee6c7', analyst: '#ff5a52', executor: '#b084ff', brain: '#ff8a3d' }[name];
-    const ring = status === 'danger' ? '#ff5a52' : status === 'hot' ? col : '#3a3a3c';
+    const ring = status === 'danger' ? '#ff5a52' : col;
     const spin = bot.running && status !== 'idle' ? 'term-ring-spin' : '';
+    const dash = status === 'idle' ? '92 145' : status === 'danger' ? '128 145' : '112 145';
     const face = {
-      scanner: '<g fill="'+col+'"><circle cx="16" cy="14" r="1.6"/><circle cx="22" cy="14" r="1.6"/><path d="M15 20c2 2.2 6 2.2 8 0" fill="none" stroke="'+col+'" stroke-width="1.6" stroke-linecap="round"/><path d="M12 9l2 3 2-3 2 3 2-3" fill="none" stroke="'+col+'" stroke-width="1.4" stroke-linecap="round"/></g>',
-      analyst: '<g><path d="M19 8.5l8 14.5H11L19 8.5z" fill="'+col+'"/><circle cx="16.5" cy="18" r="1.1" fill="#1a0a0a"/><circle cx="21.5" cy="18" r="1.1" fill="#1a0a0a"/><path d="M16.8 21.2c1.4 1.2 3 1.2 4.4 0" fill="none" stroke="#1a0a0a" stroke-width="1.1" stroke-linecap="round"/></g>',
-      executor: '<g fill="'+col+'"><ellipse cx="19" cy="18" rx="8" ry="7.2"/><circle cx="16" cy="17" r="1.3" fill="#1a1028"/><circle cx="22" cy="17" r="1.3" fill="#1a1028"/><path d="M16 21c2 1.6 4 1.6 6 0" fill="none" stroke="#1a1028" stroke-width="1.2" stroke-linecap="round"/></g>',
-      brain: '<g fill="'+col+'"><circle cx="19" cy="18" r="8"/><circle cx="16" cy="16.5" r="1.25" fill="#2a1408"/><circle cx="22" cy="16.5" r="1.25" fill="#2a1408"/><path d="M16.2 21c1.8 1.5 3.8 1.5 5.6 0" fill="none" stroke="#2a1408" stroke-width="1.2" stroke-linecap="round"/></g>'
+      scanner: '<g><ellipse cx="26" cy="27" rx="12" ry="11.2" fill="'+col+'"/><path d="M23.2 16.2h5.6M23 18.2h6M25.2 14.8v4.6M27.4 14.8v4.6" fill="none" stroke="#06332c" stroke-width="1.25" stroke-linecap="round"/><circle cx="21.4" cy="25.2" r="1.7" fill="#06332c"/><circle cx="30.6" cy="25.2" r="1.7" fill="#06332c"/><circle cx="21.9" cy="24.6" r=".45" fill="#fff" opacity=".55"/><circle cx="31.1" cy="24.6" r=".45" fill="#fff" opacity=".55"/><path d="M21.8 31c2.5 2.3 6.9 2.3 9.4 0" fill="none" stroke="#06332c" stroke-width="1.55" stroke-linecap="round"/></g>',
+      analyst: '<g><path d="M26 9.8l15 27.4H11L26 9.8z" fill="'+col+'" stroke="'+col+'" stroke-linejoin="round" stroke-width="1.6"/><circle cx="22.2" cy="28.2" r="1.75" fill="#2a0808"/><circle cx="29.8" cy="28.2" r="1.75" fill="#2a0808"/><circle cx="22.7" cy="27.6" r=".45" fill="#fff" opacity=".45"/><path d="M22.6 32.6c2.1 1.9 4.7 1.9 6.8 0" fill="none" stroke="#2a0808" stroke-width="1.35" stroke-linecap="round"/></g>',
+      executor: '<g><path d="M15.5 24.2c0-6.4 4.4-11.5 10.5-11.5s10.5 5.1 10.5 11.5v11.6c0 1.25-.95 1.55-1.7.7l-2.3-2.55-2.25 2.7c-.6.7-1.65.7-2.25 0l-2-2.5-2 2.5c-.6.7-1.65.7-2.25 0l-2.25-2.7-2.3 2.55c-.75.85-1.7.55-1.7-.7V24.2z" fill="'+col+'"/><circle cx="22.2" cy="23.4" r="1.7" fill="#1a1028"/><circle cx="29.8" cy="23.4" r="1.7" fill="#1a1028"/><circle cx="22.7" cy="22.8" r=".45" fill="#fff" opacity=".5"/><path d="M22.4 28.2c2.2 1.8 5 1.8 7.2 0" fill="none" stroke="#1a1028" stroke-width="1.35" stroke-linecap="round"/></g>',
+      brain: '<g><path d="M26 14.2c1.1-2.6 3.8-3.6 5.2-3.4" fill="none" stroke="'+col+'" stroke-width="2.3" stroke-linecap="round"/><ellipse cx="26" cy="27" rx="12.4" ry="11.5" fill="'+col+'"/><circle cx="21.5" cy="25.2" r="1.7" fill="#2a1408"/><circle cx="30.5" cy="25.2" r="1.7" fill="#2a1408"/><circle cx="22" cy="24.6" r=".45" fill="#fff" opacity=".45"/><path d="M21.8 31c2.5 2.2 6.9 2.2 9.4 0" fill="none" stroke="#2a1408" stroke-width="1.5" stroke-linecap="round"/></g>'
     }[name];
-    return '<svg class="term-ring '+spin+'" viewBox="0 0 38 38" width="42" height="42" aria-hidden="true"><circle cx="19" cy="19" r="16" fill="none" stroke="rgba(255,255,255,.08)" stroke-width="3"/><circle cx="19" cy="19" r="16" fill="none" stroke="'+ring+'" stroke-width="3" stroke-linecap="round" stroke-dasharray="70 100" transform="rotate(-90 19 19)"/>'+face+'</svg>';
+    return '<svg class="term-ring '+spin+'" viewBox="0 0 52 52" width="52" height="52" aria-hidden="true"><circle cx="26" cy="26" r="23" fill="none" stroke="rgba(255,255,255,.08)" stroke-width="4.5"/><circle cx="26" cy="26" r="23" fill="none" stroke="'+ring+'" stroke-width="4.5" stroke-linecap="round" stroke-dasharray="'+dash+'" transform="rotate(-90 26 26)"/>'+face+'</svg>';
   }
   function ghIcon() {
     return '<svg class="term-gh" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8a8 8 0 0 0 5.47 7.59c.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82A7.68 7.68 0 0 1 8 3.46c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8 8 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>';
@@ -685,19 +862,27 @@
     return best.v;
   }
   function layoutBubbles(trades, xOf, yOf, W) {
-    const vis = trades.filter(t => t.kind === 'buy' || t.kind === 'sell' || t.kind === 'stop').slice(0, 8);
+    const all = trades.filter(t => t.kind === 'buy' || t.kind === 'sell' || t.kind === 'stop');
+    const vis = [];
+    ['sell', 'stop', 'buy'].forEach(k => { const x = all.find(t => t.kind === k && !vis.includes(t)); if (x) vis.push(x); });
+    all.forEach(t => { if (vis.length < 3 && !vis.includes(t)) vis.push(t); });
     const placed = [];
-    vis.forEach(tr => {
+    vis.forEach((tr, i) => {
       const x = xOf(tr.t);
-      if (x < 8 || x > W - 8) return;
+      if (x < 4 || x > W - 4) return;
       const y = yOf(eqAt(tr.t));
-      const w = tr.kind === 'buy' ? 132 : 150;
+      const w = tr.kind === 'buy' ? 128 : 146;
       const h = 38;
       let bx = Math.max(8, Math.min(W - w - 8, x - w / 2));
-      let by = Math.max(6, y - 58);
+      let by = Math.max(58, y - 66);
+      if (bx + w > W - 86 && by < 52) bx = Math.max(8, W - w - 96);
       let guard = 0;
-      const overlap = () => placed.some(p => Math.abs(p.bx - bx) < (p.w + w) / 2 - 4 && Math.abs(p.by - by) < (p.h + h) / 2 - 4);
-      while (overlap() && guard++ < 14) { by -= 16; if (by < 2) { by = 6; bx = Math.min(W - w - 8, bx + 24); } }
+      const overlap = () => placed.some(p => Math.abs((p.bx + p.w / 2) - (bx + w / 2)) < (p.w + w) / 2 - 2 && Math.abs(p.by - by) < (p.h + h) / 2 - 2);
+      while (overlap() && guard++ < 16) {
+        by += (i % 2 ? 18 : -18);
+        if (by < 56) { by = 56; bx = Math.min(W - w - 8, bx + 28); }
+        if (by > y - 18) { by = Math.max(56, y - 72); bx = Math.max(8, bx - 22); }
+      }
       placed.push({ tr, x, y, bx, by, w, h });
     });
     return placed;
@@ -708,29 +893,45 @@
     if (!host) return;
     const cnv = host.querySelector('canvas');
     const overlay = host.querySelector('.term-bubs');
+    const hint = document.getElementById('termHint');
+    const dot = document.getElementById('termDot');
     if (!cnv) return;
     const dpr = Math.min(2, window.devicePixelRatio || 1);
-    const W = host.clientWidth || 390, H = host.clientHeight || 200;
+    const W = host.clientWidth || 390, H = host.clientHeight || 260;
     cnv.width = W * dpr; cnv.height = H * dpr;
     cnv.style.width = W + 'px'; cnv.style.height = H + 'px';
     const g = cnv.getContext('2d');
     g.setTransform(dpr, 0, 0, dpr, 0, 0);
     g.clearRect(0, 0, W, H);
+    g.strokeStyle = 'rgba(255,255,255,0.045)';
+    g.lineWidth = 1;
+    for (let i = 1; i <= 5; i++) {
+      const y = (H / 6) * i;
+      g.beginPath(); g.moveTo(0, y); g.lineTo(W, y); g.stroke();
+    }
     const pts = windowSeries(bot.tf);
     const ys = pts.map(p => p.v);
     let lo = Math.min.apply(null, ys), hi = Math.max.apply(null, ys);
-    if (hi - lo < Math.max(2, hi * 0.04)) { const mid = (hi + lo) / 2 || 200; const pad = Math.max(8, mid * 0.08); lo = mid - pad * 0.35; hi = mid + pad * 1.15; }
-    const padT = 28, padB = 16;
-    const xOf = t => { const a = pts[0].t, b = pts[pts.length - 1].t || a + 1; return (t - a) / (b - a || 1) * (W - 2); };
-    const yOf = v => padT + (1 - (v - lo) / (hi - lo)) * (H - padT - padB);
+    const empty = !(bot.trades && bot.trades.length);
+    if (hi - lo < Math.max(2, hi * 0.04)) {
+      const mid = (hi + lo) / 2 || 200;
+      const pad = Math.max(8, mid * 0.08);
+      lo = mid - pad * 0.45;
+      hi = mid + pad * 1.35;
+    }
+    const padT = Math.max(118, Math.round(H * 0.42)), padB = 22;
+    const xOf = t => { const a = pts[0].t, b = pts[pts.length - 1].t || a + 1; return (t - a) / (b - a || 1) * (W - 8) + 4; };
+    const yOf = v => padT + (1 - (v - lo) / (hi - lo || 1)) * (H - padT - padB);
     const path = () => { g.beginPath(); pts.forEach((p, i) => { const x = xOf(p.t), y = yOf(p.v); i ? g.lineTo(x, y) : g.moveTo(x, y); }); };
     path(); g.lineTo(xOf(pts[pts.length - 1].t), H); g.lineTo(xOf(pts[0].t), H); g.closePath();
-    const grad = g.createLinearGradient(0, 0, 0, H);
-    grad.addColorStop(0, 'rgba(20, 180, 80, 0.38)');
-    grad.addColorStop(0.55, 'rgba(8, 80, 40, 0.18)');
+    const yLine = yOf(pts[pts.length - 1].v);
+    const grad = g.createLinearGradient(0, yLine, 0, H);
+    grad.addColorStop(0, 'rgba(30, 227, 106, 0.40)');
+    grad.addColorStop(0.5, 'rgba(12, 90, 44, 0.16)');
     grad.addColorStop(1, 'rgba(0,0,0,0)');
     g.fillStyle = grad; g.fill();
-    path(); g.strokeStyle = '#1ee36a'; g.lineWidth = 2.2; g.lineJoin = 'round'; g.lineCap = 'round'; g.stroke();
+    path(); g.strokeStyle = 'rgba(30,227,106,.28)'; g.lineWidth = 7; g.lineJoin = 'round'; g.lineCap = 'round'; g.stroke();
+    path(); g.strokeStyle = '#1ee36a'; g.lineWidth = 2.4; g.stroke();
     const t0 = pts[0].t, t1 = pts[pts.length - 1].t;
     const trades = bot.trades.filter(tr => tr.t >= t0 && tr.t <= t1 + 1000);
     const latestStop = trades.find(tr => tr.kind === 'stop');
@@ -745,6 +946,17 @@
         g.fillStyle = tr.kind === 'buy' ? '#3d8bff' : '#1ee36a'; g.fill();
       }
     });
+    const last = pts[pts.length - 1];
+    const ex = xOf(last.t), ey = yOf(last.v);
+    g.beginPath(); g.arc(ex, ey, 8, 0, Math.PI * 2);
+    g.fillStyle = 'rgba(30,227,106,.18)'; g.fill();
+    g.beginPath(); g.arc(ex, ey, 3.4, 0, Math.PI * 2);
+    g.fillStyle = '#1ee36a'; g.fill();
+    if (dot) { dot.style.left = ex + 'px'; dot.style.top = ey + 'px'; dot.hidden = false; }
+    if (hint) {
+      hint.classList.toggle('off', !empty);
+      if (empty) hint.style.top = Math.max(8, ey - 28) + 'px';
+    }
     const placed = layoutBubbles(trades, xOf, yOf, W);
     if (overlay) {
       overlay.innerHTML = placed.map(b => {
@@ -769,15 +981,21 @@
   function odometerHTML(value, cls) {
     return '<span class="term-bal '+cls+'" id="termBal" data-v="'+value+'">'+fmtUsd(value)+'</span>';
   }
+  function fitBalance(el, text) {
+    if (!el) return;
+    el.style.fontSize = (text && text.length > 9) ? '60px' : '';
+  }
   function animateBalance(el, from, to, cls) {
     if (!el) return;
     el.className = 'term-bal ' + cls;
-    const start = performance.now(), dur = 700;
+    const start = performance.now(), dur = 820;
     const step = now => {
       const k = Math.min(1, (now - start) / dur);
       const v = from + (to - from) * (1 - Math.pow(1 - k, 3));
       el.dataset.v = v;
-      el.textContent = fmtUsd(v);
+      const text = fmtUsd(v);
+      el.textContent = text;
+      fitBalance(el, text);
       if (k < 1) requestAnimationFrame(step);
     };
     requestAnimationFrame(step);
@@ -793,9 +1011,14 @@
 
   function agentsHTML() {
     const a = bot.agents;
-    const card = (key, title, src, bottom, border) => {
+    const glow = (key, ag) => {
+      if (ag.status === 'danger') return 'on-red';
+      if (ag.status !== 'hot') return '';
+      return 'on-' + ({ scanner: 'teal', analyst: 'red', executor: 'purple', brain: 'green' }[key] || 'teal');
+    };
+    const card = (key, title, src, bottom) => {
       const ag = a[key];
-      return '<div class="agcard '+(border || ag.status || '')+'" data-ag="'+key+'">'+agentIcon(key, ag.status)+
+      return '<div class="agcard '+glow(key, ag)+'" data-ag="'+key+'">'+agentIcon(key, ag.status)+
         '<div class="agbody"><div class="agtitle">'+title+'</div><div class="agsrc">'+ghIcon()+' '+esc(src)+'</div><div class="agbot">'+bottom(ag)+'</div></div></div>';
     };
     return '<div class="term-agents">'+
@@ -803,7 +1026,7 @@
       card('analyst', 'Analyst', 'rugcheck', ag => {
         const t = ag.token;
         return (t ? tokAv(t.icon, t.symbol, 'tav xs')+' ' : '')+'<span class="ok">'+(t ? esc(t.symbol)+' score '+(ag.score || (t.sig && t.sig.score) || '') : esc(ag.detail))+'</span>';
-      }, a.analyst.status === 'hot' ? 'on-red' : '')+
+      })+
       card('executor', 'Executor', 'jupiter', ag => {
         const t = ag.token;
         return (t ? tokAv(t.icon, t.symbol || t.mint, 'tav xs')+' ' : '')+'<span class="ok">'+esc(ag.detail)+'</span>';
@@ -811,13 +1034,16 @@
       card('brain', 'Brain', 'brain', ag => {
         const t = ag.token;
         return (t ? tokAv(t.icon, t.symbol, 'tav xs')+' ' : '')+'<span class="ok">'+esc(ag.detail)+'</span>';
-      }, a.brain.status === 'danger' ? 'on-red' : a.brain.status === 'hot' ? 'on-green' : '')+
+      })+
     '</div>';
   }
 
   function activityHTML() {
     const rows = bot.trades.slice(0, 20);
-    if (!rows.length) return '<div class="term-empty">No trades yet. The bot only buys Fast Solana coins after every safety check passes.</div>';
+    if (!rows.length) return '<div class="term-empty">'+
+      '<svg class="term-empty-ico" viewBox="0 0 64 64" aria-hidden="true"><rect x="4" y="8" width="56" height="48" rx="14" fill="rgba(255,255,255,.04)" stroke="rgba(255,255,255,.08)"/><path d="M10 40c8-2 12-16 22-16s12 18 22 10" fill="none" stroke="#1ee36a" stroke-width="2.2" stroke-linecap="round"/><circle cx="54" cy="30" r="3.1" fill="#1ee36a"/></svg>'+
+      '<b>Waiting for the first fill</b>'+
+      '<span>Safety checks come first. Fast Solana coins only, after every gate passes.</span></div>';
     return rows.map(tr => {
       const badge = tr.kind === 'buy' ? 'b-buy' : tr.kind === 'stop' ? 'b-stop' : 'b-sell';
       const mark = tr.kind === 'buy' ? '↓' : tr.kind === 'stop' ? '×' : '✓';
@@ -850,6 +1076,14 @@
     }).join('');
   }
 
+  function bannerHTML() {
+    try { if (ls.get('bot:hideBanner')) return ''; } catch {}
+    return '<div class="term-banner" id="termBanner"><svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><circle cx="8" cy="8" r="7" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M8 4.6v4.6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="8" cy="11.6" r=".9" fill="currentColor"/></svg><span>Runs only while the app is open — keep the screen on</span><button type="button" class="term-banner-x" id="termBannerX" aria-label="Dismiss">×</button></div>';
+  }
+  function bindBanner() {
+    const x = document.getElementById('termBannerX');
+    if (x) x.onclick = () => { try { ls.set('bot:hideBanner', 1); } catch {} const b = document.getElementById('termBanner'); if (b) b.remove(); };
+  }
   function termHeader(title) {
     return '<header class="term-top"><button type="button" class="term-back" id="termBack" aria-label="Back">'+chev()+'</button>'+
       '<div class="term-title">'+title+'</div>'+
@@ -866,12 +1100,14 @@
     const flashKind = bot.lastFlash && Date.now() - bot.lastFlash.t < 8000 && bot.lastFlash.kind;
     const balCls = flashKind === 'stop' ? 'dn' : (flashKind === 'sell' ? 'up' : cls);
     app.innerHTML = '<div class="term">'+termHeader('Meme Terminal')+
-      '<div class="term-banner">Bot runs only while the app is open; keep screen on</div>'+
+      bannerHTML()+
       '<div class="term-botrow"><button type="button" class="term-botid" id="termBotBtn">'+botFace()+' <span>Meme Bot</span> <i>›</i></button>'+pillLive()+'</div>'+
+      '<div class="term-hero">'+
+      '<div class="term-chart" id="termChart"><canvas></canvas><div class="term-dot" id="termDot"></div><div class="term-hint" id="termHint">Waiting for first trade…</div><div class="term-bubs"></div></div>'+
       '<div class="term-sub"><span>Solana · '+openN()+' open</span><span id="termClock">'+clockNow()+'</span></div>'+
       '<div class="term-balwrap">'+odometerHTML(p.eq, balCls)+flashHTML()+'</div>'+
       '<div class="term-pnl"><span class="'+(p.pnl >= 0 ? 'up' : 'dn')+'">'+(p.pnl >= 0 ? '▲' : '▼')+' '+fmtUsd(Math.abs(p.pnl))+' ('+Math.abs(p.pct).toFixed(2)+'%)</span><span class="term-mult">'+p.mult.toFixed(2)+'×</span></div>'+
-      '<div class="term-chart" id="termChart"><canvas></canvas><div class="term-bubs"></div></div>'+
+      '</div>'+
       '<div class="term-tfs">'+['LIVE','1H','4H','1D','1W','ALL'].map(t => '<button type="button" data-tf="'+t+'" class="'+(bot.tf === t ? 'on' : '')+'">'+(t === 'LIVE' ? '• LIVE' : t)+'</button>').join('')+'</div>'+
       '<div class="term-h3">Agents <span>4 running</span></div>'+agentsHTML()+
       '<div class="term-h3">Activity <span>'+bot.trades.length+' trade'+(bot.trades.length === 1 ? '' : 's')+'</span></div>'+
@@ -881,10 +1117,13 @@
       '<button type="button" class="term-link" id="termSettings">Settings</button></div>'+
       '<div class="note term-note">Fast Solana memecoins only, holds of about 60–90 minutes. The bot does not predict price and can lose the whole burner wallet. PAPER uses live quotes with fake money. LIVE signs real Jupiter swaps on Solana.</div></div>';
     bindTerm();
+    const bal = document.getElementById('termBal');
+    if (bal) fitBalance(bal, bal.textContent);
     requestAnimationFrame(drawChart);
   }
 
   function bindTerm() {
+    bindBanner();
     const back = $('#termBack'); if (back) back.onclick = () => { location.hash = '#/'; };
     const sh = $('#termShare'); if (sh) sh.onclick = shareStats;
     const botBtn = $('#termBotBtn'); if (botBtn) botBtn.onclick = () => { bot.view = 'wallet'; renderBot(); };
@@ -911,7 +1150,7 @@
       const flashKind = bot.lastFlash && Date.now() - bot.lastFlash.t < 8000 && bot.lastFlash.kind;
       const cls = flashKind === 'stop' ? 'dn' : flashKind === 'sell' ? 'up' : (p.pnl > 1 ? 'up' : p.pnl < -1 ? 'dn' : '');
       if (isFinite(prev) && Math.abs(prev - p.eq) > 0.005) animateBalance(el, prev, p.eq, cls);
-      else { el.className = 'term-bal ' + cls; el.dataset.v = p.eq; }
+      else { el.className = 'term-bal ' + cls; el.dataset.v = p.eq; el.textContent = fmtUsd(p.eq); fitBalance(el, el.textContent); }
     }
     const cl = $('#termClock'); if (cl) cl.textContent = clockNow();
     const wrap = document.querySelector('.term-balwrap');
@@ -943,7 +1182,7 @@
     try { if (bot.pub && lib() && lib().qrDataUrl) qr = await lib().qrDataUrl(bot.pub); } catch (e) { console.warn('qr', e); }
     const tokens = (bot.liveBal.tokens || []);
     app.innerHTML = '<div class="term term-page">'+termHeader('Wallet')+
-      '<div class="term-banner">Bot runs only while the app is open; keep screen on</div>'+
+      bannerHTML()+
       '<div class="card warn"><b>This is a hot burner wallet</b> kept in this phone’s browser storage. It is not a hardware wallet. Anyone with the phone or the exported key can spend the funds. Start with a small amount you can afford to lose. Never reuse your main Phantom seed.</div>'+
       '<div class="card"><div class="wal-label">Deposit address (Solana)</div><div class="wal-addr" id="walAddr">'+esc(bot.pub || '—')+'</div>'+
       '<div class="wal-actions"><button class="term-cta" id="copyAddr">Copy address</button></div>'+
@@ -961,7 +1200,7 @@
       '<button class="lk" id="exAsk">I understand — reveal key</button><div id="exBox" hidden><code class="wal-addr" id="exKey"></code><button class="term-cta" id="exCopy">Copy key</button></div></div>'+
       '<div class="card"><h3>Optional PIN lock</h3>'+(bot.hasPin ? '<div class="note">Wallet is PIN-encrypted on this device.</div>' : '<input class="set-in" id="newPin" type="password" inputmode="numeric" placeholder="New PIN (4+ digits)"><button class="lk" id="setPin">Encrypt wallet with PIN</button>')+'</div>'+
       '<div class="term-foot"><button class="term-link" id="backTerm">Back to terminal</button></div></div>';
-    bindWalletChrome();
+    bindWalletChrome(); bindBanner();
     const copyA = $('#copyAddr'); if (copyA) copyA.onclick = () => copyText(bot.pub || '');
     const exAsk = $('#exAsk');
     if (exAsk) exAsk.onclick = () => {
@@ -1039,22 +1278,22 @@
   function renderSettings() {
     const s = bot.settings;
     app.innerHTML = '<div class="term term-page">'+termHeader('Settings')+
-      '<div class="term-banner">Bot runs only while the app is open; keep screen on</div>'+
+      bannerHTML()+
       '<div class="card"><h3>Mode</h3><div class="seg" id="modeSeg">'+
       '<button type="button" data-mode="PAPER" class="'+(s.mode !== 'LIVE' ? 'on' : '')+'">PAPER</button>'+
       '<button type="button" data-mode="LIVE" class="'+(s.mode === 'LIVE' ? 'on' : '')+'">LIVE</button></div>'+
       '<div class="note">'+(s.mode === 'LIVE' ? 'LIVE uses real SOL in the burner wallet. Trades are signed on this phone and sent to Solana.' : 'PAPER simulates fills from live Jupiter quotes. No real money moves.')+'</div></div>'+
       '<div class="card"><h3>Risk (quick flips, capital first)</h3>'+
-      setNum('posPct', 'Position size', (s.posPct * 100).toFixed(0), '% of equity, max 10')+
-      setNum('maxOpen', 'Max open positions', s.maxOpen, 'max 2')+
+      setNum('posPct', 'Position size', (s.posPct * 100).toFixed(0), '% of equity, default 5, max 10')+
+      setNum('maxOpen', 'Max open positions', s.maxOpen, 'default 8, hard cap 8 (~40% if size is 5%)')+
       setNum('tpPct', 'Take profit', (s.tpPct * 100).toFixed(0), '% · sell half')+
       setNum('tpSellPct', 'Sell at TP', (s.tpSellPct * 100).toFixed(0), '% of the position')+
       setNum('trailPct', 'Trailing stop', (s.trailPct * 100).toFixed(0), '% off peak after TP or +20%')+
-      setNum('slPct', 'Hard stop loss', (s.slPct * 100).toFixed(0), '% checked about every 2s')+
+      setNum('slPct', 'Hard stop loss', (s.slPct * 100).toFixed(0), '% checked about every 1s')+
       setNum('maxHoldMin', 'Max hold', s.maxHoldMin, 'minutes (60–120 for Fast flips)')+
       setNum('dailyLossPct', 'Daily loss cap', (s.dailyLossPct * 100).toFixed(0), '% of the day-start balance → auto-stop entries')+
       setNum('slippageBps', 'Slippage cap', s.slippageBps, 'basis points')+
-      setNum('minScore', 'Min momentum score', s.minScore, 'needs 3 stable scans')+
+      setNum('minScore', 'Min momentum score', s.minScore, 'needs ' + (s.scoreScans || 2) + ' stable scans')+
       setNum('minAgeMin', 'Min pair age', s.minAgeMin, 'minutes')+
       setNum('minSolReserve', 'Fee reserve', s.minSolReserve, 'SOL kept for fees')+
       '<label class="set-lab">Custom RPC URL</label><input class="set-in" id="rpcUrl" value="'+esc(s.rpcUrl || '')+'" placeholder="https://solana-rpc.publicnode.com">'+
@@ -1063,6 +1302,7 @@
       '<button class="term-cta danger" id="kill">KILL SWITCH — sell all & stop</button></div>'+
       '<div class="term-foot"><button class="term-link" id="backTerm">Back to terminal</button></div></div>';
     bindWalletChrome();
+    bindBanner();
     app.querySelectorAll('#modeSeg [data-mode]').forEach(b => b.onclick = () => {
       if (b.dataset.mode === 'LIVE') {
         if (!confirm('LIVE mode spends real SOL from the burner wallet on Fast Solana memecoins. You can lose everything you deposit. The bot only runs while the app is open. Continue?')) return;
@@ -1075,7 +1315,7 @@
       const val = id => parseFloat(document.getElementById(id).value);
       const pct = (id, max) => { const v = val(id); if (isFinite(v)) bot.settings[id] = Math.min(max != null ? max : 99, v / 100); };
       pct('posPct', 0.10);
-      bot.settings.maxOpen = Math.max(1, Math.min(2, Math.round(val('maxOpen') || 2)));
+      bot.settings.maxOpen = Math.max(1, Math.min(8, Math.round(val('maxOpen') || 8)));
       pct('tpPct'); pct('tpSellPct', 1); pct('trailPct'); pct('slPct'); pct('dailyLossPct');
       if (isFinite(val('maxHoldMin'))) bot.settings.maxHoldMin = Math.max(30, Math.min(180, val('maxHoldMin')));
       if (isFinite(val('slippageBps'))) bot.settings.slippageBps = val('slippageBps');
@@ -1089,11 +1329,79 @@
     $('#kill').onclick = () => { if (!confirm('Sell every open position now and stop the bot?')) return; killSwitch(); };
   }
 
+  function demoRequested() {
+    try {
+      if (window.__BOT_DEMO === true) return true;
+      if (localStorage.getItem('bot:demo') === '1') return true;
+      const hashQ = (location.hash.split('?')[1] || '');
+      const search = (location.search || '').replace(/^\?/, '');
+      return /(?:^|&)demo=1(?:&|$)/.test(hashQ + '&' + search);
+    } catch { return false; }
+  }
+  function demoIcon(bg, letter) {
+    const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40"><circle cx="20" cy="20" r="20" fill="'+bg+'"/><text x="20" y="25" text-anchor="middle" font-size="15" font-family="-apple-system,system-ui,sans-serif" font-weight="700" fill="#fff">'+letter+'</text></svg>';
+    return 'data:image/svg+xml;utf8,' + encodeURIComponent(svg);
+  }
+  function loadDemoData() {
+    const now = Date.now();
+    const T = m => now - (18 - m) * 60e3;
+    const icoN = demoIcon('#3d8bff', 'N');
+    const icoR = demoIcon('#ff7a3d', 'R');
+    const icoP = demoIcon('#1ee36a', 'P');
+    const key = [
+      [0, 200], [1, 200.2], [2, 199.8], [2.8, 200],
+      [3, 200], [4, 206], [5, 214], [6, 228], [7, 238],
+      [8, 248], [8.2, 248], [10, 248], [10.5, 252], [11, 246], [11.5, 242],
+      [12, 244.9], [13, 245], [14, 245], [14.5, 258], [15, 272], [15.5, 290],
+      [16, 308], [16.5, 322], [17, 307], [17.2, 312], [17.6, 318], [18, 324.4]
+    ];
+    const pts = key.map(([m, v]) => ({ t: T(m), v }));
+    bot.equity = [];
+    for (let ts = pts[0].t; ts <= now; ts += 12000) {
+      let a = pts[0], b = pts[pts.length - 1];
+      for (let i = 0; i < pts.length - 1; i++) if (ts >= pts[i].t && ts <= pts[i + 1].t) { a = pts[i]; b = pts[i + 1]; break; }
+      if (ts >= pts[pts.length - 1].t) { bot.equity.push({ t: ts, v: pts[pts.length - 1].v }); continue; }
+      const k = (ts - a.t) / (b.t - a.t || 1);
+      bot.equity.push({ t: ts, v: a.v + (b.v - a.v) * k });
+    }
+    bot.equity.push({ t: now, v: 324.40 });
+    bot.startUsd = 200;
+    bot.startTs = T(0);
+    bot.cashUsd = 324.40;
+    bot.dayStartEquity = 200;
+    bot.positions = [];
+    bot.trades = [
+      { id: 'd1', t: T(17), kind: 'sell', symbol: 'PEBBLE', icon: icoP, usd: 90, pnlUsd: 62, pnlPct: 62 / 28, mult: 3.21, agent: 'Brain', note: 'took profit', mc: 412000, frac: 1 },
+      { id: 'd2', t: T(14), kind: 'buy', symbol: 'PEBBLE', icon: icoP, usd: 28, agent: 'Executor', note: 'entry', mc: 280000 },
+      { id: 'd3', t: T(12), kind: 'stop', symbol: 'RIPP', icon: icoR, usd: 20.9, pnlUsd: -3.10, pnlPct: -0.129, agent: 'Brain', note: 'stop −12%', mc: 190000 },
+      { id: 'd4', t: T(10), kind: 'buy', symbol: 'RIPP', icon: icoR, usd: 24, agent: 'Executor', note: 'entry', mc: 210000 },
+      { id: 'd5', t: T(8), kind: 'sell', symbol: 'NOVA', icon: icoN, usd: 68, pnlUsd: 48, pnlPct: 2.4, mult: 3.40, agent: 'Brain', note: 'took profit', mc: 640000, frac: 1 },
+      { id: 'd6', t: T(3), kind: 'buy', symbol: 'NOVA', icon: icoN, usd: 20, agent: 'Executor', note: 'entry', mc: 375000 }
+    ];
+    bot.lastFlash = { t: now - 20000, usd: 62, kind: 'sell' };
+    bot.agents = {
+      scanner: { status: 'hot', detail: '1,284 pools', n: 1284 },
+      analyst: { status: 'hot', detail: 'PEBBLE score 88', token: { symbol: 'PEBBLE', icon: icoP }, score: 88 },
+      executor: { status: 'hot', detail: 'bought $28', token: { symbol: 'PEBBLE', icon: icoP } },
+      brain: { status: 'hot', detail: 'sold 3.21x', token: { symbol: 'PEBBLE', icon: icoP } }
+    };
+    bot.tf = 'LIVE';
+    bot.settings.mode = 'PAPER';
+    bot.running = false;
+    bot.halted = null;
+    bot._skipSave = true;
+  }
+  function applyDemo() {
+    if (bot._demoApplied) return;
+    bot._demoApplied = true;
+    loadDemoData();
+  }
   async function renderBot() {
     document.body.classList.add('term-on');
     $('#backBtn').hidden = true;
     $('#title').innerHTML = '<span class="logo"></span>Meme Terminal';
     try { await ensureWallet(); } catch (e) { console.warn(e); }
+    if (demoRequested()) applyDemo();
     if (!bot.equity.length) pushEquity(equityNow());
     if (bot.view === 'wallet') return renderWallet();
     if (bot.view === 'settings') return renderSettings();
@@ -1114,6 +1422,12 @@
     start: startBot, stop: stopBot, kill: killSwitch,
     render: renderBot, save, ensureWallet, keypair, jupQuote, jupSwapTx, signSwap, simulateB64, sendB64,
     rpc, solPrice, loadLiveBalances, equityNow, scanAndMaybeEnter, checkExits, executeBuy, executeSell,
-    strategy: S, WSOL, USDC
+    strategy: S, WSOL, USDC,
+    get rejectTally() { return bot.rejectTally || {}; },
+    demo: function (on) {
+      window.__BOT_DEMO = !!on;
+      if (on) applyDemo();
+      return renderBot();
+    }
   };
 })();

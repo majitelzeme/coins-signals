@@ -38,7 +38,36 @@ function fmtPrice(p) {
 }
 const fmtPct = v => v == null || !isFinite(v) ? '—' : (v >= 0 ? '+' : '') + v.toFixed(2) + '%';
 const pctCls = v => v >= 0 ? 'up' : 'dn';
-function fmtBig(n) { if (!n) return '—'; const u = [[1e12,'T'],[1e9,'B'],[1e6,'M'],[1e3,'K']]; for (const [v, s] of u) if (n >= v) return '$' + (n / v).toFixed(2) + s; return '$' + n.toFixed(0); }
+function fmtBig(n) { if (n == null || !isFinite(n) || n === 0) return '—'; const sign = n < 0 ? '-' : ''; const a = Math.abs(n); const u = [[1e12,'T'],[1e9,'B'],[1e6,'M'],[1e3,'K']]; for (const [v, s] of u) if (a >= v) return sign + '$' + (a / v).toFixed(2) + s; return sign + '$' + a.toFixed(0); }
+function fmtMcVal(n) {
+  if (n == null || !isFinite(n)) return '—';
+  const sign = n < 0 ? '-' : ''; const a = Math.abs(n);
+  const u = [[1e12,'T'],[1e9,'B'],[1e6,'M'],[1e3,'K']];
+  for (const [v, s] of u) if (a >= v) return sign + '$' + (a / v).toFixed(a >= 10 * v ? 1 : 2) + s;
+  return sign + '$' + a.toFixed(a >= 100 ? 0 : 2);
+}
+const pairMc = p => { const n = p && (p.marketCap || p.fdv); return n && isFinite(n) ? +n : null; };
+const coinMc = c => c && c.mcap && isFinite(c.mcap) ? +c.mcap : null;
+const mcFactor = (mc, px) => (mc && px && isFinite(mc) && isFinite(px)) ? mc / px : null;
+const fmtPrimaryMc = (mc, px) => mc ? fmtBig(mc) : fmtPrice(px);
+const pxSub = px => `<span class="pxsub">${fmtPrice(px)}</span>`;
+function levelMcHTML(px, fac) {
+  if (px == null || !isFinite(px)) return '<b>—</b>';
+  if (fac) return `<b>${fmtBig(px * fac)}</b><br><small class="pxsub">${fmtPrice(px)}</small>`;
+  return `<b>${fmtPrice(px)}</b>`;
+}
+function levelMcRangeHTML(a, b, fac) {
+  if (fac) return `<b>${fmtBig(a * fac)}–${fmtBig(b * fac)}</b><br><small class="pxsub">${fmtPrice(a)}–${fmtPrice(b)}</small>`;
+  return `<b>${fmtPrice(a)}<br>– ${fmtPrice(b)}</b>`;
+}
+function planLineHTML(L, fac) {
+  if (fac) return `<span>Entry MC <b class="e">${fmtBig(L.entry[0] * fac)}–${fmtBig(L.entry[1] * fac)}</b></span><span>Stop <b class="dn">${fmtBig(L.stop * fac)}</b></span><span>Target <b class="up">${fmtBig(L.tp * fac)}</b></span><span class="hold">⏱ ${esc(L.hold)}</span>`;
+  return `<span>Entry <b class="e">${fmtPrice(L.entry[1])}</b></span><span>Stop <b class="dn">${fmtPrice(L.stop)}</b></span><span>Target <b class="up">${fmtPrice(L.tp)}</b></span><span class="hold">⏱ ${esc(L.hold)}</span>`;
+}
+function dsChartUrl(chain, pairAddress, url) {
+  const base = url || (`https://dexscreener.com/${chain}/${pairAddress}`);
+  return base + (base.includes('?') ? '&' : '?') + 'chartType=marketCap';
+}
 function timeAgo(ts) { const s = Math.round((Date.now() - ts) / 1000); if (s < 10) return 'just now'; if (s < 60) return s + 's ago'; if (s < 3600) return Math.round(s / 60) + ' min ago'; if (s < 172800) return Math.round(s / 3600) + ' h ago'; return Math.round(s / 86400) + ' d ago'; }
 function toast(msg, ms = 3200) { const t = $('#toast'); t.textContent = msg; t.hidden = false; clearTimeout(toast._t); toast._t = setTimeout(() => t.hidden = true, ms); }
 class HttpError extends Error { constructor(status, url) { super('HTTP ' + status); this.status = status; this.url = url; } }
@@ -225,8 +254,8 @@ function rowHTML(c) {
     ${avatar(c)}
     <div class="nm"><div class="t"><span class="nmx">${esc(c.name)}</span><span class="sym">${esc(c.symbol)}</span>${c.rank ? `<span class="rk">#${c.rank}</span>` : ''}</div>
       <div class="r">${s ? esc(s.reason) : 'Not enough data'}</div></div>
-    <div class="rt"><div style="display:flex;gap:8px;align-items:center">${sparkSVG(c.spark)}<span class="px">${fmtPrice(c.price)}</span></div>
-      <div style="display:flex;gap:6px;align-items:center"><span class="chg ${pctCls(c.ch24)}">${fmtPct(c.ch24)}</span>${badge(s)}</div></div></a>`;
+    <div class="rt"><div style="display:flex;gap:8px;align-items:center">${sparkSVG(c.spark)}<span class="px">${fmtPrimaryMc(c.mcap, c.price)}</span></div>
+      ${c.mcap ? pxSub(c.price) : ''}<div style="display:flex;gap:6px;align-items:center"><span class="chg ${pctCls(c.ch24)}">${fmtPct(c.ch24)}</span>${badge(s)}</div></div></a>`;
 }
 const DISCLAIMER = `<div class="disclaimer"><b>Not financial advice. Nothing here predicts price.</b> Memecoins are extremely risky and many fresh tokens are rugs or scams that go to zero. Scores are automated momentum, buy-pressure and indicator readings from past data and are often wrong. Do your own research and only risk money you can afford to lose completely.</div>`;
 function metaHTML() {
@@ -401,12 +430,13 @@ function fastVisible() {
 }
 function fastRowHTML(i) {
   const p = i.pair, pc = p.priceChange || {}, t1 = buysSells(p.txns && p.txns.h1), now = Date.now();
+  const mc = pairMc(p);
   return `<a class="row frow" href="#/t/${encodeURIComponent(i.chain)}/${encodeURIComponent(i.addr)}"><span class="bar" style="background:${barColor(i.sig)}"></span>
     ${avatar({ symbol: i.symbol, image: i.icon })}
     <div class="nm"><div class="t"><span class="nmx">${esc(i.symbol)}</span><span class="ch">${chainName(i.chain)}</span><span class="age">${fmtAge(now - p.pairCreatedAt)}</span></div>
-      <div class="r">Liq ${fmtBig(p.liquidity && p.liquidity.usd)} · MC ${fmtBig(p.marketCap || p.fdv)} · <span class="up">${t1.b}</span>/<span class="dn">${t1.s}</span> b/s 1h</div>
+      <div class="r">Liq ${fmtBig(p.liquidity && p.liquidity.usd)} · <span class="up">${t1.b}</span>/<span class="dn">${t1.s}</span> b/s 1h</div>
       <div class="pcs"><span class="${pctCls(+pc.m5)}">5m ${fmtPct(+pc.m5)}</span><span class="${pctCls(+pc.h1)}">1h ${fmtPct(+pc.h1)}</span><span class="${pctCls(+pc.h24)}">24h ${fmtPct(+pc.h24)}</span></div></div>
-    <div class="rt"><span class="px">${fmtPrice(+p.priceUsd)}</span>${badge(i.sig)}${riskBadge(i.risk)}</div></a>`;
+    <div class="rt"><span class="px">${fmtPrimaryMc(mc, +p.priceUsd)}</span>${mc ? pxSub(+p.priceUsd) : ''}${badge(i.sig)}${riskBadge(i.risk)}</div></a>`;
 }
 function renderFast() {
   if (!fast.ts) { app.innerHTML = fast.err ? errHTML(fast.err) : skeleton(); return; }
@@ -459,7 +489,7 @@ function liveCardHTML(i, now) {
         <div class="tags"><span class="ch">${chainName(i.chain)}</span>${i.kinds.includes('boost') ? `<span class="tag boost">⚡ Boost${i.boostTotal ? ' ' + i.boostTotal : ''}</span>` : ''}${i.kinds.includes('new') ? '<span class="tag np">New profile</span>' : ''}<span class="seen" data-seen="${i.seen}">${timeAgo(i.seen)}</span></div></a>
       <button class="cp" data-ca="${esc(i.addr)}" aria-label="Copy contract address">CA</button></div>
     ${i.desc ? `<div class="desc">${esc(i.desc)}</div>` : ''}
-    ${i.p ? `<div class="lstats"><span>${fmtPrice(p.price)}</span><span>Liq ${fmtBig(p.liq)}</span><span>MC ${fmtBig(p.mc)}</span><span class="${pctCls(+p.h1)}">1h ${fmtPct(+p.h1)}</span><span>Age ${fmtAge(now - p.created)}</span>${p.tx ? `<span><span class="up">${t.b}</span>/<span class="dn">${t.s}</span></span>` : ''}</div>` : '<div class="lstats"><span class="mut">loading pair stats…</span></div>'}
+    ${i.p ? `<div class="lstats"><span class="px">${fmtPrimaryMc(p.mc, p.price)}</span>${p.mc ? pxSub(p.price) : ''}<span>Liq ${fmtBig(p.liq)}</span><span class="${pctCls(+p.h1)}">1h ${fmtPct(+p.h1)}</span><span>Age ${fmtAge(now - p.created)}</span>${p.tx ? `<span><span class="up">${t.b}</span>/<span class="dn">${t.s}</span></span>` : ''}</div>` : '<div class="lstats"><span class="mut">loading pair stats…</span></div>'}
     <div class="links">${linksHTML(links, true)}<a class="lk" href="${esc(i.url || 'https://dexscreener.com/' + i.chain + '/' + i.addr)}" target="_blank" rel="noopener noreferrer">Chart</a></div></div>`;
 }
 function renderLive() {
@@ -492,13 +522,17 @@ async function renderToken(chain, addr) {
     app.innerHTML = `
       <div class="dhead">${avatar({ symbol: p.baseToken.symbol, image: (p.info && p.info.imageUrl) || (it && it.icon) || (liveIt && liveIt.icon) })}<div><h1>${esc(p.baseToken.name)}</h1><div class="sub">${esc(p.baseToken.symbol)} · ${chainName(chain)} · ${esc(p.dexId || '')} · age ${fmtAge(now - p.pairCreatedAt)}</div></div>
         <button class="star ${fav ? 'on' : ''}" id="favBtn" aria-label="Add to watchlist">${STAR}</button></div>
-      <div class="pxline"><span class="bigpx">${fmtPrice(+p.priceUsd)}</span><span class="chg ${pctCls(+pc.m5)}">5m ${fmtPct(+pc.m5)}</span><span class="chg ${pctCls(+pc.h1)}">1h ${fmtPct(+pc.h1)}</span><span class="chg ${pctCls(+pc.h24)}">24h ${fmtPct(+pc.h24)}</span></div>
+      <div class="pxline"><div class="pxstack"><span class="bigpx" id="bigpx">${fmtPrimaryMc(pairMc(p), +p.priceUsd)}</span>${pairMc(p) ? `<span class="pxsub" id="pxsub">${fmtPrice(+p.priceUsd)}</span>` : ''}</div><span class="chg ${pctCls(+pc.m5)}">5m ${fmtPct(+pc.m5)}</span><span class="chg ${pctCls(+pc.h1)}">1h ${fmtPct(+pc.h1)}</span><span class="chg ${pctCls(+pc.h24)}">24h ${fmtPct(+pc.h24)}</span></div>
       <div class="links big">${linksHTML(links)}<button class="lk cp" data-ca="${esc(addr)}">Copy CA ${esc(shortAddr(addr))}</button></div>
       <div class="tf">
         <div class="card"><small>Momentum</small><div style="margin-top:6px">${badge(s)}</div><div class="note" style="margin-top:6px">Score ${s.score}/100</div></div>
         <div class="card"><small>Risk</small><div style="margin-top:6px">${riskBadge(r)}</div><div class="note" style="margin-top:6px">${r.pts} risk points</div></div>
       </div>
-      <div class="card"><h3>Chart</h3><div class="embed"><iframe src="https://dexscreener.com/${encodeURIComponent(chain)}/${encodeURIComponent(p.pairAddress)}?embed=1&theme=dark&trades=0&info=0" title="DexScreener chart" loading="lazy"></iframe></div></div>
+      <div class="card chartcard"><h3>Market cap ${tfSegHTML('15m')}</h3>
+        <div class="ohlc" id="ohlc" hidden></div>
+        <div class="chartbox" id="mcchart"><div class="chart-empty mut">Loading chart…</div></div>
+        <div class="chartcap">BUY/SELL marks are automated indicator signals from past candles, not predictions. Charts by <a href="https://www.tradingview.com/" target="_blank" rel="noopener">TradingView</a>.</div>
+        <div class="note"><a href="${esc(dsChartUrl(chain, p.pairAddress, p.url))}" target="_blank" rel="noopener">Open DexScreener chart</a> · pair ${esc(shortAddr(p.pairAddress))}</div></div>
       <div class="card"><h3>Stats</h3><div class="ind">
         <div class="lv"><small>Liquidity</small><b>${fmtBig(p.liquidity && p.liquidity.usd)}</b></div>
         <div class="lv"><small>Market cap / FDV</small><b>${fmtBig(p.marketCap)} / ${fmtBig(p.fdv)}</b></div>
@@ -511,13 +545,14 @@ async function renderToken(chain, addr) {
       <div class="card"><h3>Risk flags</h3>${r.why.length ? `<ul class="flags">${r.why.map(w => `<li>⚠ ${esc(w)}</li>`).join('')}</ul>` : '<div class="note" style="margin:0">No extra flags — still a memecoin: high risk.</div>'}
         <div class="note">Not checked here: mint/freeze authority, LP lock, holder concentration, honeypot tax. Check those on the chart page before buying.</div></div>
       ${plan ? `<div class="card"><h3>Example quick-flip exit plan</h3><div class="levels">
-        <div class="lv s"><small>Stop</small><b>${fmtPrice(plan.stop)}</b><br><small>−${(plan.sp * 100).toFixed(0)}%</small></div>
-        <div class="lv t"><small>Take part</small><b>${fmtPrice(plan.tp1)}</b><br><small>+${(plan.sp * 150).toFixed(0)}%</small></div>
-        <div class="lv t"><small>Take rest</small><b>${fmtPrice(plan.tp2)}</b><br><small>+${(plan.sp * 300).toFixed(0)}%</small></div></div>
-        <div class="note">Hold: minutes to hours. Example levels from the risk level (wider stop for riskier coins), not a prediction — fresh memecoins can drop 90% in seconds and stops may not fill.</div></div>` : ''}
+        <div class="lv s"><small>Stop</small>${levelMcHTML(plan.stop, mcFactor(pairMc(p), +p.priceUsd))}<br><small>−${(plan.sp * 100).toFixed(0)}%</small></div>
+        <div class="lv t"><small>Take part</small>${levelMcHTML(plan.tp1, mcFactor(pairMc(p), +p.priceUsd))}<br><small>+${(plan.sp * 150).toFixed(0)}%</small></div>
+        <div class="lv t"><small>Take rest</small>${levelMcHTML(plan.tp2, mcFactor(pairMc(p), +p.priceUsd))}<br><small>+${(plan.sp * 300).toFixed(0)}%</small></div></div>
+        <div class="note">Hold: minutes to hours. Example levels from the risk level (wider stop for riskier coins), not a prediction — fresh memecoins can drop 90% in seconds and stops may not fill. Values shown as market cap, with token price underneath.</div></div>` : ''}
       ${DISCLAIMER}
       <div class="note">Data: DexScreener · pair ${esc(shortAddr(p.pairAddress))} · <a href="${esc(p.url)}" target="_blank" rel="noopener">open full chart</a></div>`;
     $('#favBtn').onclick = e => { const on = toggleDexFav({ key: k, chain, addr, symbol: p.baseToken.symbol, name: p.baseToken.name, icon: (p.info && p.info.imageUrl) || '' }); e.currentTarget.classList.toggle('on', on); toast(on ? 'Added to watchlist' : 'Removed from watchlist', 1500); };
+    bindMcChart({ kind: 'token', key: k, chain, addr, pairAddress: p.pairAddress, dsUrl: dsChartUrl(chain, p.pairAddress, p.url), price: +p.priceUsd, mcap: pairMc(p), plan, defaultTf: '15m' });
   };
   if (p) draw(); else app.innerHTML = skeleton(3);
   try { const m = await pairsFor([{ chain, addr }], p ? PAIR_TTL : 0); const np = m.get(k); if (np && location.hash === `#/t/${encodeURIComponent(chain)}/${encodeURIComponent(addr)}`) { const changed = !p || np !== p; p = np; if (changed) draw(); } else if (!p) draw(); }
@@ -557,9 +592,9 @@ function slowRowHTML(c) {
     ${avatar(c)}
     <div class="nm"><div class="t"><span class="nmx">${esc(c.name)}</span>${c.name.toLowerCase() !== String(c.symbol).toLowerCase() ? `<span class="sym">${esc(c.symbol)}</span>` : ''}${c.rank ? `<span class="rk">#${c.rank}</span>` : ''}</div>
       <div class="r">${w ? esc(w.reason) : 'Not enough data'}</div></div>
-    <div class="rt"><div style="display:flex;gap:8px;align-items:center">${sparkSVG(c.spark)}<span class="px">${fmtPrice(c.price)}</span></div>
-      <div style="display:flex;gap:6px;align-items:center"><span class="chg ${pctCls(c.ch24)}">${fmtPct(c.ch24)}</span>${badge(w)}</div></div>
-    ${L && L.mode !== 'avoid' ? `<div class="plan"><span>Entry <b class="e">${fmtPrice(L.entry[1])}</b></span><span>Stop <b class="dn">${fmtPrice(L.stop)}</b></span><span>Target <b class="up">${fmtPrice(L.tp)}</b></span><span class="hold">⏱ ${esc(L.hold)}</span></div>` : ''}</a>`;
+    <div class="rt"><div style="display:flex;gap:8px;align-items:center">${sparkSVG(c.spark)}<span class="px">${fmtPrimaryMc(c.mcap, c.price)}</span></div>
+      ${c.mcap ? pxSub(c.price) : ''}<div style="display:flex;gap:6px;align-items:center"><span class="chg ${pctCls(c.ch24)}">${fmtPct(c.ch24)}</span>${badge(w)}</div></div>
+    ${L && L.mode !== 'avoid' ? `<div class="plan">${planLineHTML(L, mcFactor(c.mcap, c.price))}</div>` : ''}</a>`;
 }
 
 // ---------- screens ----------
@@ -659,6 +694,7 @@ function render() {
   if (!detail) $('#title').innerHTML = '<span class="logo"></span>' + (r.name === 'fast' ? 'Memecoin Signals' : TITLES[r.name]);
   const key = r.name + (r.id || r.addr || '');
   if (key !== lastRoute) { window.scrollTo(0, 0); app.style.animation = 'none'; void app.offsetWidth; app.style.animation = ''; if (r.name === 'coin' && !lastRoute.startsWith('coin')) state.tf = '7d'; lastRoute = key; }
+  if (r.name !== 'coin' && r.name !== 'token') destroyMcChart();
   if (r.name === 'coin') renderDetail(r.id); else if (r.name === 'token') renderToken(r.chain, r.addr);
   else if (r.name === 'slow') renderSlow(); else if (r.name === 'live') renderLive(); else if (r.name === 'watch') renderWatch(); else if (r.name === 'about') renderAbout(); else renderFast();
   schedule();
@@ -720,22 +756,22 @@ async function renderDetail(id) {
     app.innerHTML = `
       <div class="dhead">${avatar(coin)}<div><h1>${esc(coin.name)}</h1><div class="sub">${esc(coin.symbol.toUpperCase())}${coin.rank ? ' · Rank #' + coin.rank : ''}</div></div>
         <button class="star ${fav ? 'on' : ''}" id="favBtn" aria-label="Add to watchlist">${STAR}</button></div>
-      <div class="pxline"><span class="bigpx">${fmtPrice(coin.price)}</span><span class="chg ${pctCls(coin.ch24)}" style="font-size:14px">${fmtPct(coin.ch24)} 24h</span><span class="chg ${pctCls(coin.ch7d)}" style="font-size:14px">${fmtPct(coin.ch7d)} 7d</span></div>
+      <div class="pxline"><div class="pxstack"><span class="bigpx" id="bigpx">${fmtPrimaryMc(coin.mcap, coin.price)}</span>${coin.mcap ? `<span class="pxsub" id="pxsub">${fmtPrice(coin.price)}</span>` : ''}</div><span class="chg ${pctCls(coin.ch24)}" style="font-size:14px">${fmtPct(coin.ch24)} 24h</span><span class="chg ${pctCls(coin.ch7d)}" style="font-size:14px">${fmtPct(coin.ch7d)} 7d</span></div>
       <div class="tf">
         <div class="card"><small>Short-term (1h)</small><div style="margin-top:6px">${badge(short)}</div><div class="note" style="margin-top:6px">Score ${short ? short.score : '—'}</div></div>
         <div class="card"><small>Swing (1D, 90d)</small><div style="margin-top:6px">${hist ? badge(swing) : '<span class="badge b-H">loading…</span>'}</div><div class="note" style="margin-top:6px">Score ${swing ? swing.score : '—'}</div></div>
       </div>
-      ${coin.swing ? swingPlanCard(coin.swing) : ''}
-      <div class="card"><h3>Price chart <div class="seg"><button data-tf="7d" class="${tf === '7d' ? 'on' : ''}">7D · 1h</button><button data-tf="90d" class="${tf === '90d' ? 'on' : ''}">90D · 1D</button></div></h3>
-        <div class="chartwrap"><canvas class="chart" id="chart"></canvas><div class="tip" id="tip" hidden></div></div>
-        <div class="legend"><span><i style="background:#f2f2f4"></i>Price</span><span><i style="background:#d9b25f"></i>SMA20</span><span><i style="background:#9b8cf0"></i>SMA50</span><span><i style="background:#5e9eff"></i>Entry</span><span><i style="background:#ff5a52"></i>Stop</span><span><i style="background:#32d074"></i>Target</span></div>
-      </div>
-      ${sig ? signalCard(sig, tf) : '<div class="card">Not enough history to compute signals.</div>'}
+      ${coin.swing ? swingPlanCard(coin.swing, mcFactor(coin.mcap, coin.price)) : ''}
+      <div class="card chartcard"><h3>Market cap ${tfSegHTML('1h')}</h3>
+        <div class="ohlc" id="ohlc" hidden></div>
+        <div class="chartbox" id="mcchart"><div class="chart-empty mut">Loading chart…</div></div>
+        <div class="chartcap">BUY/SELL marks are automated indicator signals from past candles, not predictions. Charts by <a href="https://www.tradingview.com/" target="_blank" rel="noopener">TradingView</a>.</div></div>
+      ${sig ? signalCard(sig, tf, mcFactor(coin.mcap, coin.price)) : '<div class="card">Not enough history to compute signals.</div>'}
       ${DISCLAIMER}
-      <div class="note">Data: ${esc(tf === '7d' ? state.source : (hist && hist.source) || '')} · ${tf === '7d' ? 'updated ' + timeAgo(state.ts) : hist ? 'updated ' + timeAgo(hist.ts) : ''}${coin.mcap ? ' · Mkt cap ' + fmtBig(coin.mcap) : ''}${coin.vol ? ' · Vol 24h ' + fmtBig(coin.vol) : ''}</div>`;
+      <div class="note">Data: ${esc(tf === '7d' ? state.source : (hist && hist.source) || '')} · ${tf === '7d' ? 'updated ' + timeAgo(state.ts) : hist ? 'updated ' + timeAgo(hist.ts) : ''}${coin.vol ? ' · Vol 24h ' + fmtBig(coin.vol) : ''}</div>`;
     $('#favBtn').onclick = e => { const on = toggleFav(coin.id); e.currentTarget.classList.toggle('on', on); toast(on ? 'Added to watchlist' : 'Removed from watchlist', 1500); };
     app.querySelectorAll('[data-tf]').forEach(b => b.onclick = () => { state.tf = b.dataset.tf; renderDetail(id); });
-    if (sig) drawChart($('#chart'), times, closes, sig, tf);
+    bindMcChart({ kind: 'coin', key: coin.id, coinId: coin.id, symbol: coin.symbol, spark: coin.spark, binance: !!coin.binance, price: coin.price, mcap: coinMc(coin), plan: (coin.swing && coin.swing.levels) || (sig && sig.levels), defaultTf: '1h' });
   };
   if (tf === '7d') {
     draw(ls.get('hist:' + id) && Date.now() - ls.get('hist:' + id).ts < HIST_TTL ? ls.get('hist:' + id) : null);
@@ -755,7 +791,7 @@ function gaugeSVG(score, code) {
     <text x="42" y="50" text-anchor="middle" fill="#f2f2f4" font-size="19" font-weight="800" style="stroke:none">${score > 0 ? '+' : ''}${score}</text>
     <text x="42" y="66" text-anchor="middle" fill="#8e8e93" font-size="9" font-weight="700" style="stroke:none">SCORE</text></svg>`;
 }
-function signalCard(s, tf) {
+function signalCard(s, tf, fac) {
   const col = ({ SB: '#32d074', B: '#32d074', H: '#aeaeb2', S: '#ff7b73', SS: '#ff6b63' })[s.code];
   const L = s.levels;
   const titles = L.mode === 'long' ? ['Entry zone', 'Stop-loss', 'Take-profit'] : L.mode === 'dip' ? ['Buy-the-dip zone', 'Stop-loss', 'Take-profit'] : ['Re-entry (support)', 'Stop if holding', 'Resistance'];
@@ -763,88 +799,384 @@ function signalCard(s, tf) {
     L.mode === 'dip' ? 'No clear edge right now — consider waiting for a pullback into the zone.' :
     'Bearish setup: avoid new buys for now. If you hold, consider protecting gains; watch support for a possible re-entry.';
   const fx = s.factors.map(f => `<li><span>${esc(f.txt.charAt(0).toUpperCase() + f.txt.slice(1))}</span><span class="pts ${f.pts > 0 ? 'up' : f.pts < 0 ? 'dn' : ''}">${f.pts > 0 ? '+' : ''}${f.pts}</span></li>`).join('');
-  return `<div class="card"><h3>Signal · ${tf === '7d' ? 'short-term' : 'swing'}</h3>
+  return `<div class="card"><h3>Signal · ${tf === '7d' ? 'short-term' : 'swing'} <div class="seg"><button data-tf="7d" class="${tf === '7d' ? 'on' : ''}">1h</button><button data-tf="90d" class="${tf === '90d' ? 'on' : ''}">1D</button></div></h3>
       <div class="sig">${gaugeSVG(s.score, s.code)}<div><div class="lbl" style="color:${col}">${s.label}</div><div class="why">${esc(s.reason)}</div></div></div>
       <div class="levels">
-        <div class="lv e"><small>${titles[0]}</small><b>${fmtPrice(L.entry[0])}<br>– ${fmtPrice(L.entry[1])}</b></div>
-        <div class="lv s"><small>${titles[1]}</small><b>${fmtPrice(L.stop)}</b><br><small>${fmtPct((L.stop / L.entry[1] - 1) * 100)}</small></div>
-        <div class="lv t"><small>${titles[2]}</small><b>${fmtPrice(L.tp)}</b><br><small>${fmtPct((L.tp / L.entry[1] - 1) * 100)}</small></div>
-      </div><div class="note">${note}</div></div>
+        <div class="lv e"><small>${titles[0]}</small>${levelMcRangeHTML(L.entry[0], L.entry[1], fac)}</div>
+        <div class="lv s"><small>${titles[1]}</small>${levelMcHTML(L.stop, fac)}<br><small>${fmtPct((L.stop / L.entry[1] - 1) * 100)}</small></div>
+        <div class="lv t"><small>${titles[2]}</small>${levelMcHTML(L.tp, fac)}<br><small>${fmtPct((L.tp / L.entry[1] - 1) * 100)}</small></div>
+      </div><div class="note">${note}${fac ? ' Levels shown as market cap, with token price underneath.' : ''}</div></div>
     <div class="card"><h3>Indicators</h3><div class="ind">
       <div class="lv"><small>RSI (14)</small><b class="${s.rsi < 30 ? 'up' : s.rsi > 70 ? 'dn' : ''}">${s.rsi.toFixed(1)}</b></div>
       <div class="lv"><small>MACD hist</small><b class="${pctCls(s.hist)}">${s.hist >= 0 ? '+' : ''}${(s.hist / s.sma20 * 100).toFixed(3)}%</b></div>
-      <div class="lv"><small>SMA 20</small><b>${fmtPrice(s.sma20)}</b></div>
-      <div class="lv"><small>SMA 50</small><b>${fmtPrice(s.sma50)}</b></div>
+      <div class="lv"><small>SMA 20</small>${levelMcHTML(s.sma20, fac)}</div>
+      <div class="lv"><small>SMA 50</small>${levelMcHTML(s.sma50, fac)}</div>
       <div class="lv"><small>Momentum</small><b class="${pctCls(s.roc)}">${fmtPct(s.roc)}</b></div>
       <div class="lv"><small>Volatility (ATR/day)</small><b>${s.atrPct.toFixed(2)}%</b></div>
     </div></div>
     <div class="card"><h3>Score breakdown</h3><ul class="factors">${fx}</ul></div>`;
 }
 
-// ---------- chart (canvas) ----------
-function drawChart(cv, times, closes, sig, tf) {
-  const dpr = Math.min(window.devicePixelRatio || 1, 3);
-  const W = cv.clientWidth || 360, H = 330;
-  cv.style.height = H + 'px'; cv.width = W * dpr; cv.height = H * dpr;
-  const g = cv.getContext('2d'); g.scale(dpr, dpr);
-  const pad = { l: 6, r: 58 }; const pTop = 8, pH = 190, rTop = pTop + pH + 14, rH = 52, mTop = rTop + rH + 12, mH = 48;
-  const n = closes.length, x = i => pad.l + i / (n - 1) * (W - pad.l - pad.r);
-  const { r, s20, s50, m } = sig.series; const L = sig.levels;
-  const vals = closes.concat(s20.filter(v => v != null), s50.filter(v => v != null), [L.stop, L.tp, L.entry[0]]);
-  let mn = Math.min(...vals), mx = Math.max(...vals); const span = mx - mn || mx * 0.01; mn -= span * 0.04; mx += span * 0.04;
-  const y = v => pTop + (1 - (v - mn) / (mx - mn)) * pH;
-  g.font = '10px -apple-system,system-ui,sans-serif'; g.textBaseline = 'middle';
-  // grid
-  g.strokeStyle = 'rgba(60,60,67,.7)'; g.lineWidth = 1; g.fillStyle = '#8e8e93';
-  for (let k = 0; k <= 4; k++) { const v = mn + (mx - mn) * k / 4, yy = y(v); g.beginPath(); g.moveTo(pad.l, yy); g.lineTo(W - pad.r, yy); g.stroke(); g.fillText(fmtPrice(v).replace('$', ''), W - pad.r + 6, yy); }
-  // entry zone band
-  g.fillStyle = 'rgba(94,158,255,.12)'; g.fillRect(pad.l, y(L.entry[1]), W - pad.l - pad.r, y(L.entry[0]) - y(L.entry[1]));
-  const hline = (v, c) => { g.save(); g.setLineDash([4, 4]); g.strokeStyle = c; g.lineWidth = 1.2; g.beginPath(); g.moveTo(pad.l, y(v)); g.lineTo(W - pad.r, y(v)); g.stroke(); g.restore();
-    g.fillStyle = c; g.beginPath(); g.roundRect ? g.roundRect(W - pad.r + 2, y(v) - 8, pad.r - 3, 16, 4) : g.rect(W - pad.r + 2, y(v) - 8, pad.r - 3, 16); g.fill(); g.fillStyle = '#000000'; g.font = 'bold 9.5px -apple-system,system-ui,sans-serif'; g.fillText(fmtPrice(v).replace('$', ''), W - pad.r + 5, y(v)); g.font = '10px -apple-system,system-ui,sans-serif'; };
-  // area under price
-  const upc = closes[n - 1] >= closes[0];
-  const grad = g.createLinearGradient(0, pTop, 0, pTop + pH); grad.addColorStop(0, upc ? 'rgba(50,208,116,.28)' : 'rgba(255,90,82,.25)'); grad.addColorStop(1, 'rgba(0,0,0,0)');
-  g.beginPath(); closes.forEach((v, i) => i ? g.lineTo(x(i), y(v)) : g.moveTo(x(i), y(v))); g.lineTo(x(n - 1), pTop + pH); g.lineTo(x(0), pTop + pH); g.closePath(); g.fillStyle = grad; g.fill();
-  const line = (arr, c, w) => { g.beginPath(); let st = false; arr.forEach((v, i) => { if (v == null) return; st ? g.lineTo(x(i), y(v)) : (g.moveTo(x(i), y(v)), st = true); }); g.strokeStyle = c; g.lineWidth = w; g.stroke(); };
-  line(s50, '#9b8cf0', 1.3); line(s20, '#d9b25f', 1.3); line(closes, upc ? '#32d074' : '#ff5a52', 2);
-  hline(L.stop, '#ff5a52'); hline(L.tp, '#32d074'); hline(L.entry[1], '#5e9eff');
-  // last price dot
-  g.fillStyle = '#f2f2f4'; g.beginPath(); g.arc(x(n - 1), y(closes[n - 1]), 3.5, 0, 7); g.fill();
-  // RSI panel
-  const ry = v => rTop + (1 - v / 100) * rH;
-  g.fillStyle = 'rgba(155,140,240,.08)'; g.fillRect(pad.l, ry(70), W - pad.l - pad.r, ry(30) - ry(70));
-  g.strokeStyle = 'rgba(60,60,67,.9)'; [30, 70].forEach(v => { g.beginPath(); g.moveTo(pad.l, ry(v)); g.lineTo(W - pad.r, ry(v)); g.stroke(); });
-  g.fillStyle = '#8e8e93'; g.fillText('RSI ' + sig.rsi.toFixed(0), W - pad.r + 6, rTop + rH / 2); g.fillText('70', W - pad.r + 6, ry(70)); g.fillText('30', W - pad.r + 6, ry(30));
-  g.beginPath(); let st = false; r.forEach((v, i) => { if (v == null) return; st ? g.lineTo(x(i), ry(v)) : (g.moveTo(x(i), ry(v)), st = true); }); g.strokeStyle = '#9b8cf0'; g.lineWidth = 1.4; g.stroke();
-  // MACD panel
-  const hs = m.hist.filter(v => v != null), ml = m.macd.filter(v => v != null); const am = Math.max(...hs.map(Math.abs), ...ml.map(Math.abs)) || 1;
-  const my = v => mTop + mH / 2 - v / am * mH / 2; const bw = Math.max(1, (W - pad.l - pad.r) / n * 0.7);
-  m.hist.forEach((v, i) => { if (v == null) return; g.fillStyle = v >= 0 ? 'rgba(50,208,116,.65)' : 'rgba(255,90,82,.65)'; g.fillRect(x(i) - bw / 2, Math.min(my(0), my(v)), bw, Math.abs(my(v) - my(0)) || 1); });
-  const mline = (arr, c) => { g.beginPath(); let s = false; arr.forEach((v, i) => { if (v == null) return; s ? g.lineTo(x(i), my(v)) : (g.moveTo(x(i), my(v)), s = true); }); g.strokeStyle = c; g.lineWidth = 1.2; g.stroke(); };
-  mline(m.macd, '#5e9eff'); mline(m.signal, '#d9b25f');
-  g.fillStyle = '#8e8e93'; g.fillText('MACD', W - pad.r + 6, mTop + mH / 2);
-  // crosshair interaction
-  const tip = $('#tip'); const snapshot = g.getImageData(0, 0, cv.width, cv.height);
-  const move = ev => {
-    const rect = cv.getBoundingClientRect(); const px = (ev.touches ? ev.touches[0].clientX : ev.clientX) - rect.left;
-    const i = clamp(Math.round((px - pad.l) / (W - pad.l - pad.r) * (n - 1)), 0, n - 1);
-    g.putImageData(snapshot, 0, 0); g.save(); g.strokeStyle = 'rgba(242,242,244,.4)'; g.setLineDash([3, 3]); g.beginPath(); g.moveTo(x(i), pTop); g.lineTo(x(i), mTop + mH); g.stroke(); g.restore();
-    g.fillStyle = '#fff'; g.beginPath(); g.arc(x(i), y(closes[i]), 3.5, 0, 7); g.fill();
-    const d = new Date(times[i]);
-    tip.hidden = false; tip.style.left = clamp(x(i), 70, W - 70) + 'px';
-    tip.innerHTML = `<b>${fmtPrice(closes[i])}</b> · ${d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}${tf === '7d' ? ' ' + d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }) : ''}${r[i] != null ? ' · RSI ' + r[i].toFixed(0) : ''}`;
+// ---------- market-cap candlestick chart (Axiom-style) ----------
+const CHART_TF = [
+  { id: '1m',  gt: ['minute', 1],  bn: '1m',  cgDays: 1,  limit: 250 },
+  { id: '5m',  gt: ['minute', 5],  bn: '5m',  cgDays: 1,  limit: 250 },
+  { id: '15m', gt: ['minute', 15], bn: '15m', cgDays: 1,  limit: 250 },
+  { id: '1h',  gt: ['hour', 1],    bn: '1h',  cgDays: 7,  limit: 250 },
+  { id: '4h',  gt: ['hour', 4],    bn: '4h',  cgDays: 30, limit: 220 },
+  { id: '1D',  gt: ['day', 1],     bn: '1d',  cgDays: 90, limit: 200 }
+];
+const TF_SEC = { '1m': 60, '5m': 300, '15m': 900, '1h': 3600, '4h': 14400, '1D': 86400 };
+const TF_BPD = { '1m': 1440, '5m': 288, '15m': 96, '1h': 24, '4h': 6, '1D': 1 };
+const GT_POOL_NET = { ethereum: 'eth', bsc: 'bsc', base: 'base', solana: 'solana', arbitrum: 'arbitrum', polygon: 'polygon_pos', avalanche: 'avax', ton: 'ton', sui: 'sui', tron: 'tron' };
+const ohlcvCache = new Map();
+const bnMissing = new Set();
+let chartState = {};
+
+function tfSegHTML(active) {
+  return `<div class="seg" id="chtf">${CHART_TF.map(t => `<button type="button" data-ctf="${t.id}" class="${t.id === active ? 'on' : ''}">${t.id}</button>`).join('')}</div>`;
+}
+function destroyMcChart() {
+  if (chartState.timer) { clearInterval(chartState.timer); }
+  if (chartState.ro) { try { chartState.ro.disconnect(); } catch {} }
+  if (chartState.markers && chartState.markers.detach) { try { chartState.markers.detach(); } catch {} }
+  if (chartState.chart) { try { chartState.chart.remove(); } catch {} }
+  chartState = {};
+}
+function resampleCloses(prices, vols, sec) {
+  const buckets = new Map();
+  for (const [ms, px] of prices) {
+    if (px == null || !isFinite(px)) continue;
+    const t = Math.floor(ms / 1000 / sec) * sec;
+    let b = buckets.get(t);
+    if (!b) buckets.set(t, { t, o: px, h: px, l: px, c: px, v: 0 });
+    else { b.h = Math.max(b.h, px); b.l = Math.min(b.l, px); b.c = px; }
+  }
+  for (const [ms, v] of vols || []) {
+    const t = Math.floor(ms / 1000 / sec) * sec;
+    const b = buckets.get(t); if (b) b.v = v;
+  }
+  return [...buckets.values()].sort((a, b) => a.t - b.t).map(b => [b.t, b.o, b.h, b.l, b.c, b.v]);
+}
+function sparkToBars(spark, tfId) {
+  const sec = TF_SEC[tfId];
+  if (!sec || sec < 3600 || !spark || spark.length < 3) return null;
+  const step = 3600, now = Math.floor(Date.now() / 1000);
+  const start = now - (spark.length - 1) * step;
+  const pts = spark.map((c, i) => [(start + i * step) * 1000, c]);
+  return resampleCloses(pts, [], sec);
+}
+function barsFromOhlcvList(list, fac) {
+  const k = fac || 1, candles = [], volume = [];
+  const seen = new Set();
+  for (const row of list) {
+    const t = +row[0], o = +row[1], h = +row[2], l = +row[3], c = +row[4], v = +row[5] || 0;
+    if (!isFinite(t) || !isFinite(o) || !isFinite(c) || seen.has(t)) continue;
+    seen.add(t);
+    const up = c >= o;
+    candles.push({ time: t, open: o * k, high: h * k, low: l * k, close: c * k, volume: v });
+    volume.push({ time: t, value: v, color: up ? 'rgba(50,208,116,.45)' : 'rgba(255,90,82,.45)' });
+  }
+  candles.sort((a, b) => a.time - b.time);
+  volume.sort((a, b) => a.time - b.time);
+  return { candles, volume };
+}
+async function fetchGtOhlcv(chain, pairAddr, tf) {
+  const net = GT_POOL_NET[chain] || chain;
+  const url = `${GT}/networks/${encodeURIComponent(net)}/pools/${encodeURIComponent(pairAddr)}/ohlcv/${tf.gt[0]}?aggregate=${tf.gt[1]}&limit=${tf.limit}&currency=usd&token=base&include_empty_intervals=true`;
+  const d = await getJSON(url, 15000);
+  return (d && d.data && d.data.attributes && d.data.attributes.ohlcv_list) || [];
+}
+async function fetchBinanceOhlcv(symbol, tf) {
+  const k = await binance(`/klines?symbol=${symbol.toUpperCase()}USDT&interval=${tf.bn}&limit=${tf.limit}`);
+  return k.map(x => [Math.floor(x[0] / 1000), +x[1], +x[2], +x[3], +x[4], +x[7]]);
+}
+async function fetchCgChart(id, tf) {
+  const d = await getJSON(`${CG}/coins/${encodeURIComponent(id)}/market_chart?vs_currency=usd&days=${tf.cgDays}`, 15000);
+  return resampleCloses(d.prices || [], d.total_volumes || [], TF_SEC[tf.id]);
+}
+async function fetchOhlcv(st, tf) {
+  const key = [st.kind, st.key, tf.id, st.pairAddress || ''].join('|');
+  const hit = ohlcvCache.get(key);
+  if (hit && Date.now() - hit.ts < 45e3) return hit.list;
+  let list = null, err;
+  if (st.kind === 'token' && st.pairAddress) {
+    try { list = await fetchGtOhlcv(st.chain, st.pairAddress, tf); } catch (e) { err = e; }
+  } else if (st.kind === 'coin') {
+    const sym = (st.symbol || '').toUpperCase();
+    const bnKnown = st.binance || FALLBACK.some(f => f[0] === sym);
+    if (sym && bnKnown && !bnMissing.has(sym)) {
+      try { list = await fetchBinanceOhlcv(st.symbol, tf); }
+      catch (e) { if (e && (e.status === 400 || e.status === 404)) bnMissing.add(sym); err = e; }
+    }
+    if (!list && !cgBlocked()) {
+      try { list = await fetchCgChart(st.coinId, tf); } catch (e) { cgBackoff(e); err = err || e; }
+    }
+    if (!list && st.spark) list = sparkToBars(st.spark, tf.id);
+  }
+  if (list && list.length) { ohlcvCache.set(key, { ts: Date.now(), list }); return list; }
+  if (hit) return hit.list;
+  if (err) throw err;
+  return list;
+}
+function signalMarkers(candles, kind, tfId) {
+  const n = candles.length, out = [];
+  if (n < 13) return out;
+  const closes = candles.map(c => c.close);
+  const hi = Math.max(...candles.map(c => c.high));
+  const push = (i, dir) => {
+    const low = hi ? candles[i].low / hi < 0.18 : false;
+    out.push(dir === 'buy'
+      ? { time: candles[i].time, position: low ? 'aboveBar' : 'belowBar', color: '#32d074', shape: 'arrowUp', text: 'BUY', size: 1.5 }
+      : { time: candles[i].time, position: 'aboveBar', color: '#ff5a52', shape: 'arrowDown', text: 'SELL', size: 1.5 });
   };
-  const end = () => { tip.hidden = true; g.putImageData(snapshot, 0, 0); };
-  cv.onmousemove = move; cv.onmouseleave = end; cv.ontouchstart = move; cv.ontouchmove = move; cv.ontouchend = end;
+  const confirm = 2, cooldown = Math.max(8, Math.round(n / 20));
+  const emit = (raw) => {
+    let stance = null;
+    const filled = raw.map(d => {
+      if (d === 'buy' || d === 'sell' || d === 'hold') stance = d;
+      return stance;
+    });
+    let prev = null, pending = null, pendingAt = -1, last = -Infinity;
+    filled.forEach((dir, i) => {
+      if (!dir || dir === 'hold') { pending = null; return; }
+      if (dir === prev) { pending = null; return; }
+      if (pending !== dir) { pending = dir; pendingAt = i; }
+      if (pending === dir && i - pendingAt + 1 >= confirm && i - last >= cooldown) {
+        push(i, dir); prev = dir; last = i; pending = null;
+      }
+    });
+  };
+  if (kind === 'coin' && n >= 55) {
+    const bpd = TF_BPD[tfId] || 24;
+    const raw = Array(n).fill(null);
+    for (let i = 54; i < n; i++) {
+      const s = analyze(closes.slice(0, i + 1), bpd);
+      if (!s) continue;
+      raw[i] = (s.code === 'SB' || s.code === 'B') ? 'buy' : (s.code === 'S' || s.code === 'SS') ? 'sell' : 'hold';
+    }
+    emit(raw);
+    return out;
+  }
+  const fastN = n >= 30 ? 21 : 13, fastS = n >= 30 ? 9 : 5;
+  const e9 = ema(closes, fastS), e21 = ema(closes, fastN), r = rsi(closes, Math.min(14, Math.max(6, Math.floor(n / 3))));
+  const raw = Array(n).fill(null);
+  let seeded = false;
+  for (let i = fastN; i < n; i++) {
+    if (e9[i] == null || e21[i] == null) continue;
+    if (!seeded) {
+      if (e9[i] > e21[i] && (r[i] == null || r[i] < 70)) raw[i] = 'buy';
+      else if (e9[i] < e21[i] && (r[i] == null || r[i] > 30)) raw[i] = 'sell';
+      seeded = true;
+      continue;
+    }
+    if (e9[i - 1] == null || e21[i - 1] == null) continue;
+    const crossUp = e9[i - 1] <= e21[i - 1] && e9[i] > e21[i];
+    const crossDn = e9[i - 1] >= e21[i - 1] && e9[i] < e21[i];
+    const mom = i >= 5 && closes[i - 5] ? closes[i] / closes[i - 5] - 1 : 0;
+    if (crossUp && (r[i] == null || r[i] < 70) && mom >= -0.02) raw[i] = 'buy';
+    else if (crossDn && (r[i] == null || r[i] > 30)) raw[i] = 'sell';
+    else if (r[i - 1] != null && r[i] != null) {
+      if (r[i - 1] <= 30 && r[i] > 30 && e9[i] >= e21[i]) raw[i] = 'buy';
+      else if (r[i - 1] >= 70 && r[i] < 70 && e9[i] <= e21[i]) raw[i] = 'sell';
+    }
+  }
+  emit(raw);
+  return out;
+}
+function setPlanLines(series, plan, fac, LW) {
+  (chartState.lines || []).forEach(l => { try { series.removePriceLine(l); } catch {} });
+  chartState.lines = [];
+  if (!plan || !series) return;
+  const add = (pricePx, color, title) => {
+    const price = fac ? pricePx * fac : pricePx;
+    if (!isFinite(price)) return;
+    chartState.lines.push(series.createPriceLine({ price, color, lineWidth: 1, lineStyle: LW.LineStyle.Dashed, axisLabelVisible: true, title }));
+  };
+  if (plan.entry && Array.isArray(plan.entry)) {
+    add(plan.entry[0], '#5e9eff', 'Entry');
+    add(plan.entry[1], '#5e9eff', 'BUY');
+  } else if (plan.price) add(plan.price, '#5e9eff', 'BUY');
+  if (plan.stop) add(plan.stop, '#ff5a52', 'Stop');
+  if (plan.tp) add(plan.tp, '#32d074', 'TP');
+  if (plan.tp1) add(plan.tp1, '#32d074', 'TP1');
+  if (plan.tp2) add(plan.tp2, '#2bb866', 'TP2');
+}
+function fmtOhlcHud(bar, prev) {
+  if (!bar) return '';
+  const ch = prev && prev.close ? (bar.close / prev.close - 1) * 100 : null;
+  return `<span>O <b>${fmtMcVal(bar.open)}</b></span><span>H <b>${fmtMcVal(bar.high)}</b></span><span>L <b>${fmtMcVal(bar.low)}</b></span><span>C <b>${fmtMcVal(bar.close)}</b></span>${bar.volume ? `<span>Vol <b>${fmtBig(bar.volume)}</b></span>` : ''}${ch != null ? `<span class="${pctCls(ch)}">${fmtPct(ch)}</span>` : ''}`;
+}
+function paintOhlc(i) {
+  const ohlc = $('#ohlc'), bars = chartState.bars; if (!ohlc || !bars || !bars.length) return;
+  const idx = i == null ? bars.length - 1 : i;
+  ohlc.hidden = false;
+  ohlc.innerHTML = fmtOhlcHud(bars[idx], bars[idx - 1]);
+}
+function createMcChart(host) {
+  const LW = window.LightweightCharts;
+  if (!LW) { host.innerHTML = '<div class="chart-empty mut">Chart library failed to load.</div>'; return null; }
+  host.innerHTML = '';
+  const chart = LW.createChart(host, {
+    autoSize: true,
+    layout: { background: { color: '#000000' }, textColor: '#8e8e93', fontFamily: '-apple-system,BlinkMacSystemFont,system-ui,sans-serif', fontSize: 11, attributionLogo: false },
+    grid: { vertLines: { color: 'rgba(255,255,255,0.06)' }, horzLines: { color: 'rgba(255,255,255,0.06)' } },
+    rightPriceScale: { borderColor: 'rgba(255,255,255,0.08)', scaleMargins: { top: 0.08, bottom: 0.05 } },
+    leftPriceScale: { visible: false },
+    timeScale: { borderColor: 'rgba(255,255,255,0.08)', timeVisible: true, secondsVisible: false, rightOffset: 4 },
+    crosshair: {
+      mode: LW.CrosshairMode.Normal,
+      vertLine: { color: 'rgba(242,242,244,.35)', labelBackgroundColor: '#1c1c21' },
+      horzLine: { color: 'rgba(242,242,244,.35)', labelBackgroundColor: '#1c1c21' }
+    },
+    localization: { priceFormatter: fmtMcVal },
+    handleScroll: { vertTouchDrag: false }
+  });
+  const series = chart.addSeries(LW.CandlestickSeries, {
+    upColor: '#32d074', downColor: '#ff5a52',
+    borderUpColor: '#32d074', borderDownColor: '#ff5a52',
+    wickUpColor: '#32d074', wickDownColor: '#ff5a52',
+    lastValueVisible: true, priceLineVisible: true, priceLineColor: '#f2f2f4', priceLineWidth: 1,
+    autoscaleInfoProvider: orig => {
+      const res = orig();
+      if (!res || !res.priceRange) return res;
+      let min = res.priceRange.minValue, max = res.priceRange.maxValue;
+      if (min < 0) min = 0;
+      const st = chartState, fac = st.fac, plan = st.plan;
+      if (plan) {
+        const add = px => { if (px != null && isFinite(px)) { const v = fac ? px * fac : px; if (v < min) min = Math.max(0, v); if (v > max) max = v; } };
+        if (plan.entry) { add(plan.entry[0]); add(plan.entry[1]); }
+        add(plan.price); add(plan.stop); add(plan.tp); add(plan.tp1);
+        if (plan.tp2 && max && (fac ? plan.tp2 * fac : plan.tp2) < max * 2.2) add(plan.tp2);
+      }
+      res.priceRange.minValue = min;
+      res.priceRange.maxValue = max;
+      return res;
+    }
+  });
+  const volPane = chart.addPane();
+  const vol = volPane.addSeries(LW.HistogramSeries, {
+    lastValueVisible: false, priceLineVisible: false, priceFormat: { type: 'volume' }
+  });
+  try {
+    const panes = chart.panes();
+    if (panes[0] && panes[0].setStretchFactor) panes[0].setStretchFactor(3.5);
+    volPane.setStretchFactor(1);
+    vol.priceScale().applyOptions({ borderVisible: false });
+  } catch (e) { console.warn('pane layout', e); }
+  return { chart, series, vol };
+}
+async function loadAndDrawChart() {
+  const st = chartState, host = $('#mcchart');
+  if (!host || !st.kind) return;
+  const tf = CHART_TF.find(t => t.id === st.tf);
+  const seq = (st.seq = (st.seq || 0) + 1);
+  host.innerHTML = '<div class="chart-empty mut">Loading chart…</div>';
+  try {
+    const raw = await fetchOhlcv(st, tf);
+    if (seq !== chartState.seq || !$('#mcchart')) return;
+    const fac = mcFactor(st.mcap, st.price);
+    st.fac = fac;
+    if (!raw || !raw.length) { host.innerHTML = `<div class="chart-empty mut">No candle data for this timeframe.${st.dsUrl ? `<br><a href="${esc(st.dsUrl)}" target="_blank" rel="noopener">Open DexScreener</a>` : ''}</div>`; return; }
+    const packed = barsFromOhlcvList(raw, fac || 1);
+    st.bars = packed.candles;
+    if (st.chart) { try { st.chart.remove(); } catch {} st.chart = st.series = st.vol = st.markers = null; }
+    const inst = createMcChart(host);
+    if (!inst) return;
+    const LW = window.LightweightCharts;
+    st.chart = inst.chart; st.series = inst.series; st.vol = inst.vol;
+    inst.series.setData(packed.candles.map(({ time, open, high, low, close }) => ({ time, open, high, low, close })));
+    inst.vol.setData(packed.volume);
+    const marks = signalMarkers(packed.candles, st.kind === 'coin' ? 'coin' : 'token', st.tf);
+    st.markCount = marks.length;
+    st.markers = LW.createSeriesMarkers(inst.series, marks, { autoScale: false });
+
+    setPlanLines(inst.series, st.plan, fac, LW);
+    inst.chart.timeScale().fitContent();
+    paintOhlc();
+    inst.chart.subscribeCrosshairMove(param => {
+      if (!chartState.bars) return;
+      if (!param || param.time == null) { paintOhlc(); return; }
+      const i = chartState.bars.findIndex(b => b.time === param.time);
+      if (i >= 0) paintOhlc(i);
+    });
+  } catch (e) {
+    console.warn('chart', e);
+    if (seq !== chartState.seq || !$('#mcchart')) return;
+    host.innerHTML = `<div class="chart-empty mut">Couldn't load candles.${st.dsUrl ? ` <a href="${esc(st.dsUrl)}" target="_blank" rel="noopener">Open DexScreener</a>` : ''}</div>`;
+  }
+}
+async function tickTokenChart() {
+  const st = chartState;
+  if (!st || st.kind !== 'token') return;
+  if (document.visibilityState !== 'visible' || route().name !== 'token') return;
+  try {
+    const m = await pairsFor([{ chain: st.chain, addr: st.addr }], 0);
+    const p = m.get(st.key); if (!p) return;
+    st.price = +p.priceUsd; st.mcap = pairMc(p);
+    const fac = mcFactor(st.mcap, st.price); if (fac) st.fac = fac;
+    const big = $('#bigpx'); if (big) big.textContent = fmtPrimaryMc(st.mcap, st.price);
+    const sub = $('#pxsub'); if (sub) sub.textContent = fmtPrice(st.price);
+    if (st.series && st.bars && st.bars.length && st.price) {
+      const sec = TF_SEC[st.tf], t = Math.floor(Date.now() / 1000 / sec) * sec;
+      const val = st.fac ? st.price * st.fac : (st.mcap || st.price);
+      let last = st.bars[st.bars.length - 1];
+      if (t > last.time) {
+        last = { time: t, open: last.close, high: val, low: val, close: val, volume: 0 };
+        st.bars.push(last);
+      } else {
+        last.close = val; last.high = Math.max(last.high, val); last.low = Math.min(last.low, val);
+      }
+      st.series.update({ time: last.time, open: last.open, high: last.high, low: last.low, close: last.close });
+      paintOhlc();
+    }
+    const key = [st.kind, st.key, st.tf, st.pairAddress || ''].join('|');
+    const hit = ohlcvCache.get(key);
+    if (!hit || Date.now() - hit.ts > 60e3) {
+      ohlcvCache.delete(key);
+      const tf = CHART_TF.find(x => x.id === st.tf);
+      const raw = await fetchOhlcv(st, tf);
+      if (raw && raw.length && st.series && chartState === st) {
+        const packed = barsFromOhlcvList(raw, st.fac || 1);
+        st.bars = packed.candles;
+        st.series.setData(packed.candles.map(({ time, open, high, low, close }) => ({ time, open, high, low, close })));
+        st.vol.setData(packed.volume);
+        const marks = signalMarkers(packed.candles, 'token', st.tf);
+        if (st.markers && st.markers.setMarkers) st.markers.setMarkers(marks);
+        else st.markers = window.LightweightCharts.createSeriesMarkers(st.series, marks);
+        setPlanLines(st.series, st.plan, st.fac, window.LightweightCharts);
+        paintOhlc();
+      }
+    }
+  } catch (e) { console.warn('chart tick', e); }
+}
+function bindMcChart(opts) {
+  const keepTf = (chartState.key === opts.key && chartState.kind === opts.kind && chartState.tf) ? chartState.tf : null;
+  destroyMcChart();
+  const host = $('#mcchart'); if (!host) return;
+  const saved = keepTf || ls.get('chartTf:' + opts.kind, opts.defaultTf);
+  const tf = CHART_TF.some(t => t.id === saved) ? saved : opts.defaultTf;
+  chartState = { ...opts, tf, lines: [], seq: 0 };
+  document.querySelectorAll('[data-ctf]').forEach(b => {
+    b.classList.toggle('on', b.dataset.ctf === tf);
+    b.onclick = () => {
+      chartState.tf = b.dataset.ctf;
+      ls.set('chartTf:' + opts.kind, b.dataset.ctf);
+      document.querySelectorAll('[data-ctf]').forEach(x => x.classList.toggle('on', x.dataset.ctf === chartState.tf));
+      loadAndDrawChart();
+    };
+  });
+  loadAndDrawChart();
+  if (opts.kind === 'token') chartState.timer = setInterval(tickTokenChart, 12000);
 }
 
-function swingPlanCard(w) {
+function swingPlanCard(w, fac) {
   const L = w.levels; const t = L.mode === 'long' ? ['Entry zone', 'Stop-loss', 'Target'] : L.mode === 'dip' ? ['Buy-the-dip zone', 'Stop-loss', 'Target'] : ['Support (re-entry)', 'Stop if holding', 'Resistance'];
   return `<div class="card"><h3>Slow swing plan ${badge(w)}</h3>
     <div class="why" style="margin-bottom:10px">${esc(w.reason)}</div>
-    <div class="levels"><div class="lv e"><small>${t[0]}</small><b>${fmtPrice(L.entry[0])}<br>– ${fmtPrice(L.entry[1])}</b></div>
-      <div class="lv s"><small>${t[1]}</small><b>${fmtPrice(L.stop)}</b></div><div class="lv t"><small>${t[2]}</small><b>${fmtPrice(L.tp)}</b></div></div>
-    <div class="note">⏱ Suggested hold: <b>${esc(L.hold)}</b>. Swing score ${w.score > 0 ? '+' : ''}${w.score} (4h/daily trend weighted). Not a prediction.</div></div>`;
+    <div class="levels"><div class="lv e"><small>${t[0]}</small>${levelMcRangeHTML(L.entry[0], L.entry[1], fac)}</div>
+      <div class="lv s"><small>${t[1]}</small>${levelMcHTML(L.stop, fac)}</div><div class="lv t"><small>${t[2]}</small>${levelMcHTML(L.tp, fac)}</div></div>
+    <div class="note">⏱ Suggested hold: <b>${esc(L.hold)}</b>. Swing score ${w.score > 0 ? '+' : ''}${w.score} (4h/daily trend weighted). Not a prediction.${fac ? ' Levels shown as market cap, with token price underneath.' : ''}</div></div>`;
 }
 
 // pull-to-refresh

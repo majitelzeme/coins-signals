@@ -2,47 +2,67 @@
 (function (root) {
   'use strict';
 
+  /* v10: 6-agent pipeline defaults (Scout → Filter → Analyst → Executor → Risk → Logger). */
   const DEFAULTS = {
     mode: 'PAPER',
-    posPct: 0.05,
-    maxOpen: 10,
-    tpPct: 0.35,
-    tpSellPct: 0.50,
-    trailPct: 0.12,
-    trailArmPct: 0.20,
-    slPct: 0.12,
-    dailyLossPct: 0.20,
-    maxHoldMin: 90,
-    minSolReserve: 0.02,
-    slippageBps: 150,
+    pipelineV: 1,
+    // Scout
+    scoutMinAgeMin: 30,
+    scoutMaxAgeH: 72,
+    scoutMinMc: 300000,
+    scoutMaxMc: 20000000,
+    // Filter (kills)
+    minLiqMcPct: 25,
+    minLpLockedPct: 90,
+    maxDevPct: 3,
+    maxDeadLaunches: 2,
+    deadLaunchMc: 5000,
+    maxBundlePct: 10,
+    max1hChg: 80,
     minLiq: 8000,
-    minAgeMin: 5,
-    maxAgeH: 120,
-    minScore: 52,
-    scoreScans: 1,
-    cooldownMin: 40,
-    consecLossLimit: 0,
-    max1hChg: 180,
-    maxImpactPct: 4,
-    maxTopHoldersPct: 40,
-    abortMovePct: 3,
-    liqDropPct: 0.25,
-    minQuoteLiq: 5000,
-    minLiqMcRatio: 0.05,
-    tokenCooldownMin: 30,
+    // Analyst
+    passScore: 70,
+    weights: { momentum: 25, buyers: 20, buySell: 15, holders: 15, liqMc: 10, smart: 15 },
+    smartWallets: [],
+    // Executor
+    posPct: 0.08,
+    maxOpen: 8,
     minPosSol: 0.02,
-    maxDevPct: 5,
-    maxInsiderPct: 12,
+    maxImpactPct: 4,
+    abortMovePct: 3,
+    slippageBps: 150,
+    // Risk
+    slPct: 0.06,
+    trailArmPct: 0.12,
+    trailPct: 0.06,
+    tpPct: 0,
+    tpSellPct: 0.5,
+    maxHoldMin: 120,
+    dailyLossPct: 0.20,
     maxSellImpactPct: 8,
+    liqDropPct: 0.25,
     emergencyQuoteLiq: 2000,
-    minBuySellRatio: 1.15,
-    minVolM5: 1000,
-    minVolH1: 8000,
+    tokenCooldownMin: 30,
+    consecLossLimit: 0,
+    cooldownMin: 40,
+    minSolReserve: 0.02,
     paperStartUsd: 200,
-    rpcUrl: 'https://solana-rpc.publicnode.com'
+    rpcUrl: 'https://solana-rpc.publicnode.com',
+    // legacy (v9 scanner/analyzeSafety; kept for compatibility)
+    minAgeMin: 5, maxAgeH: 120, minScore: 52, scoreScans: 1, maxTopHoldersPct: 40,
+    minQuoteLiq: 5000, minLiqMcRatio: 0.05, maxInsiderPct: 12, minBuySellRatio: 1.15, minVolM5: 1000, minVolH1: 8000
+  };
+  /** v9 defaults, kept so the legacy unit tests still describe the old scanner. */
+  const LEGACY_DEFAULTS = {
+    mode: 'PAPER', posPct: 0.05, maxOpen: 10, tpPct: 0.35, tpSellPct: 0.50, trailPct: 0.12, trailArmPct: 0.20, slPct: 0.12,
+    dailyLossPct: 0.20, maxHoldMin: 90, minSolReserve: 0.02, slippageBps: 150, minLiq: 8000, minAgeMin: 5, maxAgeH: 120,
+    minScore: 52, scoreScans: 1, cooldownMin: 40, consecLossLimit: 0, max1hChg: 180, maxImpactPct: 4, maxTopHoldersPct: 40,
+    abortMovePct: 3, liqDropPct: 0.25, minQuoteLiq: 5000, minLiqMcRatio: 0.05, tokenCooldownMin: 30, minPosSol: 0.02,
+    maxDevPct: 5, maxInsiderPct: 12, maxSellImpactPct: 8, emergencyQuoteLiq: 2000, minBuySellRatio: 1.15, minVolM5: 1000,
+    minVolH1: 8000, paperStartUsd: 200, rpcUrl: 'https://solana-rpc.publicnode.com'
   };
 
-  const cloneDefaults = () => Object.assign({}, DEFAULTS);
+  const cloneDefaults = () => { const o = Object.assign({}, DEFAULTS); o.weights = Object.assign({}, DEFAULTS.weights); o.smartWallets = []; return o; };
 
   const pairLiq = p => (p && p.liquidity && +p.liquidity.usd) || 0;
   const pairVol = (p, k) => (p && p.volume && +p.volume[k]) || 0;
@@ -348,7 +368,8 @@
 
     if (x.rugged || x.pairGone) return { action: 'sell_all', reason: 'liquidity', pnl, peak, emergency: true };
 
-    if (pnl <= -s.slPct) return { action: 'sell_all', reason: 'stop', sl: true, pnl, peak };
+    const stopPx = +pos.stopPx > 0 ? +pos.stopPx : entry * (1 - s.slPct);
+    if (mark <= stopPx * (1 + 1e-9)) return { action: 'sell_all', reason: 'stop', sl: true, pnl, peak };
 
     if (pos.entryLiq && pair && pairLiq(pair) > 0 && pairLiq(pair) < pos.entryLiq * (1 - s.liqDropPct)) {
       return { action: 'sell_all', reason: 'liquidity', pnl, peak, emergency: true };
@@ -371,11 +392,13 @@
     }
     if (heldMin >= s.maxHoldMin) return { action: 'sell_all', reason: 'time', pnl, peak };
 
-    if (!pos.tpTaken && pnl >= s.tpPct) {
+    if (s.tpPct > 0 && !pos.tpTaken && pnl >= s.tpPct) {
       return { action: 'sell_partial', pct: s.tpSellPct, reason: 'tp', pnl, peak };
     }
-    const armed = pos.tpTaken || (peak / entry - 1) >= s.trailArmPct;
-    if (armed && mark <= peak * (1 - s.trailPct)) {
+    const armPct = pos.trailArmPct != null ? +pos.trailArmPct : s.trailArmPct;
+    const trailPct = pos.trailPct != null ? +pos.trailPct : s.trailPct;
+    const armed = pos.tpTaken || (peak / entry - 1) >= armPct;
+    if (armed && mark <= peak * (1 - trailPct)) {
       return { action: 'sell_all', reason: 'trail', pnl, peak };
     }
     return { action: 'hold', pnl, peak };
@@ -570,8 +593,315 @@
     return { fills, pnlPct: cash / start - 1, exitReason: (fills[fills.length - 1] || {}).reason || 'open' };
   }
 
+  /* ===================== v10 6-agent pipeline (pure) ===================== */
+  const clamp01 = x => Math.max(0, Math.min(1, x));
+  const ramp = (x, x0, x1) => (!isFinite(x) ? 0 : 100 * clamp01((x - x0) / (x1 - x0)));
+  const num = v => (v == null || v === '' || !isFinite(+v)) ? null : +v;
+  const round1 = x => Math.round(x * 10) / 10;
+
+  /** Normalise a DexScreener pair (+ optional GeckoTerminal pool attrs) into a Scout record. */
+  function toScoutPair(dsPair, gt, extra) {
+    const p = dsPair || {};
+    const g = gt || null;
+    const pc = p.priceChange || {};
+    const gpc = (g && g.price_change_percentage) || {};
+    const pick = (a, b) => (num(a) != null ? num(a) : num(b));
+    const base = p.baseToken || {};
+    const created = p.pairCreatedAt || (g && g.pool_created_at ? Date.parse(g.pool_created_at) : 0);
+    return {
+      mint: base.address || (extra && extra.mint) || '',
+      symbol: base.symbol || (extra && extra.symbol) || '?',
+      name: base.name || '',
+      icon: (extra && extra.icon) || (p.info && p.info.imageUrl) || '',
+      pairAddress: p.pairAddress || (g && g.address) || '',
+      dexId: p.dexId || '',
+      chainId: p.chainId || 'solana',
+      createdAt: created || 0,
+      mcap: pairMc(p) || (g ? (num(g.market_cap_usd) || num(g.fdv_usd) || 0) : 0),
+      liqUsd: pairLiq(p) || (g ? num(g.reserve_in_usd) || 0 : 0),
+      priceUsd: num(p.priceUsd) || (g ? num(g.base_token_price_usd) : null) || 0,
+      quoteLiq: (p.liquidity && num(p.liquidity.quote)) || null,
+      priceChange: { m5: pick(pc.m5, gpc.m5), m15: num(gpc.m15), m30: num(gpc.m30), h1: pick(pc.h1, gpc.h1), h6: pick(pc.h6, gpc.h6), h24: pick(pc.h24, gpc.h24) },
+      txns: p.txns || null,
+      gtTx: (g && g.transactions) || null,
+      volume: p.volume || null,
+      src: (extra && extra.src) || [],
+      pair: p
+    };
+  }
+
+  /** SCOUT: Solana pairs 30m–72h old, mcap $300k–$20M. Input: candidate records. Output: { pairs, skipped }. */
+  function scoutStage(records, now, settings) {
+    const s = Object.assign({}, DEFAULTS, settings || {});
+    const best = {};
+    const skipped = {};
+    const skip = r => { skipped[r] = (skipped[r] || 0) + 1; };
+    (records || []).forEach(r => {
+      if (!r || !r.mint) return skip('no token');
+      if ((r.chainId || 'solana') !== 'solana') return skip('not solana');
+      if (!(r.priceUsd > 0)) return skip('no price');
+      const age = r.createdAt ? (now - r.createdAt) / 60000 : Infinity;
+      if (age < s.scoutMinAgeMin) return skip('younger than ' + s.scoutMinAgeMin + 'm');
+      if (age > s.scoutMaxAgeH * 60) return skip('older than ' + s.scoutMaxAgeH + 'h');
+      if (!(r.mcap > 0)) return skip('no mcap');
+      if (r.mcap < s.scoutMinMc) return skip('mcap < $' + Math.round(s.scoutMinMc / 1000) + 'K');
+      if (r.mcap > s.scoutMaxMc) return skip('mcap > $' + Math.round(s.scoutMaxMc / 1e6) + 'M');
+      const cur = best[r.mint];
+      if (!cur || (r.liqUsd || 0) > (cur.liqUsd || 0)) best[r.mint] = Object.assign({}, r, { ageMin: age });
+    });
+    const pairs = Object.keys(best).map(k => best[k]).sort((a, b) => (b.liqUsd || 0) - (a.liqUsd || 0));
+    return { stage: 'scout', t: now, pairs, skipped, seen: (records || []).length };
+  }
+
+  /** LP locked/burned % for the traded pool (RugCheck markets[].lp.lpLockedPct). null = unknown. */
+  function lpLockedPctOf(report, pairAddress) {
+    if (!report) return null;
+    const mk = (report.markets || []).filter(m => m && m.lp);
+    const own = mk.find(m => pairAddress && String(m.pubkey) === String(pairAddress));
+    const vals = (own ? [own] : mk).map(m => num(m.lp.lpLockedPct)).filter(v => v != null);
+    if (vals.length) return Math.max.apply(null, vals);
+    if (mk.some(m => m.lp && m.lp.lpBurned)) return 100;
+    const top = num(report.lpLockedPct);
+    return top != null ? top : null;
+  }
+  function supplyRaw(report) {
+    const t = report && report.token;
+    return t && num(t.supply) > 0 ? +t.supply : 0;
+  }
+  /** Dev holdings %: creator wallet balance + top-holder accounts owned by the creator. */
+  function devHoldPct(report) {
+    if (!report) return null;
+    const sup = supplyRaw(report);
+    const bal = sup && num(report.creatorBalance) ? (+report.creatorBalance / sup) * 100 : 0;
+    return Math.max(bal, creatorPct(report));
+  }
+  /** Bundled/insider cluster % (RugCheck insiderNetworks current holdings, or insider-flagged top holders). */
+  function bundlePct(report) {
+    if (!report) return null;
+    const sup = supplyRaw(report);
+    let net = 0;
+    if (sup) (report.insiderNetworks || []).forEach(n => { net += (num(n.currentHolding) || num(n.tokenAmount) || 0); });
+    const netPct = sup ? net / sup * 100 : 0;
+    return Math.max(netPct, insiderPct(report));
+  }
+  /** Creator history: RugCheck rug flags + earlier launches that are dead (mcap < deadLaunchMc, >6h old). */
+  function devHistory(report, settings, now) {
+    const s = Object.assign({}, DEFAULTS, settings || {});
+    if (!report) return { rugFlag: false, dead: 0, launches: 0 };
+    const rugFlag = (report.risks || []).some(r => /rug/i.test(String(r.name || r.description || '')) && /creator|dev|deployer|history|previous/i.test(String((r.name || '') + ' ' + (r.description || ''))));
+    const t = now || Date.now();
+    const others = (report.creatorTokens || []).filter(x => x && x.mint && x.mint !== report.mint);
+    const dead = others.filter(x => {
+      const mc = num(x.marketCap);
+      const age = x.createdAt ? (t - Date.parse(x.createdAt)) / 36e5 : 99;
+      return mc != null && mc < s.deadLaunchMc && age > 6;
+    }).length;
+    return { rugFlag, dead, launches: others.length };
+  }
+
+  /** FILTER: hard kills for one scout pair. Returns { pass, kills:[{code, reason}], facts }. */
+  function filterPair(pair, report, settings, now) {
+    const s = Object.assign({}, DEFAULTS, settings || {});
+    const kills = [];
+    const kill = (code, reason) => kills.push({ code, reason });
+    const facts = {};
+    const liqMc = pair.mcap > 0 ? pair.liqUsd / pair.mcap * 100 : 0;
+    facts.liqMcPct = round1(liqMc);
+    const h1 = pair.priceChange && pair.priceChange.h1;
+    facts.h1 = h1;
+    if (h1 != null && h1 > s.max1hChg) kill('pumped_1h', 'already +' + Math.round(h1) + '% in 1h (> ' + s.max1hChg + '%)');
+    if (pair.liqUsd < s.minLiq) kill('liq_floor', 'liquidity $' + Math.round(pair.liqUsd) + ' < $' + Math.round(s.minLiq));
+    if (liqMc < s.minLiqMcPct) kill('liq_mcap', 'liq/mcap ' + liqMc.toFixed(1) + '% < ' + s.minLiqMcPct + '%');
+    if (!report) {
+      kill('no_rugcheck', 'no RugCheck data, cannot verify authorities/LP');
+      return { pass: false, kills, facts };
+    }
+    if (report.rugged) kill('rugged', 'RugCheck marks token rugged');
+    const auth = mintOrFreeze(report);
+    if (auth.mint) kill('mint_auth', 'mint authority not revoked');
+    if (auth.freeze) kill('freeze_auth', 'freeze authority not revoked');
+    const lp = lpLockedPctOf(report, pair.pairAddress);
+    facts.lpLockedPct = lp == null ? null : round1(lp);
+    if (lp == null) kill('lp_unknown', 'LP lock/burn status unknown');
+    else if (lp < s.minLpLockedPct) kill('lp_unlocked', 'LP only ' + lp.toFixed(0) + '% burned/locked');
+    const dev = devHoldPct(report);
+    facts.devPct = round1(dev || 0);
+    if (dev > s.maxDevPct) kill('dev_holds', 'dev holds ' + dev.toFixed(1) + '% (> ' + s.maxDevPct + '%)');
+    const hist = devHistory(report, s, now);
+    facts.devDead = hist.dead; facts.devLaunches = hist.launches;
+    if (hist.rugFlag) kill('dev_rugs', 'creator has rug history (RugCheck)');
+    else if (s.maxDeadLaunches > 0 && hist.dead >= s.maxDeadLaunches) kill('dev_rugs', 'creator has ' + hist.dead + ' dead earlier launches');
+    const bun = bundlePct(report);
+    facts.bundlePct = round1(bun || 0);
+    if (bun > s.maxBundlePct) kill('bundled', 'bundled/insider cluster ' + bun.toFixed(1) + '% (> ' + s.maxBundlePct + '%)');
+    const dang = dangerRisks(report).filter(r => !/bundl|sniper|insider/i.test(String(r.name || '')));
+    if (dang.length) kill('rc_danger', 'RugCheck danger: ' + dang.map(r => r.name || r).join(', '));
+    return { pass: kills.length === 0, kills, facts };
+  }
+
+  /** FILTER stage: input = Scout output + reports map. */
+  function filterStage(scoutOut, reports, settings, now) {
+    const passed = [], killed = [];
+    (scoutOut.pairs || []).forEach(p => {
+      const r = filterPair(p, reports ? reports[p.mint] : null, settings, now);
+      if (r.pass) passed.push(Object.assign({}, p, { safety: r.facts }));
+      else killed.push({ mint: p.mint, symbol: p.symbol, icon: p.icon, kills: r.kills, facts: r.facts });
+    });
+    return { stage: 'filter', t: now, pairs: passed, killed };
+  }
+
+  /* ---- Analyst component scores (0–100 each, null = no data) ---- */
+  function scoreMomentum(pc) {
+    pc = pc || {};
+    if (pc.h1 == null && pc.m5 == null) return null;
+    const h1 = pc.h1 != null ? pc.h1 : 0;
+    let a = h1 <= 25 ? ramp(h1, -10, 25) : (h1 <= 60 ? 100 : 100 - 0.5 * ramp(h1, 60, 80));
+    const sh = pc.m15 != null ? pc.m15 : (pc.m5 != null ? pc.m5 * 2 : 0);
+    let b = sh <= 30 ? ramp(sh, -6, 8) : 100 - 0.6 * ramp(sh, 30, 50);
+    const seq = [pc.m5, pc.m15 != null ? pc.m15 : pc.m30, pc.h1, pc.h6].filter(v => v != null);
+    const c = seq.length ? 100 * seq.filter(v => v > 0).length / seq.length : 50;
+    return Math.round(0.4 * a + 0.35 * b + 0.25 * c);
+  }
+  function scoreBuyers(gtTx) {
+    const h1 = gtTx && gtTx.h1;
+    if (!h1 || h1.buyers == null) return null;
+    const buyers = +h1.buyers || 0, sellers = +h1.sellers || 0;
+    const a = buyers > 0 ? ramp(Math.log10(buyers), Math.log10(30), Math.log10(1500)) : 0;
+    const b = buyers + sellers > 0 ? ramp(buyers / (buyers + sellers), 0.45, 0.62) : 0;
+    const m15 = gtTx.m15 && +gtTx.m15.buyers;
+    const c = m15 != null && buyers > 0 ? ramp(m15 * 4 / buyers, 0.7, 1.5) : 50;
+    return Math.round(0.5 * a + 0.3 * b + 0.2 * c);
+  }
+  function scoreBuySell(txns, gtTx) {
+    const src = (txns && txns.h1) ? txns : (gtTx || null);
+    if (!src || !src.h1) return null;
+    const h1 = src.h1, m5 = src.m5 || {};
+    const r1 = (+h1.buys || 0) / Math.max(1, +h1.sells || 0);
+    const n5 = (+m5.buys || 0) + (+m5.sells || 0);
+    const r5 = n5 >= 10 ? (+m5.buys || 0) / Math.max(1, +m5.sells || 0) : r1;
+    return Math.round(ramp(0.6 * r1 + 0.4 * r5, 0.9, 1.6));
+  }
+  /** Holder growth: measured %/h from RugCheck holder-count snapshots; else proxy from GT unique buyers per holder. */
+  function scoreHolders(snaps, gtTx) {
+    const list = (snaps || []).filter(x => x && x.n > 0);
+    if (list.length >= 2) {
+      const a = list[0], b = list[list.length - 1];
+      const hrs = (b.t - a.t) / 36e5;
+      if (hrs >= 10 / 60) {
+        const g = (b.n - a.n) / a.n * 100 / hrs;
+        return { score: Math.round(ramp(g, 0, 6)), growthPctH: round1(g), basis: 'measured' };
+      }
+    }
+    const n = list.length ? list[list.length - 1].n : 0;
+    const buyers = gtTx && gtTx.h1 && +gtTx.h1.buyers;
+    if (n > 0 && buyers) {
+      const rate = buyers / n * 100;
+      return { score: Math.round(0.8 * ramp(rate, 0, 15)), growthPctH: null, basis: 'proxy' };
+    }
+    return null;
+  }
+  function scoreLiqMc(liqMcPct) {
+    if (liqMcPct == null || !isFinite(liqMcPct)) return null;
+    return Math.round(ramp(liqMcPct, 5, 40));
+  }
+  function scoreSmart(hits, nWallets) {
+    if (!nWallets) return null;
+    if (hits == null) return null;
+    return hits >= 3 ? 100 : hits === 2 ? 85 : hits === 1 ? 60 : 0;
+  }
+
+  /** ANALYST: weighted 0–100 score. Components without data are excluded and weights renormalised. */
+  function scorePair(pair, ctx, settings) {
+    const s = Object.assign({}, DEFAULTS, settings || {});
+    const w = Object.assign({}, DEFAULTS.weights, s.weights || {});
+    const c = ctx || {};
+    const gtTx = c.gtTx || pair.gtTx;
+    const pc = Object.assign({}, pair.priceChange || {}, c.priceChange || {});
+    const hold = scoreHolders(c.holderSnaps, gtTx);
+    const liqMc = pair.mcap > 0 ? pair.liqUsd / pair.mcap * 100 : null;
+    const comps = {
+      momentum: { score: scoreMomentum(pc), weight: w.momentum },
+      buyers: { score: scoreBuyers(gtTx), weight: w.buyers },
+      buySell: { score: scoreBuySell(pair.txns, gtTx), weight: w.buySell },
+      holders: { score: hold ? hold.score : null, weight: w.holders, basis: hold ? hold.basis : 'no data', growthPctH: hold ? hold.growthPctH : null },
+      liqMc: { score: scoreLiqMc(liqMc), weight: w.liqMc },
+      smart: { score: scoreSmart(c.smartHits, c.smartWallets), weight: w.smart, basis: c.smartWallets ? (c.smartHits == null ? 'rpc failed' : c.smartHits + '/' + c.smartWallets + ' wallets') : 'n/a (no wallets set)' }
+    };
+    let tw = 0, acc = 0, have = 0;
+    Object.keys(comps).forEach(k => {
+      const x = comps[k];
+      if (x.score == null) return;
+      have++; tw += x.weight; acc += x.weight * x.score;
+    });
+    const score = tw > 0 ? Math.round(acc / tw) : 0;
+    const enough = have >= 4;
+    return { score, pass: enough && score >= s.passScore, enough, components: comps };
+  }
+
+  /** EXECUTOR sizing: ≤ posPct (8%) of equity, floor at minPosSol, never more than spendable cash. */
+  function executorSize(equityUsd, cashUsd, settings, reserveUsd, solPx) {
+    const s = Object.assign({}, DEFAULTS, settings || {});
+    const pct = Math.min(0.08, s.posPct);
+    const want = (+equityUsd || 0) * pct;
+    const spend = Math.max(0, (+cashUsd || 0) - Math.max(0, +reserveUsd || 0));
+    const usd = Math.min(want, spend);
+    const floor = minPosUsd(s, solPx);
+    if (floor > 0 && usd < floor) return 0;
+    return usd;
+  }
+
+  /** RISK pre-entry: approve a sized ticket and register the hard stop + trailing plan BEFORE any fill. */
+  function riskApprove(ticket, state, settings, now, extra) {
+    const s = Object.assign({}, DEFAULTS, settings || {});
+    const reasons = [];
+    const gate = canOpenMore(state, s, now, extra);
+    if (!gate.ok) reasons.push(gate.reason);
+    if (!ticket || !(ticket.usd > 0)) reasons.push('no size');
+    if (ticket && ticket.usd > (+state.equityUsd || +state.cashUsd || 0) * 0.08 + 1e-6) reasons.push('size above 8% cap');
+    const qs = ticket && ticket.quoteSell;
+    if (!qs || !qs.ok) reasons.push('sell quote failed (honeypot)');
+    else if (Math.abs(+qs.impactPct || 0) > s.maxSellImpactPct) reasons.push('sell impact ' + Math.abs(+qs.impactPct).toFixed(2) + '% (thin exit)');
+    const qb = ticket && ticket.quoteBuy;
+    if (!qb || !qb.ok) reasons.push('no buy quote');
+    else if (Math.abs(+qb.impactPct || 0) > s.maxImpactPct) reasons.push('buy impact ' + Math.abs(+qb.impactPct).toFixed(2) + '%');
+    if (ticket && ticket.mint && tokenOnCooldown(state, ticket.mint, now)) reasons.push('token cooldown');
+    if (ticket && (state.positions || []).some(p => p.mint === ticket.mint)) reasons.push('already holding');
+    if (reasons.length) return { ok: false, reasons };
+    const ref = +ticket.expectedPx || +ticket.priceUsd;
+    return {
+      ok: true, reasons: [],
+      plan: { stopPct: s.slPct, stopPx: ref * (1 - s.slPct), trailArmPct: s.trailArmPct, trailPct: s.trailPct, registeredAt: now || Date.now() }
+    };
+  }
+  /** After the fill, re-anchor the registered stop to the actual fill price: exactly −stopPct from entry. */
+  function anchorStop(plan, fillPx) {
+    const px = +fillPx;
+    if (!plan || !(px > 0)) return null;
+    return px * (1 - plan.stopPct);
+  }
+
+  /** LOGGER helpers: append with dedupe for repeated kills; cap size. */
+  function logAppend(log, ev, cap, dedupeMs) {
+    const L = log || [];
+    const lim = cap || 600;
+    const win = dedupeMs != null ? dedupeMs : 10 * 60e3;
+    if (ev.kind === 'kill' && ev.mint) {
+      for (let i = 0; i < Math.min(L.length, 200); i++) {
+        const e = L[i];
+        if (e.kind === 'kill' && e.mint === ev.mint && e.stage === ev.stage && e.code === ev.code) {
+          if (ev.t - e.t0 < win) { e.n = (e.n || 1) + 1; e.t = ev.t; e.reason = ev.reason; L.splice(i, 1); L.unshift(e); return L; }
+          break;
+        }
+      }
+    }
+    ev.n = ev.n || 1; ev.t0 = ev.t;
+    L.unshift(ev);
+    if (L.length > lim) L.length = lim;
+    return L;
+  }
+
   const api = {
-    DEFAULTS, cloneDefaults, scanCandidates, analyzeSafety, momentumEntry,
+    DEFAULTS, LEGACY_DEFAULTS, cloneDefaults, toScoutPair, scoutStage, filterPair, filterStage, scorePair, scoreMomentum, scoreBuyers, scoreBuySell, scoreHolders, scoreLiqMc, scoreSmart, lpLockedPctOf, devHoldPct, bundlePct, devHistory, executorSize, riskApprove, anchorStop, logAppend, scanCandidates, analyzeSafety, momentumEntry,
     decideExit, abortIfMoved, canOpenMore, positionUsd, applyBuy, applySell,
     markToMarket, updateDayAndHalt, recordLossStreak, tradeStats, maxDrawdown,
     walkExit, topHolderPctExLp, lpLockedOrBonded, isPumpOrGraduated, mintOrFreeze, ema, vwap, quoteLiqUsd, creatorPct, insiderPct, pairMc, dangerRisks, minPosUsd, tokenOnCooldown, armTokenCooldown

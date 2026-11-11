@@ -1,4 +1,4 @@
-/* Meme Terminal — Fast-only paper/live flip bot. Solana burner wallet, Jupiter swaps. */
+/* Meme Terminal v10 — 6-agent pipeline (Scout → Filter → Analyst → Executor → Risk → Logger). Solana burner wallet, Jupiter swaps. */
 (function () {
   'use strict';
   const S = window.BotStrategy;
@@ -11,7 +11,11 @@
   const RUG = 'https://api.rugcheck.xyz/v1/tokens/';
   const STORE = 'bot:v1';
   const WAL = 'bot:wallet';
-  const SCAN_MS = 20000;
+  const SCAN_MS = 30000;
+  const LOGKEY = 'bot:log';
+  const LOG_CAP = 600;
+  const GT = 'https://api.geckoterminal.com/api/v2';
+  const DSAPI = 'https://api.dexscreener.com';
   const TICK_MS = 1000;
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -47,16 +51,26 @@
     liveBal: { sol: 0, tokens: [], usd: 0 },
     view: 'term',
     rejectTally: {},
+    log: [],
+    stats: freshStats(),
+    holderHist: {},
+    smartCache: {},
+    logFilter: 'all',
     _skipSave: false
   };
 
   function idleAgents() {
     return {
-      scanner: { status: 'idle', detail: 'waiting', n: 0 },
+      scout: { status: 'idle', detail: 'waiting', n: 0 },
+      filter: { status: 'idle', detail: 'waiting', n: 0 },
       analyst: { status: 'idle', detail: 'waiting', token: null, score: null },
       executor: { status: 'idle', detail: 'ready' },
-      brain: { status: 'idle', detail: 'watching' }
+      risk: { status: 'idle', detail: 'watching' },
+      logger: { status: 'idle', detail: '0 events' }
     };
+  }
+  function freshStats() {
+    return { scouted: 0, scoutLast: 0, seenLast: 0, killed: 0, killLast: 0, filterPassLast: 0, killByCode: {}, scored: 0, passed: 0, passLast: 0, lastBest: null, entries: 0, riskBlocks: 0, exits: 0, cycles: 0 };
   }
 
   const persistable = () => ({
@@ -66,26 +80,25 @@
     dayKey: bot.dayKey, dayStartEquity: bot.dayStartEquity,
     consecLosses: bot.consecLosses, cooldownUntil: bot.cooldownUntil,
     tokenCooldownUntil: bot.tokenCooldownUntil || {},
-    scanned: bot.scanned, lastFlash: bot.lastFlash, tf: bot.tf
+    scanned: bot.scanned, lastFlash: bot.lastFlash, tf: bot.tf, stats: bot.stats
   });
 
-  function save() { if (bot._skipSave) return; try { ls.set(STORE, persistable()); } catch (e) { console.warn('bot save', e); } }
+  function save() { if (bot._skipSave) return; try { ls.set(STORE, persistable()); } catch (e) { console.warn('bot save', e); } saveLog(); }
+  function saveLog() {
+    if (bot._skipSave) return;
+    try { ls.set(LOGKEY, bot.log.slice(0, LOG_CAP)); }
+    catch (e) { try { bot.log.length = Math.min(bot.log.length, 200); ls.set(LOGKEY, bot.log); } catch {} }
+  }
   function migrateSettings(s) {
+    if (s && s.pipelineV !== S.DEFAULTS.pipelineV) {
+      // v9 → v10: adopt the new pipeline defaults, keep only user plumbing.
+      const keep = {};
+      ['mode', 'rpcUrl', 'minSolReserve', 'slippageBps', 'paperStartUsd'].forEach(k => { if (s[k] != null) keep[k] = s[k]; });
+      return Object.assign(S.cloneDefaults(), keep);
+    }
     const out = Object.assign(S.cloneDefaults(), s || {});
-    if (!s) return out;
-    if (s.minLiq === 30000 || s.minLiq === 12000 || s.minLiq === 10000) out.minLiq = S.DEFAULTS.minLiq;
-    if (s.minAgeMin === 25) out.minAgeMin = S.DEFAULTS.minAgeMin;
-    if (s.maxImpactPct === 2) out.maxImpactPct = S.DEFAULTS.maxImpactPct;
-    if (s.scoreScans === 3 || s.scoreScans === 2) out.scoreScans = S.DEFAULTS.scoreScans;
-    if (s.max1hChg === 300) out.max1hChg = S.DEFAULTS.max1hChg;
-    if (s.liqDropPct === 0.30) out.liqDropPct = S.DEFAULTS.liqDropPct;
-    if (s.posPct === 0.10) out.posPct = S.DEFAULTS.posPct;
-    if (s.maxOpen === 2 || s.maxOpen === 8) out.maxOpen = S.DEFAULTS.maxOpen;
-    if (s.maxAgeH === 72) out.maxAgeH = S.DEFAULTS.maxAgeH;
-    if (s.minScore === 62 || s.minScore === 58) out.minScore = S.DEFAULTS.minScore;
-    if (s.minLiqMcRatio === 0.06) out.minLiqMcRatio = S.DEFAULTS.minLiqMcRatio;
-    if (s.minQuoteLiq === 6000) out.minQuoteLiq = S.DEFAULTS.minQuoteLiq;
-    if (s.consecLossLimit === 2) out.consecLossLimit = S.DEFAULTS.consecLossLimit;
+    out.weights = Object.assign({}, S.DEFAULTS.weights, (s && s.weights) || {});
+    out.smartWallets = Array.isArray(s && s.smartWallets) ? s.smartWallets.slice(0, 10) : [];
     return out;
   }
   function load() {
@@ -94,8 +107,11 @@
     Object.assign(bot, s);
     bot.settings = migrateSettings(s.settings || {});
     bot.agents = idleAgents();
+    bot.stats = Object.assign(freshStats(), s.stats || {});
+    try { const lg = ls.get(LOGKEY); bot.log = Array.isArray(lg) ? lg : []; } catch { bot.log = []; }
     bot.rejectTally = bot.rejectTally || {};
     bot.tokenCooldownUntil = bot.tokenCooldownUntil || {};
+    (bot.positions || []).forEach(p => { p._selling = false; });
     if (bot.settings.mode !== 'LIVE') bot.settings.mode = 'PAPER';
   }
 
@@ -184,7 +200,11 @@
         const url = base + path;
         const init = { method: o.method || 'GET', headers: { accept: 'application/json' } };
         if (o.body) { init.method = 'POST'; init.headers['content-type'] = 'application/json'; init.body = JSON.stringify(o.body); }
-        const r = await fetch(url, init);
+        const ctl = new AbortController();
+        const to = setTimeout(() => ctl.abort(), o.body ? 20000 : 10000);
+        init.signal = ctl.signal;
+        let r;
+        try { r = await fetch(url, init); } finally { clearTimeout(to); }
         jupGate.last = Date.now();
         if (r.status === 429) {
           jupGate.until = Date.now() + 12000;
@@ -325,9 +345,15 @@
   }
   async function rugReport(mint) {
     const hit = bot.rugCache[mint];
-    if (hit && Date.now() - hit.ts < 360000) return hit.d;
+    if (hit && Date.now() - hit.ts < 180000) return hit.d;
     const d = await getJSON(RUG + encodeURIComponent(mint) + '/report', 12000);
     bot.rugCache[mint] = { ts: Date.now(), d };
+    if (d && +d.totalHolders > 0) {
+      const h = bot.holderHist[mint] || (bot.holderHist[mint] = []);
+      h.push({ t: Date.now(), n: +d.totalHolders });
+      while (h.length && Date.now() - h[0].t > 2 * 36e5) h.shift();
+      if (h.length > 40) h.splice(0, h.length - 40);
+    }
     return d;
   }
   const gtCache = {};
@@ -423,7 +449,8 @@
   }
 
   async function checkExits() {
-    if (!bot.positions.length) { bot.agents.brain.detail = 'watching'; bot.agents.brain.status = 'idle'; return; }
+    const R = bot.agents.risk;
+    if (!bot.positions.length) { R.detail = bot.halted ? ('halted: ' + bot.halted) : 'no open risk'; R.status = bot.halted ? 'danger' : 'idle'; R.token = null; return; }
     const now = Date.now();
     for (const pos of bot.positions.slice()) {
       if (!pos._rugTs || now - pos._rugTs > 15000) {
@@ -436,8 +463,12 @@
           if (qRug) pos._quoteLiq = pos._quoteLiq ? Math.min(pos._quoteLiq, qRug) : qRug;
         } catch {}
       }
+      if (!(pos.stopPx > 0)) {
+        // Positions opened before v10 get a stop registered now (−slPct from entry).
+        pos.stopPx = pos.entryPx * (1 - bot.settings.slPct);
+        pos.trailArmPct = bot.settings.trailArmPct; pos.trailPct = bot.settings.trailPct;
+      }
       const mid = midPx(pos);
-      const px = lastPx(pos);
       const d = S.decideExit(pos, mid, now, bot.settings, pos._pair, {
         jupPx: bot._jupPx && bot._jupPx[pos.mint],
         quoteLiqUsd: pos._quoteLiq,
@@ -447,15 +478,29 @@
         pairGone: !!pos._pairGone && !pos._pair
       });
       pos.peakPx = Math.max(pos.peakPx || pos.entryPx, mid || pos.entryPx);
-      bot.agents.brain.status = 'hot';
-      bot.agents.brain.token = pos;
-      if (d.action === 'hold') { bot.agents.brain.detail = pos.tpTaken ? 'trailing' : 'holding'; continue; }
-      bot.agents.brain.detail = d.reason === 'stop' ? ('stop ' + Math.round((bot.settings.slPct || 0.12) * -100) + '%') : (d.reason === 'tp' ? 'taking profit' : d.reason);
+      const peakUp = pos.peakPx / pos.entryPx - 1;
+      pos._trailing = peakUp >= (pos.trailArmPct != null ? pos.trailArmPct : bot.settings.trailArmPct);
+      R.status = 'hot';
+      R.token = pos;
+      if (d.action === 'hold') {
+        const n = bot.positions.length;
+        const trailing = bot.positions.filter(p => p._trailing).length;
+        R.detail = trailing ? (n + ' open · ' + trailing + ' trail') : (n + ' open · −' + Math.round(bot.settings.slPct * 100) + '%');
+        continue;
+      }
+      R.detail = d.reason === 'stop' ? ('stop −' + Math.round(bot.settings.slPct * 100) + '% hit') : d.reason === 'trail' ? 'trailing stop hit' : d.reason;
       await executeSell(pos, d.action === 'sell_partial' ? d.pct : 1, d.reason);
     }
   }
 
   async function executeSell(pos, frac, reason) {
+    // Never sell the same position twice concurrently (1s ticks, manual sell, kill switch can overlap).
+    if (!pos || pos._selling || !bot.positions.includes(pos)) return null;
+    pos._selling = true;
+    try { return await executeSellInner(pos, frac, reason); }
+    finally { pos._selling = false; }
+  }
+  async function executeSellInner(pos, frac, reason) {
     const px0 = lastPx(pos);
     bot.agents.executor.status = 'hot';
     bot.agents.executor.detail = 'selling ' + Math.round(frac * 100) + '%';
@@ -485,7 +530,7 @@
         t: Date.now(), kind, mint: pos.mint, symbol: pos.symbol, icon: pos.icon,
         usd: fillUsd, qty: res.qty, px: fillPx, mc: pos._mc || pos.entryMc,
         pnlUsd: res.pnl, pnlPct: fillPx / pos.entryPx - 1, mult,
-        agent: kind === 'stop' || reason === 'tp' || reason === 'trail' || reason === 'time' ? 'Brain' : 'Executor',
+        agent: reason === 'manual' || reason === 'kill' ? 'Executor' : 'Risk',
         note: reason === 'stop' ? 'stop −' + Math.round(bot.settings.slPct * 100) + '%'
           : reason === 'tp' ? 'took profit' : reason === 'trail' ? 'trailing stop'
           : reason === 'time' ? 'time stop' : reason === 'liquidity' ? 'liquidity drop'
@@ -497,8 +542,12 @@
         S.armTokenCooldown(bot, pos.mint, bot.settings, Date.now());
       }
       bot.agents.executor.detail = kind === 'stop' ? ('stopped −$' + Math.abs(res.pnl).toFixed(2)) : ('sold ' + (mult.toFixed(2)) + 'x');
-      bot.agents.brain.detail = bot.agents.executor.detail;
-      bot.agents.brain.status = kind === 'stop' ? 'danger' : 'hot';
+      bot.agents.risk.detail = bot.agents.executor.detail;
+      bot.agents.risk.status = kind === 'stop' ? 'danger' : 'hot';
+      bot.stats.exits++;
+      logEvent({ stage: 'risk', kind: 'trade', side: kind, mint: pos.mint, symbol: pos.symbol, icon: pos.icon,
+        reason: (reason === 'stop' ? 'hard stop −' + Math.round(bot.settings.slPct * 100) + '%' : reason === 'trail' ? 'trailing stop (' + Math.round((pos.trailPct || bot.settings.trailPct) * 100) + '% off peak)' : reason),
+        usd: fillUsd, pnlUsd: res.pnl, pnlPct: fillPx / pos.entryPx - 1, frac });
       pushEquity(equityNow());
       save();
       return res;
@@ -551,21 +600,312 @@
     catch (e) { console.warn('reconcile', e); }
   }
 
-  async function executeBuy(item, usd) {
-    const p = item.pair;
-    const mint = item.addr;
-    const px = +p.priceUsd;
+  /* ======================= v10 agent pipeline ======================= */
+  let _logSaveT = 0;
+  function logEvent(ev) {
+    ev.t = ev.t || Date.now();
+    S.logAppend(bot.log, ev, LOG_CAP);
+    const L = bot.agents.logger;
+    if (L) {
+      L.status = 'hot';
+      L.n = (L.n || 0) + 1;
+      L.detail = fmtCount(bot.log.length) + ' events';
+    }
+    if (Date.now() - _logSaveT > 5000) { _logSaveT = Date.now(); saveLog(); }
+  }
+
+  function scoutCandidateRecords(gtPools, dsLists, dsPairs, now) {
+    const s = bot.settings;
+    const gtByMint = {};
+    (gtPools || []).forEach(pl => {
+      const a = pl && pl.attributes; if (!a) return;
+      const rel = pl.relationships && pl.relationships.base_token && pl.relationships.base_token.data;
+      const id = rel && rel.id; if (!id || id.indexOf('solana_') !== 0) return;
+      const mint = id.slice(7);
+      const age = a.pool_created_at ? (now - Date.parse(a.pool_created_at)) / 60000 : Infinity;
+      const mc = +a.market_cap_usd || +a.fdv_usd || 0;
+      if (age < 20 || age > s.scoutMaxAgeH * 60 * 1.25) return;
+      if (mc && (mc < s.scoutMinMc * 0.6 || mc > s.scoutMaxMc * 1.5)) return;
+      const cur = gtByMint[mint];
+      if (!cur || (+a.reserve_in_usd || 0) > (+cur.reserve_in_usd || 0)) gtByMint[mint] = a;
+    });
+    const dsMeta = {};
+    (dsLists || []).forEach(list => (list || []).forEach(x => {
+      if (!x || (x.chainId !== 'solana') || !x.tokenAddress) return;
+      dsMeta[x.tokenAddress] = dsMeta[x.tokenAddress] || { icon: x.icon ? (/^https?:/.test(x.icon) ? x.icon : 'https://cdn.dexscreener.com/cms/images/' + encodeURIComponent(x.icon) + '?width=64&height=64&fit=crop&quality=95&format=auto') : '' };
+    }));
+    return { gtByMint, dsMeta };
+  }
+
+  // GeckoTerminal allows ~30 calls/min per IP and answers 429 without CORS headers, so pace it.
+  const gtGate = { last: 0, pauseUntil: 0, gapMs: 2100 };
+  async function gtGet(url) {
+    if (Date.now() < gtGate.pauseUntil) throw new Error('GT paused');
+    const wait = gtGate.last + gtGate.gapMs - Date.now();
+    if (wait > 0) await sleep(wait);
+    gtGate.last = Date.now();
+    try { return await getJSON(url, 12000); }
+    catch (e) { gtGate.pauseUntil = Date.now() + 20000; throw e; }
+  }
+  const GT_SCOUT = [
+    '/networks/solana/trending_pools?duration=1h&page=1', '/networks/solana/trending_pools?duration=6h&page=1',
+    '/networks/solana/trending_pools?duration=24h&page=1', '/networks/solana/trending_pools?duration=5m&page=1',
+    '/networks/solana/pools?sort=h24_tx_count_desc&page=1', '/networks/solana/trending_pools?duration=1h&page=2',
+    '/networks/solana/trending_pools?duration=6h&page=2', '/networks/solana/trending_pools?duration=24h&page=2'
+  ];
+  async function scoutFetch() {
+    const c = bot._scoutCache;
+    if (c && Date.now() - c.ts < 90000) return c;
+    const now = Date.now();
+    const gtUrls = GT_SCOUT.map(x => GT + x + '&include=base_token');
+    const dsUrls = [DSAPI + '/token-profiles/latest/v1', DSAPI + '/token-boosts/latest/v1', DSAPI + '/token-boosts/top/v1'];
+    const gtRes = [];
+    for (const u of gtUrls) { try { gtRes.push(await gtGet(u)); } catch { gtRes.push(null); if (Date.now() < gtGate.pauseUntil) break; } }
+    const dsRes = await pool(dsUrls, 3, u => getJSON(u, 10000));
+    const gtPools = [];
+    let gtOk = 0;
+    gtRes.forEach(d => { if (d && d.data) { gtOk++; d.data.forEach(x => gtPools.push(x)); } });
+    const { gtByMint, dsMeta } = scoutCandidateRecords(gtPools, dsRes, null, now);
+    (solanaFastItems() || []).forEach(it => { if (it.addr && !dsMeta[it.addr]) dsMeta[it.addr] = { icon: it.icon || '' }; });
+    const mints = Array.from(new Set(Object.keys(gtByMint).concat(Object.keys(dsMeta)))).slice(0, 120);
+    const chunks = [];
+    for (let i = 0; i < mints.length; i += 30) chunks.push(mints.slice(i, i + 30));
+    const dsBatches = await pool(chunks, 2, ch => getJSON(DSAPI + '/tokens/v1/solana/' + ch.join(','), 12000));
+    const bestDs = {};
+    dsBatches.forEach(arr => (Array.isArray(arr) ? arr : []).forEach(p => {
+      if (!p || p.chainId !== 'solana' || !p.baseToken) return;
+      const m = p.baseToken.address;
+      if (!mints.includes(m)) return;
+      const cur = bestDs[m];
+      if (!cur || ((p.liquidity && +p.liquidity.usd) || 0) > ((cur.liquidity && +cur.liquidity.usd) || 0)) bestDs[m] = p;
+    }));
+    const records = [];
+    mints.forEach(m => {
+      const ds = bestDs[m], gt = gtByMint[m];
+      const src = [gt ? 'gecko' : null, dsMeta[m] ? 'dexscreener' : null].filter(Boolean);
+      if (ds) records.push(S.toScoutPair(ds, gt && gt.address === ds.pairAddress ? gt : null, { mint: m, icon: (dsMeta[m] && dsMeta[m].icon) || '', src }));
+      else if (gt) records.push(S.toScoutPair(null, gt, { mint: m, symbol: String(gt.name || '?').split(' / ')[0], src }));
+    });
+    bot._scoutCache = { ts: now, records, gtOk, gtCalls: gtUrls.length, dsResolved: Object.keys(bestDs).length, mints: mints.length };
+    return bot._scoutCache;
+  }
+
+  /** 1) SCOUT — finds Solana pairs 30m–72h old with mcap $300k–$20M. */
+  async function agentScout() {
+    const A = bot.agents.scout;
+    A.status = 'hot'; A.detail = 'scanning…';
+    const now = Date.now();
+    let fetched;
+    try { fetched = await scoutFetch(); }
+    catch (e) { A.status = 'danger'; A.detail = 'data error'; return { stage: 'scout', t: now, pairs: [], skipped: {}, seen: 0 }; }
+    const out = S.scoutStage(fetched.records, now, bot.settings);
+    bot._lastScout = out;
+    bot.scanned += out.seen;
+    bot.stats.scouted = (bot.stats.scouted || 0) + out.pairs.length;
+    bot.stats.scoutLast = out.pairs.length;
+    bot.stats.seenLast = out.seen;
+    bot.stats.scoutSkipLast = out.skipped;
+    A.n = out.pairs.length;
+    A.detail = out.pairs.length + ' pair' + (out.pairs.length === 1 ? '' : 's') + ' in range';
+    bot._seenMint = bot._seenMint || {};
+    out.pairs.forEach(p => {
+      if (bot._seenMint[p.mint] && now - bot._seenMint[p.mint] < 30 * 60e3) return;
+      bot._seenMint[p.mint] = now;
+      logEvent({ stage: 'scout', kind: 'found', mint: p.mint, symbol: p.symbol, icon: p.icon,
+        reason: 'age ' + fmtAge(p.ageMin) + ' · MC ' + fmtMc(p.mcap) + ' · liq ' + fmtMc(p.liqUsd) });
+    });
+    return out;
+  }
+  function fmtAge(min) { return min < 90 ? Math.round(min) + 'm' : (min / 60).toFixed(1).replace(/\.0$/, '') + 'h'; }
+
+  /** 2) FILTER — receives Scout output only. Kills on authorities, LP, liq/mcap, dev, bundles, 1h pump. */
+  async function agentFilter(scoutOut) {
+    const A = bot.agents.filter;
+    A.status = 'hot';
+    const reports = {};
+    await pool(scoutOut.pairs, 3, async p => {
+      try { reports[p.mint] = await rugReport(p.mint); } catch { reports[p.mint] = null; }
+    });
+    const out = S.filterStage(scoutOut, reports, bot.settings, Date.now());
+    bot._lastFilter = out;
+    bot.stats.killUniq = bot.stats.killUniq || {};
+    out.killed.forEach(k => {
+      bot.stats.killed++;
+      k.kills.forEach(x => {
+        bot.stats.killByCode[x.code] = (bot.stats.killByCode[x.code] || 0) + 1;
+        bot.rejectTally[x.code] = (bot.rejectTally[x.code] || 0) + 1;
+        const u = bot.stats.killUniq[x.code] || (bot.stats.killUniq[x.code] = {});
+        u[k.mint] = 1;
+      });
+      logEvent({ stage: 'filter', kind: 'kill', code: k.kills[0].code, mint: k.mint, symbol: k.symbol, icon: k.icon,
+        reason: k.kills.map(x => x.reason).join('; '), codes: k.kills.map(x => x.code), facts: k.facts });
+    });
+    bot.stats.killLast = out.killed.length;
+    bot.stats.filterPassLast = out.pairs.length;
+    A.n = out.killed.length;
+    A.detail = out.killed.length + ' killed · ' + out.pairs.length + ' pass';
+    if (!scoutOut.pairs.length) { A.status = 'idle'; A.detail = 'nothing to check'; }
+    return out;
+  }
+
+  async function gtPoolsMulti(addrs) {
+    const out = {};
+    const list = addrs.filter(Boolean).slice(0, 30);
+    if (!list.length) return out;
+    try {
+      const d = await gtGet(GT + '/networks/solana/pools/multi/' + list.join(','));
+      ((d && d.data) || []).forEach(x => { if (x && x.attributes) out[x.attributes.address] = x.attributes; });
+    } catch {}
+    return out;
+  }
+  function validWallet(w) { return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(String(w || '').trim()); }
+  async function smartWalletHits(mint) {
+    const wallets = (bot.settings.smartWallets || []).filter(validWallet).slice(0, 10);
+    if (!wallets.length) return { hits: null, n: 0 };
+    let hits = 0, failed = 0;
+    for (const w of wallets) {
+      const key = w + ':' + mint;
+      const hit = bot.smartCache[key];
+      if (hit && Date.now() - hit.t < 120000) { if (hit.has) hits++; continue; }
+      try {
+        const r = await rpc('getTokenAccountsByOwner', [w, { mint }, { encoding: 'jsonParsed' }], 8000);
+        const has = ((r && r.value) || []).some(a => {
+          const amt = a && a.account && a.account.data && a.account.data.parsed && a.account.data.parsed.info && a.account.data.parsed.info.tokenAmount;
+          return amt && +amt.uiAmount > 0;
+        });
+        bot.smartCache[key] = { t: Date.now(), has };
+        if (has) hits++;
+      } catch { failed++; }
+    }
+    return { hits: failed === wallets.length ? null : hits, n: wallets.length };
+  }
+
+  /** 3) ANALYST — receives Filter survivors only. Scores 0–100; only ≥ passScore go on. */
+  async function agentAnalyst(filterOut) {
+    const A = bot.agents.analyst;
+    const s = bot.settings;
+    if (!filterOut.pairs.length) {
+      A.status = 'idle'; A.token = null; A.score = null;
+      A.detail = 'waiting for survivors';
+      return { stage: 'analyst', t: Date.now(), pairs: [], scored: [] };
+    }
+    A.status = 'hot';
+    const gt = await gtPoolsMulti(filterOut.pairs.map(p => p.pairAddress));
+    const scored = [];
+    for (const p of filterOut.pairs) {
+      const g = gt[p.pairAddress];
+      const gpc = (g && g.price_change_percentage) || {};
+      const snaps = (bot.holderHist[p.mint] || []).filter(x => Date.now() - x.t <= 60 * 60e3);
+      const sm = await smartWalletHits(p.mint);
+      const res = S.scorePair(p, {
+        gtTx: (g && g.transactions) || p.gtTx,
+        priceChange: { m15: gpc.m15 != null ? +gpc.m15 : undefined, m30: gpc.m30 != null ? +gpc.m30 : undefined },
+        holderSnaps: snaps, smartHits: sm.hits, smartWallets: sm.n
+      }, s);
+      bot.stats.scored++;
+      const row = Object.assign({}, p, { score: res.score, pass: res.pass, components: res.components, enough: res.enough });
+      scored.push(row);
+      const prev = (bot._lastScore || (bot._lastScore = {}))[p.mint];
+      if (!prev || Math.abs(prev.s - res.score) >= 3 || Date.now() - prev.t > 10 * 60e3 || prev.pass !== res.pass) {
+        bot._lastScore[p.mint] = { s: res.score, t: Date.now(), pass: res.pass };
+        const c = res.components;
+        const part = k => c[k].score == null ? '–' : c[k].score;
+        logEvent({ stage: 'analyst', kind: res.pass ? 'pass' : 'kill', code: res.pass ? 'score_pass' : (res.enough ? 'score_low' : 'score_nodata'),
+          mint: p.mint, symbol: p.symbol, icon: p.icon, score: res.score,
+          reason: (res.enough ? 'score ' + res.score + (res.pass ? ' ≥ ' : ' < ') + s.passScore : 'not enough data (' + Object.keys(c).filter(k => c[k].score != null).length + '/6 components) · score ' + res.score) + ' · mom ' + part('momentum') + ' · buyers ' + part('buyers') + ' · b/s ' + part('buySell') +
+            ' · holders ' + part('holders') + (c.holders.basis === 'proxy' ? '*' : '') + ' · liq/mc ' + part('liqMc') + ' · smart ' + part('smart'),
+          components: Object.keys(c).reduce((o, k) => { o[k] = c[k].score; return o; }, {}) });
+      }
+      if (!res.pass) {
+        bot.stats.killByCode[res.enough ? 'score_low' : 'score_nodata'] = (bot.stats.killByCode[res.enough ? 'score_low' : 'score_nodata'] || 0) + 1;
+      }
+    }
+    scored.sort((a, b) => b.score - a.score);
+    const passed = scored.filter(x => x.pass);
+    bot._lastScored = scored;
+    bot.stats.passed += passed.length;
+    bot.stats.passLast = passed.length;
+    const best = scored[0];
+    bot.stats.lastBest = best ? { symbol: best.symbol, score: best.score } : null;
+    A.token = best ? { symbol: best.symbol, icon: best.icon } : null;
+    A.score = best ? best.score : null;
+    A.n = passed.length;
+    A.detail = passed.length ? (passed.length + ' ≥' + s.passScore + ' · top ' + best.score) : (best ? 'best ' + best.score + ' < ' + s.passScore : 'no scores');
+    return { stage: 'analyst', t: Date.now(), pairs: passed, scored };
+  }
+
+  /** 4) EXECUTOR — receives Analyst ≥70 list only. Sizes ≤8%, gets buy + honeypot sell quotes, hands ticket to Risk. */
+  async function agentExecutor(analystOut) {
+    const E = bot.agents.executor;
+    if (!analystOut.pairs.length) { E.status = 'idle'; E.detail = bot.positions.length ? (bot.positions.length + ' open') : 'ready'; return { tickets: 0, fills: 0 }; }
+    let tickets = 0, fills = 0;
+    for (const p of analystOut.pairs) {
+      const now = Date.now();
+      if (bot.positions.some(x => x.mint === p.mint)) continue;
+      const gate = S.canOpenMore(bot, bot.settings, now, { solPx: bot.solPx, reserveUsd: reserveUsd() });
+      if (!gate.ok) { E.detail = gate.reason; logEvent({ stage: 'executor', kind: 'skip', code: 'gate', mint: p.mint, symbol: p.symbol, icon: p.icon, reason: gate.reason }); break; }
+      const solPx = await solPrice();
+      const eq = equityNow();
+      const usd = S.executorSize(eq, bot.cashUsd, bot.settings, reserveUsd(), solPx);
+      if (!(usd > 0)) { E.detail = 'size below floor'; logEvent({ stage: 'executor', kind: 'skip', code: 'size', mint: p.mint, symbol: p.symbol, reason: 'size below 0.02 SOL floor' }); break; }
+      E.status = 'hot'; E.token = p; E.detail = 'quoting ' + p.symbol;
+      // Scout data can be ~90s old: re-read the live pair so the signal price is current.
+      let livePx = p.priceUsd, livePair = p.pair;
+      try {
+        const fresh = await dsBestPair(p.mint, p.pairAddress, true);
+        if (fresh && +fresh.priceUsd > 0) { livePx = +fresh.priceUsd; livePair = fresh; }
+      } catch {}
+      let quoteBuy = null, quoteSell = null;
+      try {
+        const lamports = Math.floor((usd / solPx) * 1e9);
+        quoteBuy = await jupQuote(WSOL, p.mint, lamports, bot.settings.slippageBps);
+        if (quoteBuy && quoteBuy.ok) quoteSell = await jupQuote(p.mint, WSOL, Math.max(1, quoteBuy.outAmount), bot.settings.slippageBps);
+      } catch (e) { /* risk will reject on missing quotes */ }
+      const ticket = { mint: p.mint, symbol: p.symbol, icon: p.icon, usd, score: p.score, expectedPx: livePx, priceUsd: livePx, quoteBuy, quoteSell, scout: Object.assign({}, p, { pair: livePair || p.pair, liqUsd: (livePair && livePair.liquidity && +livePair.liquidity.usd) || p.liqUsd }) };
+      tickets++;
+      const ok = await agentRisk(ticket);
+      if (ok) fills++;
+    }
+    if (fills) E.detail = 'bought ' + fills + ' · ' + bot.positions.length + ' open';
+    return { tickets, fills };
+  }
+
+  /** 5) RISK — approves a ticket and registers stop −6% + trail (+12% arm) BEFORE the fill; also owns exits (checkExits). */
+  async function agentRisk(ticket) {
+    const R = bot.agents.risk;
+    const st = { positions: bot.positions, cashUsd: bot.cashUsd, equityUsd: equityNow(), dayStartEquity: bot.dayStartEquity, halted: bot.halted, cooldownUntil: bot.cooldownUntil, tokenCooldownUntil: bot.tokenCooldownUntil };
+    const v = S.riskApprove(ticket, st, bot.settings, Date.now(), { solPx: bot.solPx, reserveUsd: reserveUsd() });
+    if (!v.ok) {
+      bot.stats.riskBlocks++;
+      bot.stats.killByCode['risk_' + (v.reasons[0] || 'x').split(' ')[0]] = (bot.stats.killByCode['risk_' + (v.reasons[0] || 'x').split(' ')[0]] || 0) + 1;
+      logEvent({ stage: 'risk', kind: 'kill', code: 'risk', mint: ticket.mint, symbol: ticket.symbol, icon: ticket.icon, reason: v.reasons.join('; ') });
+      R.detail = 'blocked ' + ticket.symbol;
+      return false;
+    }
+    ticket.risk = v.plan;
+    logEvent({ stage: 'risk', kind: 'plan', mint: ticket.mint, symbol: ticket.symbol, icon: ticket.icon,
+      reason: 'stop −' + Math.round(v.plan.stopPct * 100) + '% registered · trail ' + Math.round(v.plan.trailPct * 100) + '% after +' + Math.round(v.plan.trailArmPct * 100) + '%' });
+    const pos = await executeBuy(ticket);
+    return !!pos;
+  }
+
+  /** Executor fill — refuses any ticket without a Risk-registered stop. */
+  async function executeBuy(ticket) {
+    if (!ticket || !ticket.risk || !(ticket.risk.stopPct > 0)) { console.warn('executeBuy: no risk plan'); return null; }
+    const item = ticket.scout || {};
+    const p = item.pair || {};
+    const mint = ticket.mint;
+    const px = +ticket.expectedPx || +p.priceUsd;
+    const usd = ticket.usd;
     bot.agents.executor.status = 'hot';
-    bot.agents.executor.detail = 'buying ' + Math.round(bot.settings.posPct * 100) + '%';
-    bot.agents.executor.token = item;
+    bot.agents.executor.detail = 'buying $' + usd.toFixed(0);
+    bot.agents.executor.token = { symbol: ticket.symbol, icon: ticket.icon };
     try {
       const solPx = await solPrice();
       const solAmt = usd / solPx;
       let amount = 0, costUsd = usd, fillPx = px, decimals = 6;
       if (bot.settings.mode === 'LIVE') {
         const lamports = Math.floor(solAmt * 1e9);
-        const q = await jupQuote(WSOL, mint, lamports, bot.settings.slippageBps);
-        if (!q.ok) throw new Error('buy quote failed');
         const rec = await liveSwap(WSOL, mint, lamports, { signalPx: px, outDecimals: decimals });
         await reconcileLiveCash();
         const tok = (bot.liveBal.tokens || []).find(t => t.mint === mint);
@@ -573,17 +913,18 @@
         if (tok) decimals = tok.decimals;
         costUsd = rec.usd;
         fillPx = amount ? costUsd / amount : px;
-        const chk = S.abortIfMoved(px, fillPx, bot.settings);
-        if (chk.abort) throw new Error(chk.reason);
       } else {
-        const lamports = Math.floor(solAmt * 1e9);
-        const q = await jupQuote(WSOL, mint, lamports, bot.settings.slippageBps);
-        if (!q.ok) throw new Error('buy quote failed');
+        const q = ticket.quoteBuy;
+        if (!q || !q.ok) throw new Error('buy quote failed');
         if (q.impactPct > bot.settings.maxImpactPct) throw new Error('impact ' + q.impactPct.toFixed(2) + '%');
-        const approx = usd / px;
-        const d6 = q.outAmount / 1e6, d9 = q.outAmount / 1e9;
-        if (Math.abs(d6 - approx) < Math.abs(d9 - approx)) { decimals = 6; amount = d6; }
-        else { decimals = 9; amount = d9; }
+        const rugHit = bot.rugCache[mint] && bot.rugCache[mint].d;
+        if (rugHit && rugHit.token && isFinite(+rugHit.token.decimals)) decimals = +rugHit.token.decimals;
+        else {
+          const approx = usd / px;
+          const d6 = q.outAmount / 1e6, d9 = q.outAmount / 1e9;
+          decimals = Math.abs(d6 - approx) < Math.abs(d9 - approx) ? 6 : 9;
+        }
+        amount = q.outAmount / Math.pow(10, decimals);
         fillPx = amount ? usd / amount : px;
         const chk = S.abortIfMoved(px, fillPx, bot.settings);
         if (chk.abort) throw new Error(chk.reason);
@@ -591,151 +932,61 @@
       }
       const id = 'p' + Date.now() + Math.random().toString(16).slice(2, 6);
       const rugHit = bot.rugCache[mint] && bot.rugCache[mint].d;
-      if (rugHit && rugHit.token && isFinite(+rugHit.token.decimals)) decimals = +rugHit.token.decimals;
-      let pairAddr = p.pairAddress;
-      try {
-        const best = await dsBestPair(mint, pairAddr, true);
-        if (best && best.pairAddress) { pairAddr = best.pairAddress; item.pair = best; }
-      } catch {}
-      const used = item.pair || p;
-      const quoteLiq = S.quoteLiqUsd(used, bot.solPx || solPx, rugHit);
+      // Same source as the 1s exit checks (DexScreener quote side), so the liquidity-drop exit compares like with like.
+      const quoteLiq = S.quoteLiqUsd(p, bot.solPx || solPx, null) || S.quoteLiqUsd(p, bot.solPx || solPx, rugHit);
       S.applyBuy(bot, {
-        id, mint, symbol: item.symbol, icon: item.icon, px: fillPx, mc: pairMc(used),
-        liq: (used.liquidity && used.liquidity.usd) || 0, quoteLiq, amount, costUsd, t: Date.now(),
-        pairAddress: pairAddr
+        id, mint, symbol: ticket.symbol, icon: ticket.icon, px: fillPx, mc: item.mcap || pairMc(p),
+        liq: item.liqUsd || 0, quoteLiq, amount, costUsd, t: Date.now(), pairAddress: item.pairAddress
       });
       const pos = bot.positions[bot.positions.length - 1];
       pos.decimals = decimals;
       pos.entryQuoteLiq = quoteLiq;
+      pos.stopPx = S.anchorStop(ticket.risk, fillPx);
+      pos.trailArmPct = ticket.risk.trailArmPct;
+      pos.trailPct = ticket.risk.trailPct;
+      pos.score = ticket.score;
+      pos._pair = p;
+      bot.stats.entries++;
       addTrade({
-        id: 't' + id, t: Date.now(), kind: 'buy', mint, symbol: item.symbol, icon: item.icon,
-        usd: costUsd, qty: amount, px: fillPx, mc: pairMc(p), agent: 'Executor', note: 'bought'
+        id: 't' + id, t: Date.now(), kind: 'buy', mint, symbol: ticket.symbol, icon: ticket.icon,
+        usd: costUsd, qty: amount, px: fillPx, mc: item.mcap || pairMc(p), agent: 'Executor', note: 'score ' + ticket.score
       });
+      logEvent({ stage: 'executor', kind: 'trade', side: 'buy', mint, symbol: ticket.symbol, icon: ticket.icon, usd: costUsd, score: ticket.score,
+        reason: 'bought ' + fmtUsd(costUsd) + ' (' + (costUsd / Math.max(1e-9, equityNow()) * 100).toFixed(1) + '% equity) · score ' + ticket.score + ' · stop ' + fmtPx(pos.stopPx) });
       bot.agents.executor.detail = 'bought $' + costUsd.toFixed(0);
-      bot.agents.brain.detail = 'holding';
-      bot.agents.brain.status = 'hot';
-      bot.agents.brain.token = pos;
+      bot.agents.risk.detail = bot.positions.length + ' open · −' + Math.round(bot.settings.slPct * 100) + '%';
+      bot.agents.risk.status = 'hot';
+      bot.agents.risk.token = pos;
       pushEquity(equityNow());
       save();
       return pos;
     } catch (e) {
       console.warn('buy failed', e);
-      toast('Buy skipped: ' + (e.message || e), 3500);
+      logEvent({ stage: 'executor', kind: 'kill', code: 'fill_abort', mint, symbol: ticket.symbol, icon: ticket.icon, reason: 'fill aborted: ' + (e.message || e) });
       bot.agents.executor.detail = 'aborted';
       return null;
     }
   }
+  function fmtPx(x) { if (!(x > 0)) return '—'; return x >= 1 ? '$' + x.toFixed(4) : '$' + x.toPrecision(3); }
 
-  function noteReject(reasons) {
-    bot.rejectTally = bot.rejectTally || {};
-    const r0 = (reasons && reasons[0]) || 'unknown';
-    let bucket = r0;
-    if (/^liq|liquidity/.test(r0)) bucket = 'liquidity';
-    else if (/young|too new/.test(r0)) bucket = 'too new';
-    else if (/too old/.test(r0)) bucket = 'too old';
-    else if (/mint/.test(r0)) bucket = 'mint authority';
-    else if (/freeze/.test(r0)) bucket = 'freeze authority';
-    else if (/LP not/.test(r0)) bucket = 'LP unlocked';
-    else if (/danger risks|rugcheck/.test(r0)) bucket = 'rugcheck flags';
-    else if (/holders/.test(r0)) bucket = 'holder concentration';
-    else if (/buy impact/.test(r0)) bucket = 'buy impact';
-    else if (/honeypot|sell quote|sell impact/.test(r0)) bucket = 'honeypot / sell quote';
-    else if (/score not yet|score dipped/.test(r0)) bucket = 'score stability';
-    else if (/EMA|VWAP|local top|momentum|parabolic|1h |5m |no price|chasing/.test(r0)) bucket = 'momentum: ' + r0;
-    else if (/buy count|not rising/.test(r0)) bucket = 'buy count not rising';
-    else if (/extreme/i.test(r0)) bucket = 'extreme risk';
-    else if (/quote failed|Jupiter/.test(r0)) bucket = 'quote failed';
-    else if (/rugcheck failed/.test(r0)) bucket = 'rugcheck failed';
-    else if (/no safe/.test(r0)) bucket = 'no scan candidates';
-    else if (/quote liquidity|total liquidity|liq\/mcap/.test(r0)) bucket = 'thin exit liquidity';
-    else if (/dev holds/.test(r0)) bucket = 'dev holdings';
-    else if (/insiders|sniper/.test(r0)) bucket = 'insiders/snipers';
-    else if (/5m dump/.test(r0)) bucket = '5m dump';
-    else if (/token cooldown/.test(r0)) bucket = 'token cooldown';
-    bot.rejectTally[bucket] = (bot.rejectTally[bucket] || 0) + 1;
-  }
-  async function scanAndMaybeEnter() {
+  /** Pipeline: Scout → Filter → Analyst → Executor → Risk (each stage gets only the previous output). Logger records all. */
+  async function runPipeline() {
     bot.equityUsd = equityNow();
     pushEquity(bot.equityUsd);
-    await ensureFast();
-    const now = Date.now();
-    const items = solanaFastItems();
-    bot.scanned += items.length;
-    const scanned = S.scanCandidates(items, now, bot.settings);
-    (scanned.whySkip || []).forEach(w => noteReject(w.reasons));
-    bot.agents.scanner.status = 'hot';
-    bot.agents.scanner.n = bot.scanned;
-    bot.agents.scanner.detail = fmtCount(scanned.scanned) + ' pools';
-    const gate = S.canOpenMore(bot, bot.settings, now, { solPx: bot.solPx, reserveUsd: reserveUsd() });
-    if (!gate.ok) { bot.agents.analyst.detail = gate.reason; bot.agents.analyst.status = 'idle'; return; }
-    if (bot.cashUsd - reserveUsd() < 2) { bot.agents.analyst.detail = 'need more cash / reserve'; return; }
-    const slots = Math.max(1, (bot.settings.maxOpen || 10) - bot.positions.length);
-    const top = scanned.candidates.slice(0, Math.max(16, slots * 3));
-    bot.agents.analyst.status = 'hot';
-    if (!top.length) { bot.agents.analyst.detail = 'no safe candidates'; noteReject(['no safe candidates']); return; }
-    let bought = 0;
-    for (const it of top) {
-      const gateNow = S.canOpenMore(bot, bot.settings, Date.now(), { solPx: bot.solPx, reserveUsd: reserveUsd() });
-      if (!gateNow.ok) {
-        bot.agents.analyst.detail = bought ? ('opened ' + bought + ' · ' + gateNow.reason) : gateNow.reason;
-        break;
-      }
-      if (bot.cashUsd - reserveUsd() < 2) {
-        bot.agents.analyst.detail = bought ? ('opened ' + bought + ' · need more cash') : 'need more cash / reserve';
-        break;
-      }
-      if (bot.positions.some(p => p.mint === it.addr)) continue;
-      if (S.tokenOnCooldown(bot, it.addr, now)) { noteReject(['token cooldown']); continue; }
-      const hist = bot.scoreHist[it.addr] || (bot.scoreHist[it.addr] = []);
-      hist.push(it.sig.score);
-      if (hist.length > 8) hist.shift();
-      bot.agents.analyst.token = it;
-      bot.agents.analyst.score = it.sig.score;
-      bot.agents.analyst.detail = it.symbol + ' score ' + it.sig.score;
-      let rug = null, ticks = bot.ticks[it.addr] || [];
-      try { rug = await rugReport(it.addr); } catch (e) { bot.agents.analyst.detail = 'rugcheck failed'; noteReject(['rugcheck failed']); continue; }
-      if (ticks.length < 12 && it.pair.pairAddress) {
-        try { ticks = await gtTicks(it.pair.pairAddress); bot.ticks[it.addr] = ticks; } catch {}
-      }
-      const pre = S.analyzeSafety({
-        item: it, rug, priorScores: hist, ticks, now, skipQuotes: true, solPx: bot.solPx
-      }, bot.settings);
-      if (!pre.ok) {
-        noteReject(pre.reasons);
-        bot.agents.analyst.detail = (it.symbol + ' rejected: ' + pre.reasons[0]).slice(0, 52);
-        continue;
-      }
-      const solPx = await solPrice();
-      const usd = S.positionUsd(equityNow(), bot.settings, reserveUsd(), bot.solPx || solPx);
-      if (usd < 1) { bot.agents.analyst.detail = bought ? ('opened ' + bought + ' · size too small') : 'size too small'; break; }
-      const lamports = Math.floor((usd / solPx) * 1e9);
-      let quoteBuy, quoteSell;
-      try {
-        quoteBuy = await jupQuote(WSOL, it.addr, lamports, bot.settings.slippageBps);
-        const out = quoteBuy.ok ? quoteBuy.outAmount : Math.floor((usd / +it.pair.priceUsd) * 1e6);
-        quoteSell = await jupQuote(it.addr, WSOL, Math.max(1, out), bot.settings.slippageBps);
-      } catch (e) { bot.agents.analyst.detail = 'quote failed'; noteReject(['quote failed']); continue; }
-      const prev = bot.buyerHist[it.addr];
-      const h1b = ((it.pair.txns || {}).h1 || {}).buys;
-      const verdict = S.analyzeSafety({
-        item: it, rug, quoteBuy, quoteSell, priorScores: hist, ticks, now,
-        buyerTrend: prev ? { prevH1Buys: prev.h1 } : null,
-        solPx
-      }, bot.settings);
-      bot.buyerHist[it.addr] = { h1: h1b, t: now };
-      if (!verdict.ok) {
-        noteReject(verdict.reasons);
-        bot.agents.analyst.detail = (it.symbol + ' rejected: ' + verdict.reasons[0]).slice(0, 52);
-        continue;
-      }
-      const pos = await executeBuy(it, usd);
-      if (pos) bought++;
-    }
-    if (bought) bot.agents.analyst.detail = 'opened ' + bought + ' · ' + bot.positions.length + ' open';
+    bot.stats.cycles++;
+    const scoutOut = await agentScout();
+    const filterOut = await agentFilter(scoutOut);
+    const analystOut = await agentAnalyst(filterOut);
+    const execOut = await agentExecutor(analystOut);
+    bot._lastCycle = { t: Date.now(), scout: scoutOut.pairs.length, seen: scoutOut.seen, killed: filterOut.killed.length, survivors: filterOut.pairs.length, scored: analystOut.scored.length, passed: analystOut.pairs.length, tickets: execOut.tickets, fills: execOut.fills };
+    saveLog();
+    return bot._lastCycle;
   }
+  const scanAndMaybeEnter = runPipeline;
 
   async function tickLoop() {
-    if (!bot.running) return;
+    if (!bot.running || bot._tickBusy) return;
+    bot._tickBusy = true;
     try {
       await solPrice();
       if (bot.settings.mode === 'LIVE') await loadLiveBalances().catch(() => {});
@@ -747,6 +998,7 @@
       S.updateDayAndHalt(bot, eq, bot.settings, Date.now());
       if (route().name === 'bot') patchLiveUI();
     } catch (e) { console.warn('bot tick', e); }
+    finally { bot._tickBusy = false; }
   }
   async function scanLoop() {
     if (!bot.running || bot._scanBusy) return;
@@ -874,18 +1126,21 @@
     return '<rect x="'+x1+'" y="'+y+'" width="'+w+'" height="'+h+'" rx="'+r+'" fill="'+fill+'"/>' +
            '<rect x="'+x2+'" y="'+y+'" width="'+w+'" height="'+h+'" rx="'+r+'" fill="'+fill+'"/>';
   }
+  const AG_COLORS = { scout: '#12a8a2', filter: '#f2b40c', analyst: '#f83c3c', executor: '#8f6af0', risk: '#f86e0c', logger: '#3d8bff' };
   function agentIcon(name, status) {
-    const body = { scanner: '#12a8a2', analyst: '#f83c3c', executor: '#8f6af0', brain: '#f86e0c' }[name];
+    const body = AG_COLORS[name] || '#888';
     const ok = '#1ee36a';
-    const ring = name === 'scanner' ? '#5ac8f8' : (status === 'danger' ? '#f85840' : (status === 'idle' ? 'rgba(255,255,255,.22)' : ok));
+    const ring = name === 'scout' ? '#5ac8f8' : (status === 'danger' ? '#f85840' : (status === 'idle' ? 'rgba(255,255,255,.22)' : ok));
     const circ = (2 * Math.PI * 23).toFixed(2);
-    const pct = name === 'scanner' ? 0.50 : status === 'danger' ? 0.95 : status === 'idle' ? 0.38 : 0.86;
+    const pct = name === 'scout' ? 0.50 : status === 'danger' ? 0.95 : status === 'idle' ? 0.38 : 0.86;
     const dash = (pct * 2 * Math.PI * 23).toFixed(2) + ' ' + circ;
     const face = {
-      scanner: '<g><circle cx="26.00" cy="21.15" r="5.55" fill="'+body+'"/><circle cx="30.20" cy="23.57" r="5.55" fill="'+body+'"/><circle cx="30.20" cy="28.42" r="5.55" fill="'+body+'"/><circle cx="26.00" cy="30.85" r="5.55" fill="'+body+'"/><circle cx="21.80" cy="28.43" r="5.55" fill="'+body+'"/><circle cx="21.80" cy="23.57" r="5.55" fill="'+body+'"/><circle cx="26" cy="26" r="7.1" fill="'+body+'"/>'+slotEyes(26, 26.1, 3.15, 2.2, 6.2, '#05332f')+'</g>',
+      scout: '<g><circle cx="26.00" cy="21.15" r="5.55" fill="'+body+'"/><circle cx="30.20" cy="23.57" r="5.55" fill="'+body+'"/><circle cx="30.20" cy="28.42" r="5.55" fill="'+body+'"/><circle cx="26.00" cy="30.85" r="5.55" fill="'+body+'"/><circle cx="21.80" cy="28.43" r="5.55" fill="'+body+'"/><circle cx="21.80" cy="23.57" r="5.55" fill="'+body+'"/><circle cx="26" cy="26" r="7.1" fill="'+body+'"/>'+slotEyes(26, 26.1, 3.15, 2.2, 6.2, '#05332f')+'</g>',
+      filter: '<g><path d="M26 12.6L36.6 16.4Q37.8 16.9 37.8 18.2V25.2C37.8 31.4 33.1 35.9 26.6 38.3Q26 38.5 25.4 38.3C18.9 35.9 14.2 31.4 14.2 25.2V18.2Q14.2 16.9 15.4 16.4Z" fill="'+body+'"/>'+slotEyes(26, 25.6, 3.2, 2.3, 6.6, '#2a1c00')+'</g>',
       analyst: '<g><path d="M26 12.4 L37.4 33.4 Q38.5 35.7 36.2 35.7 H15.8 Q13.5 35.7 14.6 33.4 Z" fill="'+body+'" stroke="'+body+'" stroke-linejoin="round" stroke-width="3.2"/>'+slotEyes(26, 27.4, 3.2, 2.35, 6.6, '#1a0505')+'</g>',
       executor: '<g><path d="M14.6 25.2C13.2 18.8 17.2 15.2 21.2 16.2C22.1 12.4 26.8 12.2 28.8 15.6C32.2 13.6 37.4 16.2 36.8 21.6C39.6 23.6 39.2 29.6 35.4 31.1C34.4 35 28.2 36.6 24.2 34.1C20.2 36.6 14.6 34.6 14.1 30.2C11.8 28.6 12.2 26.2 14.6 25.2Z" fill="'+body+'"/>'+slotEyes(26.2, 24.8, 3.4, 2.2, 6.2, '#1a1030')+'</g>',
-      brain: '<g><path d="M27.6 13.4c.4-1.6 1.6-2.6 2.7-2.8" fill="none" stroke="#3c4a22" stroke-width="1.7" stroke-linecap="round"/><rect x="14.4" y="15.2" width="23.2" height="22.2" rx="8.4" fill="'+body+'"/>'+slotEyes(26, 26.2, 3.0, 3.05, 8.6, '#1a0c00')+'</g>'
+      risk: '<g><path d="M27.6 13.4c.4-1.6 1.6-2.6 2.7-2.8" fill="none" stroke="#3c4a22" stroke-width="1.7" stroke-linecap="round"/><rect x="14.4" y="15.2" width="23.2" height="22.2" rx="8.4" fill="'+body+'"/>'+slotEyes(26, 26.2, 3.0, 3.05, 8.6, '#1a0c00')+'</g>',
+      logger: '<g><path d="M18 14.2H34Q38.6 14.2 38.6 18.8V28.4Q38.6 33 34 33H25L19.4 37.6Q18.4 38.4 18.6 37.1L19.2 33H18Q13.4 33 13.4 28.4V18.8Q13.4 14.2 18 14.2Z" fill="'+body+'"/>'+slotEyes(26, 23.6, 3.2, 2.3, 6.4, '#06142e')+'</g>'
     }[name];
     return '<svg class="term-ring" viewBox="0 0 52 52" width="52" height="52" aria-hidden="true"><circle cx="26" cy="26" r="23" fill="none" stroke="rgba(255,255,255,.06)" stroke-width="4.4"/><circle cx="26" cy="26" r="23" fill="none" stroke="'+ring+'" stroke-width="4.4" stroke-linecap="round" stroke-dasharray="'+dash+'" transform="rotate(-90 26 26)"/>'+face+'</svg>';
   }
@@ -1082,41 +1337,90 @@
     return '<span class="term-flash '+(up ? 'up' : 'dn')+'">'+(n >= 0 ? '+' : '')+fmtUsd(n)+'</span>';
   }
 
+  const AG_ORDER = [
+    ['scout', 'Scout', 'dexscreener'],
+    ['filter', 'Filter', 'rugcheck'],
+    ['analyst', 'Analyst', 'on-chain score'],
+    ['executor', 'Executor', 'jupiter'],
+    ['risk', 'Risk', 'stop · trail'],
+    ['logger', 'Logger', 'kill log']
+  ];
   function agentsHTML() {
     const a = bot.agents;
     const featured = () => {
-      if (a.brain && a.brain.status === 'danger') return 'brain';
-      if (a.brain && a.brain.status === 'hot') return 'brain';
-      if (a.executor && a.executor.status === 'hot') return 'executor';
-      if (a.analyst && a.analyst.status === 'hot') return 'analyst';
+      if (a.risk && a.risk.status === 'danger') return 'risk';
+      if (a.executor && a.executor.status === 'hot' && a.executor.token) return 'executor';
+      if (a.risk && a.risk.status === 'hot') return 'risk';
+      if (a.analyst && a.analyst.status === 'hot' && a.analyst.n) return 'analyst';
       return '';
     };
+    const f = featured();
     const glow = (key, ag) => {
       if (ag.status === 'danger') return 'on-red';
-      if (key === featured() && ag.status !== 'idle') return 'on-green';
+      if (key === f && ag.status !== 'idle') return 'on-green';
       return '';
     };
-    const card = (key, title, src, bottom) => {
-      const ag = a[key];
-      return '<div class="agcard '+glow(key, ag)+'" data-ag="'+key+'">'+agentIcon(key, ag.status)+
-        '<div class="agbody"><div class="agtitle">'+title+'</div><div class="agsrc">'+ghIcon()+'<span>'+esc(src)+'</span></div><div class="agbot">'+bottom(ag)+'</div></div></div>';
+    const tokLine = (tok, txt, cls) => (tok ? tokAv(tok.icon, tok.symbol, 'tav xs') : '') + '<span class="agline">' + (tok ? '<span class="agtok">' + esc(tok.symbol) + '</span> ' : '') + '<span class="' + (cls || 'ok') + '">' + esc(txt) + '</span></span>';
+    const bottom = {
+      scout: ag => '<span class="agline"><span class="ok">' + esc(ag.detail) + '</span></span>',
+      filter: ag => {
+        const k = ag.n || 0;
+        return '<span class="agline">' + (ag.status === 'idle' ? '<span class="ok">' + esc(ag.detail) + '</span>' : '<span class="bad">' + k + ' killed</span> <span class="ok">· ' + esc(String(bot.stats.filterPassLast || 0)) + ' pass</span>') + '</span>';
+      },
+      analyst: ag => ag.token && ag.score != null ? tokLine(ag.token, String(ag.score) + (ag.score >= bot.settings.passScore ? ' ✓' : ''), ag.score >= bot.settings.passScore ? 'ok' : 'warn') : tokLine(null, ag.detail),
+      executor: ag => tokLine(ag.status === 'hot' ? ag.token : null, ag.status === 'hot' && ag.token ? String(ag.detail).replace(/^bought /, '') : ag.detail),
+      risk: ag => tokLine(null, ag.detail, ag.status === 'danger' ? 'bad' : 'ok'),
+      logger: ag => tokLine(null, ag.detail)
     };
-    return '<div class="term-agents">'+
-      card('scanner', 'Scanner', 'dexscreener', ag => tokAv(null, '#', 'tav xs')+'<span class="agline"><span class="ok">'+esc(ag.detail)+'</span></span>')+
-      card('analyst', 'Analyst', 'rugcheck', ag => {
-        const tok = ag.token;
-        const score = ag.score || (tok && tok.sig && tok.sig.score) || '';
-        return (tok ? tokAv(tok.icon, tok.symbol, 'tav xs') : '')+'<span class="agline">'+(tok ? '<span class="agtok">'+esc(tok.symbol)+'</span> ' : '')+'<span class="ok">'+(tok ? 'score '+score : esc(ag.detail))+'</span></span>';
-      })+
-      card('executor', 'Executor', 'jupiter', ag => {
-        const tok = ag.token;
-        return (tok ? tokAv(tok.icon, tok.symbol || tok.mint, 'tav xs') : '')+'<span class="agline"><span class="ok">'+esc(ag.detail)+'</span></span>';
-      })+
-      card('brain', 'Brain', 'strategy', ag => {
-        const tok = ag.token;
-        return (tok ? tokAv(tok.icon, tok.symbol, 'tav xs') : '')+'<span class="agline"><span class="ok">'+esc(ag.detail)+'</span></span>';
-      })+
-    '</div>';
+    return '<div class="term-agents six">' + AG_ORDER.map(([key, title, src]) => {
+      const ag = a[key] || { status: 'idle', detail: '' };
+      return '<button type="button" class="agcard ' + glow(key, ag) + '" data-ag="' + key + '">' + agentIcon(key, ag.status) +
+        '<div class="agbody"><div class="agtitle">' + title + '</div><div class="agsrc">' + ghIcon() + '<span>' + esc(src) + '</span></div><div class="agbot">' + bottom[key](ag) + '</div></div></button>';
+    }).join('') + '</div>';
+  }
+
+  const STAGE_LABEL = { scout: 'Scout', filter: 'Filter', analyst: 'Analyst', executor: 'Executor', risk: 'Risk', logger: 'Logger' };
+  const KILL_LABEL = {
+    liq_mcap: 'liq/mcap too low', lp_unlocked: 'LP not burned/locked', lp_unknown: 'LP status unknown', mint_auth: 'mint not revoked',
+    freeze_auth: 'freeze not revoked', dev_holds: 'dev holds >3%', dev_rugs: 'dev past rugs', bundled: 'bundled >10%',
+    pumped_1h: '+80% in 1h', liq_floor: 'liquidity floor', no_rugcheck: 'no RugCheck', rugged: 'rugged', rc_danger: 'RugCheck danger',
+    score_low: 'score < 70', score_nodata: 'not enough data', risk: 'risk blocked', fill_abort: 'fill aborted'
+  };
+  function logRowHTML(e) {
+    const st = e.stage || 'logger';
+    const verb = e.kind === 'kill' ? (st === 'analyst' ? 'rejected' : st === 'risk' ? 'blocked' : st === 'executor' ? 'aborted' : 'killed')
+      : e.kind === 'pass' ? 'passed' : e.kind === 'found' ? 'found' : e.kind === 'plan' ? 'armed stop'
+      : e.kind === 'trade' ? (e.side === 'buy' ? 'bought' : e.side === 'stop' ? 'stopped' : 'sold') : e.kind === 'skip' ? 'skipped' : 'noted';
+    const right = e.kind === 'trade' && e.side !== 'buy' && e.pnlUsd != null
+      ? '<div class="' + (e.pnlUsd >= 0 ? 'up' : 'dn') + '">' + (e.pnlUsd >= 0 ? '+' : '') + moneyTxt(e.pnlUsd) + '</div>'
+      : e.score != null ? '<div class="' + (e.score >= bot.settings.passScore ? 'up' : '') + '">' + e.score + '</div>'
+      : e.kind === 'trade' ? '<div>' + fmtUsd(e.usd) + '</div>' : '';
+    return '<div class="lgr lg-' + esc(st) + ' k-' + esc(e.kind) + '"><div class="act-av">' + tokAv(e.icon, e.symbol) + '<i class="lg-dot" style="background:' + (AG_COLORS[st] || '#888') + '"></i></div>' +
+      '<div class="act-m"><div class="act-t"><span class="lg-st">' + esc(STAGE_LABEL[st] || st) + '</span> ' + esc(verb) + ' ' + esc(e.symbol || '') + '</div>' +
+      '<div class="lg-why">' + esc(e.reason || '') + '</div></div>' +
+      '<div class="act-r">' + right + '<div class="act-s">' + esc(clockAt(e.t)) + (e.n > 1 ? ' · ×' + e.n : '') + '</div></div></div>';
+  }
+  function killSummaryHTML() {
+    const uniq = bot.stats.killUniq || {};
+    const rows = Object.keys(uniq).map(k => [k, Object.keys(uniq[k]).length]).sort((a, b) => b[1] - a[1]).slice(0, 8);
+    if (!rows.length) return '';
+    return '<div class="lg-sum">' + rows.map(([k, n]) => '<span class="lg-chip">' + esc(KILL_LABEL[k] || k) + ' <b>' + n + '</b></span>').join('') + '</div>';
+  }
+  function renderLog() {
+    const f = bot.logFilter || 'all';
+    const list = bot.log.filter(e => f === 'all' || e.stage === f || (f === 'logger' && e.kind === 'trade'));
+    const lc = bot._lastCycle;
+    app.innerHTML = '<div class="term term-page">' + termHeader('Agent log') +
+      '<div class="lg-chips" id="lgChips">' + [['all', 'All']].concat(AG_ORDER.map(x => [x[0], x[1]])).map(([k, t]) =>
+        '<button type="button" data-lf="' + k + '" class="' + (f === k ? 'on' : '') + '">' + (k !== 'all' ? '<i style="background:' + AG_COLORS[k] + '"></i>' : '') + esc(k === 'logger' ? 'Trades' : t) + '</button>').join('') + '</div>' +
+      (lc ? '<div class="lg-cycle">Last cycle ' + esc(clockAt(lc.t)) + ': scout ' + lc.scout + ' → filter pass ' + lc.survivors + ' → ≥' + bot.settings.passScore + ': ' + lc.passed + ' → fills ' + lc.fills + '</div>' : '') +
+      ((f === 'all' || f === 'filter') ? killSummaryHTML() : '') +
+      '<div class="term-act">' + (list.length ? list.slice(0, 150).map(logRowHTML).join('') : '<div class="term-empty"><b>No events yet</b><span>Start the paper bot. Every kill, score and trade lands here.</span></div>') + '</div>' +
+      '<div class="term-foot"><button type="button" class="term-link" id="backTerm">Back to terminal</button><button type="button" class="term-link" id="lgClear">Clear log</button></div>' +
+      '<div class="note term-note">Kept on this phone only (last ' + LOG_CAP + ' events). Repeated kills of the same coin for the same reason are merged (×n).</div></div>';
+    bindWalletChrome();
+    app.querySelectorAll('[data-lf]').forEach(b => b.onclick = () => { bot.logFilter = b.dataset.lf; renderLog(); });
+    const c = $('#lgClear'); if (c) c.onclick = () => { if (!confirm('Clear the agent log?')) return; bot.log = []; bot.stats.killUniq = {}; saveLog(); renderLog(); };
   }
 
   function activityHTML() {
@@ -1124,7 +1428,7 @@
     if (!rows.length) return '<div class="term-empty">'+
       '<svg class="term-empty-ico" viewBox="0 0 64 64" aria-hidden="true"><rect x="4" y="8" width="56" height="48" rx="14" fill="rgba(255,255,255,.04)" stroke="rgba(255,255,255,.08)"/><path d="M10 40c8-2 12-16 22-16s12 18 22 10" fill="none" stroke="#1ee36a" stroke-width="2.2" stroke-linecap="round"/><circle cx="54" cy="30" r="3.1" fill="#1ee36a"/></svg>'+
       '<b>Waiting for the first fill</b>'+
-      '<span>Safety checks come first. Fast Solana coins only, after every gate passes.</span></div>';
+      '<span>Scout → Filter → Analyst must all pass first. Every kill is in the Log.</span></div>';
     return rows.map(tr => {
       const badge = tr.kind === 'buy' ? 'b-buy' : tr.kind === 'stop' ? 'b-stop' : 'b-sell';
       const mark = tr.kind === 'buy'
@@ -1195,13 +1499,14 @@
       '<div class="term-pnl"><span class="'+(p.pnl >= 0 ? 'up' : 'dn')+'">'+(p.pnl >= 0 ? '▲' : '▼')+' '+fmtUsd(Math.abs(p.pnl))+' ('+Math.abs(p.pct).toFixed(2)+'%)</span><span class="term-mult">'+p.mult.toFixed(2)+'x</span></div>'+
       '</div>'+
       '<div class="term-tfs">'+['LIVE','1H','4H','1D','1W','ALL'].map(t => '<button type="button" data-tf="'+t+'" class="'+(bot.tf === t ? 'on' : '')+'">'+(t === 'LIVE' ? '• LIVE' : t)+'</button>').join('')+'</div>'+
-      '<div class="term-h3">Agents <span>'+(bot.running || bot._demoLive ? '4 running' : 'idle')+'</span></div>'+agentsHTML()+
+      '<div class="term-h3">Agents <span>'+(bot.running || bot._demoLive ? '6 running' : 'idle')+'</span></div>'+agentsHTML()+
       '<div class="term-h3">Activity <span>'+bot.trades.length+' trade'+(bot.trades.length === 1 ? '' : 's')+'</span></div>'+
       '<div class="term-act">'+activityHTML()+'</div>'+(bot._demoApplied ? '' : positionsHTML())+
       '<div class="term-foot"><button type="button" class="term-cta '+(bot.running ? 'stop' : '')+'" id="termToggle">'+(bot.running ? 'Pause bot' : (bot.settings.mode === 'LIVE' ? 'Start LIVE bot' : 'Start paper bot'))+'</button>'+
+      '<button type="button" class="term-link" id="termLog">Log</button>'+
       '<button type="button" class="term-link" id="termWallet">Wallet</button>'+
       '<button type="button" class="term-link" id="termSettings">Settings</button></div>'+
-      '<div class="note term-note">Fast Solana memecoins only, holds of about 60–90 minutes. The bot does not predict price and can lose the whole burner wallet. PAPER uses live quotes with fake money. LIVE signs real Jupiter swaps on Solana.</div></div>';
+      '<div class="note term-note">6 agents: Scout finds Solana pairs 30m–72h old ($300K–$20M MC) → Filter kills unsafe ones → Analyst scores 0–100 (70+ pass) → Executor sizes ≤8% → Risk sets −6% stop before entry, trails after +12% → Logger records every kill. It can still lose money. PAPER uses live quotes with fake money.</div></div>';
     bindTerm();
     const bal = document.getElementById('termBal');
     if (bal) fitBalance(bal, bal.textContent);
@@ -1217,6 +1522,8 @@
     const tog = $('#termToggle'); if (tog) tog.onclick = () => bot.running ? stopBot() : startBot();
     const w = $('#termWallet'); if (w) w.onclick = () => { bot.view = 'wallet'; renderBot(); };
     const s = $('#termSettings'); if (s) s.onclick = () => { bot.view = 'settings'; renderBot(); };
+    const lg = $('#termLog'); if (lg) lg.onclick = () => { bot.logFilter = 'all'; bot.view = 'log'; renderBot(); };
+    bindAgents();
     app.querySelectorAll('[data-sell]').forEach(b => b.onclick = async () => {
       const pos = bot.positions.find(p => p.id === b.dataset.sell);
       if (!pos) return;
@@ -1227,7 +1534,15 @@
     });
   }
 
+  function bindAgents() {
+    app.querySelectorAll('.term-agents [data-ag]').forEach(b => b.onclick = () => { bot.logFilter = b.dataset.ag; bot.view = 'log'; renderBot(); });
+  }
   function patchLiveUI() {
+    if (route().name === 'bot' && bot.view === 'log') {
+      const sig = bot.log.length + ':' + (bot.log[0] ? bot.log[0].t : 0);
+      if (sig !== bot._logSig && window.scrollY < 60) { bot._logSig = sig; renderLog(); }
+      return;
+    }
     if (route().name !== 'bot' || bot.view !== 'term') return;
     const p = pnlState();
     const el = $('#termBal');
@@ -1250,7 +1565,7 @@
     const pnl = document.querySelector('.term-pnl');
     if (pnl) pnl.innerHTML = '<span class="'+(p.pnl >= 0 ? 'up' : 'dn')+'">'+(p.pnl >= 0 ? '▲' : '▼')+' '+fmtUsd(Math.abs(p.pnl))+' ('+Math.abs(p.pct).toFixed(2)+'%)</span><span class="term-mult">'+p.mult.toFixed(2)+'x</span>';
     const ag = document.querySelector('.term-agents');
-    if (ag) ag.outerHTML = agentsHTML();
+    if (ag) { ag.outerHTML = agentsHTML(); bindAgents(); }
     const act = document.querySelector('.term-act');
     if (act) act.innerHTML = activityHTML();
     drawChart();
@@ -1364,35 +1679,52 @@
 
   function renderSettings() {
     const s = bot.settings;
+    const w = s.weights || S.DEFAULTS.weights;
     app.innerHTML = '<div class="term term-page">'+termHeader('Settings')+
       bannerHTML()+
       '<div class="card"><h3>Mode</h3><div class="seg" id="modeSeg">'+
       '<button type="button" data-mode="PAPER" class="'+(s.mode !== 'LIVE' ? 'on' : '')+'">PAPER</button>'+
       '<button type="button" data-mode="LIVE" class="'+(s.mode === 'LIVE' ? 'on' : '')+'">LIVE</button></div>'+
       '<div class="note">'+(s.mode === 'LIVE' ? 'LIVE uses real SOL in the burner wallet. Trades are signed on this phone and sent to Solana.' : 'PAPER simulates fills from live Jupiter quotes. No real money moves.')+'</div></div>'+
-      '<div class="card"><h3>Risk (quick flips, capital first)</h3>'+
-      setNum('posPct', 'Position size', (s.posPct * 100).toFixed(0), '% of equity, default 5, max 10')+
-      setNum('maxOpen', 'Max open positions', s.maxOpen, 'default 10, hard cap 10 (~50% if size is 5%)')+
-      setNum('tpPct', 'Take profit', (s.tpPct * 100).toFixed(0), '% · sell half')+
-      setNum('tpSellPct', 'Sell at TP', (s.tpSellPct * 100).toFixed(0), '% of the position')+
-      setNum('trailPct', 'Trailing stop', (s.trailPct * 100).toFixed(0), '% off peak after TP or +20%')+
-      setNum('slPct', 'Hard stop loss', (s.slPct * 100).toFixed(0), '% checked about every 1s')+
-      setNum('maxHoldMin', 'Max hold', s.maxHoldMin, 'minutes (60–120 for Fast flips)')+
-      setNum('dailyLossPct', 'Daily loss cap', (s.dailyLossPct * 100).toFixed(0), '% of the day-start balance → auto-stop entries')+
-      setNum('slippageBps', 'Slippage cap', s.slippageBps, 'basis points')+
-      setNum('minScore', 'Min momentum score', s.minScore, 'needs ' + (s.scoreScans || 2) + ' stable scans')+
-      setNum('minAgeMin', 'Min pair age', s.minAgeMin, 'minutes')+
+      '<div class="card"><h3>1 · Scout</h3>'+
+      setNum('scoutMinAgeMin', 'Min pair age', s.scoutMinAgeMin, 'minutes (default 30)')+
+      setNum('scoutMaxAgeH', 'Max pair age', s.scoutMaxAgeH, 'hours (default 72)')+
+      setNum('scoutMinMc', 'Min market cap', Math.round(s.scoutMinMc / 1000), '$K (default 300)')+
+      setNum('scoutMaxMc', 'Max market cap', +(s.scoutMaxMc / 1e6).toFixed(2), '$M (default 20)')+'</div>'+
+      '<div class="card"><h3>2 · Filter (kills)</h3>'+
+      setNum('minLiqMcPct', 'Min liquidity / market cap', s.minLiqMcPct, '% (default 25 — very strict for memes, most coins sit at 5–20%)')+
+      setNum('minLpLockedPct', 'Min LP burned/locked', s.minLpLockedPct, '% of LP (default 90)')+
+      setNum('maxDevPct', 'Max dev holdings', s.maxDevPct, '% of supply (default 3)')+
+      setNum('maxDeadLaunches', 'Kill if dev has dead launches ≥', s.maxDeadLaunches, 'earlier tokens now under $5K MC (default 2, 0 = off) · RugCheck rug flags always kill')+
+      setNum('maxBundlePct', 'Max bundled / insider cluster', s.maxBundlePct, '% of supply (default 10)')+
+      setNum('max1hChg', 'Max 1h pump', s.max1hChg, '% (default 80)')+'</div>'+
+      '<div class="card"><h3>3 · Analyst</h3>'+
+      setNum('passScore', 'Pass score', s.passScore, '0–100 (default 70)')+
+      '<div class="set-hint">Weights: momentum '+w.momentum+' · unique buyers '+w.buyers+' · buy/sell '+w.buySell+' · holder growth '+w.holders+' · liq/mcap '+w.liqMc+' · smart wallets '+w.smart+'. Components without data are left out and the rest re-weighted.</div>'+
+      '<label class="set-lab">Smart wallets (one per line, max 10)</label><textarea class="set-in" id="smartWallets" rows="3" placeholder="Solana wallet addresses you trust">'+esc((s.smartWallets || []).join('\n'))+'</textarea>'+
+      '<div class="set-hint">Checked on-chain via RPC. Empty = this component is not scored.</div></div>'+
+      '<div class="card"><h3>4 · Executor</h3>'+
+      setNum('posPct', 'Position size', +(s.posPct * 100).toFixed(1), '% of equity, max 8')+
+      setNum('maxOpen', 'Max open positions', s.maxOpen, 'default 8, max 10')+
+      setNum('slippageBps', 'Slippage cap', s.slippageBps, 'basis points')+'</div>'+
+      '<div class="card"><h3>5 · Risk</h3>'+
+      setNum('slPct', 'Hard stop', +(s.slPct * 100).toFixed(1), '% below entry, set before the buy (default 6)')+
+      setNum('trailArmPct', 'Trailing starts after', +(s.trailArmPct * 100).toFixed(1), '% gain (default 12)')+
+      setNum('trailPct', 'Trailing distance', +(s.trailPct * 100).toFixed(1), '% off the peak (default 6)')+
+      setNum('maxHoldMin', 'Max hold', s.maxHoldMin, 'minutes')+
+      setNum('dailyLossPct', 'Daily loss cap', +(s.dailyLossPct * 100).toFixed(1), '% of the day-start balance → stop new entries')+
       setNum('minSolReserve', 'Fee reserve', s.minSolReserve, 'SOL kept for fees')+
       '<label class="set-lab">Custom RPC URL</label><input class="set-in" id="rpcUrl" value="'+esc(s.rpcUrl || '')+'" placeholder="https://solana-rpc.publicnode.com">'+
       '<div class="note">Public RPC is fine for paper. For LIVE sends, a free Helius (or similar) RPC is more reliable.</div></div>'+
       '<div class="card"><button class="term-cta" id="saveSet">Save settings</button>'+
+      '<button class="term-cta" id="resetSet" style="margin-top:8px;background:#2c2c2e;color:#fff">Reset to defaults</button>'+
       '<button class="term-cta danger" id="kill">KILL SWITCH — sell all & stop</button></div>'+
       '<div class="term-foot"><button class="term-link" id="backTerm">Back to terminal</button></div></div>';
     bindWalletChrome();
     bindBanner();
     app.querySelectorAll('#modeSeg [data-mode]').forEach(b => b.onclick = () => {
       if (b.dataset.mode === 'LIVE') {
-        if (!confirm('LIVE mode spends real SOL from the burner wallet on Fast Solana memecoins. You can lose everything you deposit. The bot only runs while the app is open. Continue?')) return;
+        if (!confirm('LIVE mode spends real SOL from the burner wallet on Solana memecoins. You can lose everything you deposit. The bot only runs while the app is open. Continue?')) return;
         if (!confirm('Tap OK again to confirm LIVE trading with real money.')) return;
       }
       bot.settings.mode = b.dataset.mode;
@@ -1400,18 +1732,27 @@
     });
     $('#saveSet').onclick = () => {
       const val = id => parseFloat(document.getElementById(id).value);
-      const pct = (id, max) => { const v = val(id); if (isFinite(v)) bot.settings[id] = Math.min(max != null ? max : 99, v / 100); };
-      pct('posPct', 0.10);
-      bot.settings.maxOpen = Math.max(1, Math.min(10, Math.round(val('maxOpen') || 10)));
-      pct('tpPct'); pct('tpSellPct', 1); pct('trailPct'); pct('slPct'); pct('dailyLossPct');
-      if (isFinite(val('maxHoldMin'))) bot.settings.maxHoldMin = Math.max(30, Math.min(180, val('maxHoldMin')));
-      if (isFinite(val('slippageBps'))) bot.settings.slippageBps = val('slippageBps');
-      if (isFinite(val('minScore'))) bot.settings.minScore = val('minScore');
-      if (isFinite(val('minAgeMin'))) bot.settings.minAgeMin = val('minAgeMin');
-      if (isFinite(val('minSolReserve'))) bot.settings.minSolReserve = val('minSolReserve');
+      const set = (id, lo, hi, mul) => { const v = val(id); if (isFinite(v)) bot.settings[id] = Math.max(lo, Math.min(hi, v * (mul || 1))); };
+      set('scoutMinAgeMin', 0, 1440); set('scoutMaxAgeH', 1, 720);
+      set('scoutMinMc', 0, 1e9, 1000); set('scoutMaxMc', 0.05e6, 1e10, 1e6);
+      set('minLiqMcPct', 0, 100); set('minLpLockedPct', 0, 100); set('maxDevPct', 0, 100);
+      set('maxDeadLaunches', 0, 100); set('maxBundlePct', 0, 100); set('max1hChg', 5, 10000);
+      set('passScore', 0, 100);
+      set('posPct', 0.01, 0.08, 0.01); set('maxOpen', 1, 10); bot.settings.maxOpen = Math.round(bot.settings.maxOpen);
+      set('slippageBps', 10, 2000);
+      set('slPct', 0.01, 0.5, 0.01); set('trailArmPct', 0.01, 5, 0.01); set('trailPct', 0.01, 0.5, 0.01);
+      set('maxHoldMin', 5, 1440); set('dailyLossPct', 0.01, 1, 0.01); set('minSolReserve', 0, 1);
+      bot.settings.smartWallets = String($('#smartWallets').value || '').split(/[\s,]+/).map(x => x.trim()).filter(validWallet).slice(0, 10);
       bot.settings.rpcUrl = ($('#rpcUrl').value || '').trim() || S.DEFAULTS.rpcUrl;
-      bot.settings.posPct = Math.min(0.10, Math.max(0.02, bot.settings.posPct));
+      bot.settings.pipelineV = S.DEFAULTS.pipelineV;
+      bot._scoutCache = null;
       save(); toast('Settings saved');
+    };
+    $('#resetSet').onclick = () => {
+      if (!confirm('Reset all strategy settings to the defaults?')) return;
+      const keep = { mode: bot.settings.mode, rpcUrl: bot.settings.rpcUrl, minSolReserve: bot.settings.minSolReserve };
+      bot.settings = Object.assign(S.cloneDefaults(), keep);
+      save(); renderSettings(); toast('Defaults restored');
     };
     $('#kill').onclick = () => { if (!confirm('Sell every open position now and stop the bot?')) return; killSwitch(); };
   }
@@ -1480,20 +1821,29 @@
     }];
     bot.trades = [
       { id: 'd1', t: ago(6.2), kind: 'buy', symbol: 'PUSSY', icon: icoP, usd: 176.40, agent: 'Executor', note: 'entry', mc: 375000, clock: '10:36 PM' },
-      { id: 'd2', t: ago(7.4), kind: 'stop', symbol: 'Alice', icon: icoA, usd: 37.07, pnlUsd: -2.37, pnlPct: -0.06, agent: 'Brain', note: 'stop −6%', mc: 261000, clock: '10:35 PM' },
+      { id: 'd2', t: ago(7.4), kind: 'stop', symbol: 'Alice', icon: icoA, usd: 37.07, pnlUsd: -2.37, pnlPct: -0.06, agent: 'Risk', note: 'stop −6%', mc: 261000, clock: '10:35 PM' },
       { id: 'd3', t: ago(9.0), kind: 'buy', symbol: 'Alice', icon: icoA, usd: 39.44, agent: 'Executor', note: 'entry', mc: 261000, clock: '10:33 PM' },
-      { id: 'd4', t: ago(15.2), kind: 'sell', symbol: 'Alice', icon: icoA, usd: 278.85, pnlUsd: 162.66, pnlPct: 1.40, mult: 2.40, agent: 'Brain', note: 'took profit', mc: 310000, frac: 1, clock: '10:32 PM' },
+      { id: 'd4', t: ago(15.2), kind: 'sell', symbol: 'Alice', icon: icoA, usd: 278.85, pnlUsd: 162.66, pnlPct: 1.40, mult: 2.40, agent: 'Risk', note: 'trailing stop', mc: 310000, frac: 1, clock: '10:32 PM' },
       { id: 'd5', t: ago(17.8), kind: 'buy', symbol: 'Alice', icon: icoA, usd: 116.19, agent: 'Executor', note: 'entry', mc: 190000, clock: '10:29 PM' },
-      { id: 'd6', t: ago(19.4), kind: 'sell', symbol: 'PEBBLE', icon: icoB, usd: 48.1, pnlUsd: 22.10, pnlPct: 0.85, mult: 1.85, agent: 'Brain', note: 'took profit', mc: 140000, frac: 1, clock: '10:27 PM' }
+      { id: 'd6', t: ago(19.4), kind: 'sell', symbol: 'PEBBLE', icon: icoB, usd: 48.1, pnlUsd: 22.10, pnlPct: 0.85, mult: 1.85, agent: 'Risk', note: 'trailing stop', mc: 140000, frac: 1, clock: '10:27 PM' }
     ];
     bot.lastFlash = null;
     bot.agents = {
-      scanner: { status: 'hot', detail: '2,030 pools', n: 2030 },
-      analyst: { status: 'hot', detail: 'PUSSY score 92', token: { symbol: 'PUSSY', icon: icoP }, score: 92 },
+      scout: { status: 'hot', detail: '14 pairs in range', n: 14 },
+      filter: { status: 'hot', detail: '11 killed · 3 pass', n: 11 },
+      analyst: { status: 'hot', detail: '1 ≥70 · top 92', token: { symbol: 'PUSSY', icon: icoP }, score: 92, n: 1 },
       executor: { status: 'hot', detail: 'bought $176', token: { symbol: 'PUSSY', icon: icoP } },
-      brain: { status: 'hot', detail: 'sold 3.5x', token: { symbol: 'PUSSY', icon: icoP } }
+      risk: { status: 'hot', detail: '1 open · 1 trail', token: { symbol: 'PUSSY', icon: icoP } },
+      logger: { status: 'hot', detail: '1,284 events', n: 1284 }
     };
-    bot.tf = 'LIVE';
+    bot.stats = Object.assign(freshStats(), { filterPassLast: 3, killLast: 11, scoutLast: 14 });
+    bot.log = [
+      { t: ago(0.3), stage: 'risk', kind: 'plan', symbol: 'PUSSY', icon: icoP, reason: 'stop −6% registered · trail 6% after +12%' },
+      { t: ago(0.4), stage: 'analyst', kind: 'pass', symbol: 'PUSSY', icon: icoP, score: 92, reason: 'score 92 ≥ 70 · mom 88 · buyers 95 · b/s 90 · holders 84 · liq/mc 100 · smart –' },
+      { t: ago(0.6), stage: 'filter', kind: 'kill', code: 'liq_mcap', symbol: 'Max', icon: icoB, reason: 'liq/mcap 5.1% < 25%', n: 6 },
+      { t: ago(0.8), stage: 'filter', kind: 'kill', code: 'dev_holds', symbol: 'Alice', icon: icoA, reason: 'dev holds 4.2% (> 3%)', n: 2 },
+      { t: ago(1.2), stage: 'scout', kind: 'found', symbol: 'PUSSY', icon: icoP, reason: 'age 3.2h · MC $375K · liq $118K' }
+    ];    bot.tf = 'LIVE';
     bot.settings.mode = 'PAPER';
     bot.running = false;
     bot._demoLive = true;
@@ -1516,6 +1866,7 @@
     if (!bot.equity.length) pushEquity(equityNow());
     if (bot.view === 'wallet') return renderWallet();
     if (bot.view === 'settings') return renderSettings();
+    if (bot.view === 'log') return renderLog();
     renderTerm();
   }
   function leaveBot() { document.body.classList.remove('term-on'); }

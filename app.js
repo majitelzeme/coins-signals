@@ -71,10 +71,25 @@ function dsChartUrl(chain, pairAddress, url) {
 function timeAgo(ts) { const s = Math.round((Date.now() - ts) / 1000); if (s < 10) return 'just now'; if (s < 60) return s + 's ago'; if (s < 3600) return Math.round(s / 60) + ' min ago'; if (s < 172800) return Math.round(s / 3600) + ' h ago'; return Math.round(s / 86400) + ' d ago'; }
 function toast(msg, ms = 3200) { const t = $('#toast'); t.textContent = msg; t.hidden = false; clearTimeout(toast._t); toast._t = setTimeout(() => t.hidden = true, ms); }
 class HttpError extends Error { constructor(status, url) { super('HTTP ' + status); this.status = status; this.url = url; } }
-async function getJSON(url, timeout = 12000) {
+const fetchBackoff = {};
+async function getJSON(url, timeout = 12000, opts) {
+  const critical = !!(opts && opts.critical);
+  const host = (() => { try { return new URL(url, location.href).host; } catch { return ''; } })();
+  if (host && fetchBackoff[host] && Date.now() < fetchBackoff[host] && !critical) throw new HttpError(429, url);
   const ctl = new AbortController(); const id = setTimeout(() => ctl.abort(), timeout);
-  try { const r = await fetch(url, { signal: ctl.signal }); if (!r.ok) throw new HttpError(r.status, url); return await r.json(); }
-  finally { clearTimeout(id); }
+  try {
+    const r = await fetch(url, { signal: ctl.signal });
+    if (r.status === 429) {
+      const ra = parseInt(r.headers.get('retry-after'), 10);
+      const fallback = critical ? 2500 : 12000;
+      const ms = Math.min(critical ? 4000 : 60000, Math.max(critical ? 1500 : 8000, (isFinite(ra) && ra > 0 && ra < 1000 ? ra * 1000 : (ra || 0)) || fallback));
+      if (host) fetchBackoff[host] = Date.now() + ms;
+      throw new HttpError(429, url);
+    }
+    if (!r.ok) throw new HttpError(r.status, url);
+    if (host && fetchBackoff[host]) delete fetchBackoff[host];
+    return await r.json();
+  } finally { clearTimeout(id); }
 }
 async function pool(items, n, fn) { const out = new Array(items.length); let i = 0; await Promise.all(Array.from({ length: n }, async () => { while (i < items.length) { const k = i++; try { out[k] = await fn(items[k]); } catch { out[k] = null; } } })); return out; }
 async function binance(path) { let err; for (const b of BINANCE) { try { return await getJSON(b + path); } catch (e) { err = e; } } throw err; }
@@ -686,7 +701,7 @@ function route() {
   const h = location.hash || '#/';
   if (h.startsWith('#/coin/')) return { name: 'coin', id: decodeURIComponent(h.slice(7)) };
   if (h.startsWith('#/t/')) { const [c, a] = h.slice(4).split('/'); return { name: 'token', chain: decodeURIComponent(c || ''), addr: decodeURIComponent(a || '') }; }
-  const n = h.slice(2); return { name: TITLES[n] ? n : 'fast' };
+  const n = h.slice(2).split('?')[0].replace(/\/$/, ''); return { name: TITLES[n] ? n : 'fast' };
 }
 let lastRoute = '';
 function render() {

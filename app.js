@@ -528,10 +528,10 @@ async function renderToken(chain, addr) {
         <div class="card"><small>Momentum</small><div style="margin-top:6px">${badge(s)}</div><div class="note" style="margin-top:6px">Score ${s.score}/100</div></div>
         <div class="card"><small>Risk</small><div style="margin-top:6px">${riskBadge(r)}</div><div class="note" style="margin-top:6px">${r.pts} risk points</div></div>
       </div>
-      <div class="card chartcard"><h3>Market cap ${tfSegHTML('15m')}</h3>
+      <div class="card chartcard"><h3><span class="chart-h">Market cap <span class="livepill" id="livepill" hidden><i></i><b>LIVE</b></span><span class="livemc" id="livemc">${pairMc(p) ? fmtBig(pairMc(p)) : ''}</span></span>${tfSegHTML('1m')}</h3>
         <div class="ohlc" id="ohlc" hidden></div>
         <div class="chartbox" id="mcchart"><div class="chart-empty mut">Loading chart…</div></div>
-        <div class="chartcap">BUY/SELL marks are automated indicator signals from past candles, not predictions. Charts by <a href="https://www.tradingview.com/" target="_blank" rel="noopener">TradingView</a>.</div>
+        <div class="chartcap">BUY/SELL marks are automated indicator signals from past candles, not predictions. Last candle is live from DexScreener. Charts by <a href="https://www.tradingview.com/" target="_blank" rel="noopener">TradingView</a>.</div>
         <div class="note"><a href="${esc(dsChartUrl(chain, p.pairAddress, p.url))}" target="_blank" rel="noopener">Open DexScreener chart</a> · pair ${esc(shortAddr(p.pairAddress))}</div></div>
       <div class="card"><h3>Stats</h3><div class="ind">
         <div class="lv"><small>Liquidity</small><b>${fmtBig(p.liquidity && p.liquidity.usd)}</b></div>
@@ -550,9 +550,9 @@ async function renderToken(chain, addr) {
         <div class="lv t"><small>Take rest</small>${levelMcHTML(plan.tp2, mcFactor(pairMc(p), +p.priceUsd))}<br><small>+${(plan.sp * 300).toFixed(0)}%</small></div></div>
         <div class="note">Hold: minutes to hours. Example levels from the risk level (wider stop for riskier coins), not a prediction — fresh memecoins can drop 90% in seconds and stops may not fill. Values shown as market cap, with token price underneath.</div></div>` : ''}
       ${DISCLAIMER}
-      <div class="note">Data: DexScreener · pair ${esc(shortAddr(p.pairAddress))} · <a href="${esc(p.url)}" target="_blank" rel="noopener">open full chart</a></div>`;
+      <div class="note">Data: DexScreener live price · GeckoTerminal history · pair ${esc(shortAddr(p.pairAddress))} · <a href="${esc(p.url)}" target="_blank" rel="noopener">open full chart</a></div>`;
     $('#favBtn').onclick = e => { const on = toggleDexFav({ key: k, chain, addr, symbol: p.baseToken.symbol, name: p.baseToken.name, icon: (p.info && p.info.imageUrl) || '' }); e.currentTarget.classList.toggle('on', on); toast(on ? 'Added to watchlist' : 'Removed from watchlist', 1500); };
-    bindMcChart({ kind: 'token', key: k, chain, addr, pairAddress: p.pairAddress, dsUrl: dsChartUrl(chain, p.pairAddress, p.url), price: +p.priceUsd, mcap: pairMc(p), plan, defaultTf: '15m' });
+    bindMcChart({ kind: 'token', key: k, chain, addr, pairAddress: p.pairAddress, dsUrl: dsChartUrl(chain, p.pairAddress, p.url), price: +p.priceUsd, mcap: pairMc(p), plan, defaultTf: '1m' });
   };
   if (p) draw(); else app.innerHTML = skeleton(3);
   try { const m = await pairsFor([{ chain, addr }], p ? PAIR_TTL : 0); const np = m.get(k); if (np && location.hash === `#/t/${encodeURIComponent(chain)}/${encodeURIComponent(addr)}`) { const changed = !p || np !== p; p = np; if (changed) draw(); } else if (!p) draw(); }
@@ -819,6 +819,7 @@ function signalCard(s, tf, fac) {
 
 // ---------- market-cap candlestick chart (Axiom-style) ----------
 const CHART_TF = [
+  { id: '1s',  gt: ['minute', 1],  bn: '1s',  cgDays: 1,  limit: 250 },
   { id: '1m',  gt: ['minute', 1],  bn: '1m',  cgDays: 1,  limit: 250 },
   { id: '5m',  gt: ['minute', 5],  bn: '5m',  cgDays: 1,  limit: 250 },
   { id: '15m', gt: ['minute', 15], bn: '15m', cgDays: 1,  limit: 250 },
@@ -826,8 +827,9 @@ const CHART_TF = [
   { id: '4h',  gt: ['hour', 4],    bn: '4h',  cgDays: 30, limit: 220 },
   { id: '1D',  gt: ['day', 1],     bn: '1d',  cgDays: 90, limit: 200 }
 ];
-const TF_SEC = { '1m': 60, '5m': 300, '15m': 900, '1h': 3600, '4h': 14400, '1D': 86400 };
-const TF_BPD = { '1m': 1440, '5m': 288, '15m': 96, '1h': 24, '4h': 6, '1D': 1 };
+const TF_SEC = { '1s': 1, '1m': 60, '5m': 300, '15m': 900, '1h': 3600, '4h': 14400, '1D': 86400 };
+const TF_BPD = { '1s': 86400, '1m': 1440, '5m': 288, '15m': 96, '1h': 24, '4h': 6, '1D': 1 };
+const tradesCache = new Map();
 const GT_POOL_NET = { ethereum: 'eth', bsc: 'bsc', base: 'base', solana: 'solana', arbitrum: 'arbitrum', polygon: 'polygon_pos', avalanche: 'avax', ton: 'ton', sui: 'sui', tron: 'tron' };
 const ohlcvCache = new Map();
 const bnMissing = new Set();
@@ -836,8 +838,15 @@ let chartState = {};
 function tfSegHTML(active) {
   return `<div class="seg" id="chtf">${CHART_TF.map(t => `<button type="button" data-ctf="${t.id}" class="${t.id === active ? 'on' : ''}">${t.id}</button>`).join('')}</div>`;
 }
+function stopLiveFeed(st) {
+  if (!st) return;
+  st.liveGen = (st.liveGen || 0) + 1;
+  if (st.liveTimer) { clearTimeout(st.liveTimer); st.liveTimer = null; }
+  if (st.timer) { clearInterval(st.timer); st.timer = null; }
+  if (st.onVis) { try { document.removeEventListener('visibilitychange', st.onVis); } catch {} st.onVis = null; }
+}
 function destroyMcChart() {
-  if (chartState.timer) { clearInterval(chartState.timer); }
+  stopLiveFeed(chartState);
   if (chartState.ro) { try { chartState.ro.disconnect(); } catch {} }
   if (chartState.badges && chartState.series) { try { chartState.series.detachPrimitive(chartState.badges); } catch {} }
   if (chartState.markers && chartState.markers.detach) { try { chartState.markers.detach(); } catch {} }
@@ -919,6 +928,223 @@ async function fetchOhlcv(st, tf) {
   if (hit) return hit.list;
   if (err) throw err;
   return list;
+}
+function tradeUsdPrice(attr, baseAddr) {
+  const b = String(baseAddr || '').toLowerCase();
+  const from = String(attr.from_token_address || '').toLowerCase();
+  const to = String(attr.to_token_address || '').toLowerCase();
+  if (b && from === b && attr.price_from_in_usd != null) return +attr.price_from_in_usd;
+  if (b && to === b && attr.price_to_in_usd != null) return +attr.price_to_in_usd;
+  if (attr.kind === 'buy' && attr.price_to_in_usd != null) return +attr.price_to_in_usd;
+  if (attr.price_from_in_usd != null) return +attr.price_from_in_usd;
+  return NaN;
+}
+async function fetchGtTrades(chain, pairAddr) {
+  const key = (chain || '') + ':' + (pairAddr || '');
+  const hit = tradesCache.get(key);
+  if (hit && Date.now() - hit.ts < 40e3) return hit.list;
+  const net = GT_POOL_NET[chain] || chain;
+  const d = await getJSON(`${GT}/networks/${encodeURIComponent(net)}/pools/${encodeURIComponent(pairAddr)}/trades?trade_volume_in_usd_greater_than=0`, 12000);
+  const list = (d && d.data) || [];
+  tradesCache.set(key, { ts: Date.now(), list });
+  return list;
+}
+function ticksFromTrades(list, baseAddr) {
+  const out = [];
+  for (const tr of list || []) {
+    const a = tr.attributes || tr;
+    const px = tradeUsdPrice(a, baseAddr);
+    const ms = Date.parse(a.block_timestamp);
+    if (!isFinite(px) || px <= 0 || !isFinite(ms)) continue;
+    out.push({ t: ms / 1000, px, vol: +a.volume_in_usd || 0 });
+  }
+  out.sort((a, b) => a.t - b.t);
+  return out;
+}
+async function fetchDsPair(chain, pairAddr) {
+  const d = await getJSON(`${DS}/latest/dex/pairs/${encodeURIComponent(chain)}/${encodeURIComponent(pairAddr)}`, 8000);
+  return (d && (d.pair || (d.pairs && d.pairs[0]))) || null;
+}
+function pruneTicks(ticks, keepSec) {
+  const cut = Date.now() / 1000 - (keepSec || 1800);
+  let i = 0;
+  while (i < ticks.length && ticks[i].t < cut) i++;
+  if (i) ticks.splice(0, i);
+  if (ticks.length > 8000) ticks.splice(0, ticks.length - 8000);
+}
+function mergeUsdRows(ohlcvList, ticks, sec) {
+  const by = new Map();
+  let firstTick = Infinity;
+  for (const tk of ticks || []) if (tk && isFinite(tk.t)) firstTick = Math.min(firstTick, tk.t);
+  const liveStart = isFinite(firstTick) ? Math.floor(firstTick / sec) * sec : Math.floor(Date.now() / 1000 / sec) * sec;
+  for (const row of ohlcvList || []) {
+    const t = +row[0];
+    if (!isFinite(t) || t >= liveStart) continue;
+    const o = +row[1], h = +row[2], l = +row[3], c = +row[4], v = +row[5] || 0;
+    if (!isFinite(o) || !isFinite(c)) continue;
+    by.set(t, [t, o, h, l, c, v]);
+  }
+  for (const tk of ticks || []) {
+    if (!tk || !isFinite(tk.px) || tk.px <= 0) continue;
+    const t = Math.floor(tk.t / sec) * sec;
+    let b = by.get(t);
+    if (!b) by.set(t, [t, tk.px, tk.px, tk.px, tk.px, tk.vol || 0]);
+    else {
+      b[2] = Math.max(b[2], tk.px);
+      b[3] = Math.min(b[3], tk.px);
+      b[4] = tk.px;
+      b[5] += tk.vol || 0;
+    }
+  }
+  return [...by.values()].sort((a, b) => a[0] - b[0]);
+}
+function setLivePill(on, mc) {
+  const pill = $('#livepill');
+  if (pill) {
+    pill.hidden = false;
+    pill.classList.toggle('off', !on);
+    const b = pill.querySelector('b');
+    if (b) b.textContent = on ? 'LIVE' : 'STALE';
+  }
+  const livemc = $('#livemc');
+  if (livemc && mc) livemc.textContent = fmtBig(mc);
+}
+function updateHeaderMc(st) {
+  const big = $('#bigpx'); if (big) big.textContent = fmtPrimaryMc(st.mcap, st.price);
+  const sub = $('#pxsub'); if (sub) sub.textContent = fmtPrice(st.price);
+  const livemc = $('#livemc'); if (livemc && st.mcap) livemc.textContent = fmtBig(st.mcap);
+}
+function packUsdToMc(usdRows, fac) {
+  return barsFromOhlcvList(usdRows, fac || 1);
+}
+function applyPacked(st, packed, fit) {
+  st.bars = packed.candles;
+  if (!st.series) return;
+  st.series.setData(packed.candles.map(({ time, open, high, low, close }) => ({ time, open, high, low, close })));
+  if (st.vol) st.vol.setData(packed.volume);
+  const marks = signalMarkers(packed.candles, st.kind === 'coin' ? 'coin' : 'token', st.tf);
+  st.markCount = marks.length;
+  applyChartBadges(st.series, marks, st.plan, st.fac);
+  if (fit && st.chart) st.chart.timeScale().fitContent();
+  paintOhlc();
+}
+function rebuildTokenChart(st, fit) {
+  const sec = TF_SEC[st.tf] || 60;
+  const hist = st.tf === '1s' ? [] : (st.ohlcvList || []);
+  st.usdRows = mergeUsdRows(hist, st.ticks || [], sec);
+  applyPacked(st, packUsdToMc(st.usdRows, st.fac || 1), fit);
+}
+function applyLiveTick(st, px, mcap, volDelta) {
+  if (!px || !isFinite(px) || px <= 0) return;
+  const now = Date.now() / 1000;
+  st.ticks = st.ticks || [];
+  st.ticks.push({ t: now, px, vol: volDelta || 0 });
+  pruneTicks(st.ticks, st.tf === '1s' ? 1800 : 6 * 3600);
+  const fac = mcFactor(mcap, px);
+  const facChanged = !!(fac && st.fac && Math.abs(fac - st.fac) / st.fac > 0.005);
+  if (fac) st.fac = fac;
+  st.price = px;
+  if (mcap != null) st.mcap = mcap;
+  updateHeaderMc(st);
+  setLivePill(true, st.mcap);
+  st.liveAt = Date.now();
+  st.liveOk = true;
+  if (!st.series) {
+    const host = $('#mcchart');
+    if (host) {
+      const inst = createMcChart(host);
+      if (inst) {
+        st.chart = inst.chart; st.series = inst.series; st.vol = inst.vol;
+        inst.chart.subscribeCrosshairMove(param => {
+          if (!chartState.bars) return;
+          if (!param || param.time == null) { paintOhlc(); return; }
+          const i = chartState.bars.findIndex(b => b.time === param.time);
+          if (i >= 0) paintOhlc(i);
+        });
+        rebuildTokenChart(st, true);
+      }
+    }
+    return;
+  }
+  if (facChanged || !st.usdRows || !st.usdRows.length) { rebuildTokenChart(st, false); return; }
+  const sec = TF_SEC[st.tf] || 60;
+  const t = Math.floor(now / sec) * sec;
+  const val = st.fac ? px * st.fac : (st.mcap || px);
+  const last = st.usdRows[st.usdRows.length - 1];
+  if (!last || t > last[0]) st.usdRows.push([t, px, px, px, px, volDelta || 0]);
+  else if (t === last[0]) { last[2] = Math.max(last[2], px); last[3] = Math.min(last[3], px); last[4] = px; last[5] += volDelta || 0; }
+  else { rebuildTokenChart(st, false); return; }
+  let bar = st.bars[st.bars.length - 1];
+  if (!bar || t > bar.time) {
+    bar = { time: t, open: val, high: val, low: val, close: val, volume: volDelta || 0 };
+    st.bars.push(bar);
+  } else if (t === bar.time) {
+    bar.close = val; bar.high = Math.max(bar.high, val); bar.low = Math.min(bar.low, val);
+    bar.volume = (bar.volume || 0) + (volDelta || 0);
+  }
+  st.series.update({ time: bar.time, open: bar.open, high: bar.high, low: bar.low, close: bar.close });
+  if (st.vol) st.vol.update({ time: bar.time, value: bar.volume || 0, color: bar.close >= bar.open ? 'rgba(50,208,116,.45)' : 'rgba(255,90,82,.45)' });
+  paintOhlc();
+}
+function exposeLiveDebug() {
+  window.__liveChart = () => {
+    const st = chartState || {};
+    const last = st.bars && st.bars[st.bars.length - 1];
+    return {
+      key: st.key, chain: st.chain, addr: st.addr, pairAddress: st.pairAddress,
+      tf: st.tf, mc: st.mcap, price: st.price, fac: st.fac,
+      lastClose: last && last.close, lastTime: last && last.time,
+      lastOpen: last && last.open, lastHigh: last && last.high, lastLow: last && last.low,
+      nBars: (st.bars && st.bars.length) || 0, nTicks: (st.ticks && st.ticks.length) || 0,
+      liveAt: st.liveAt, liveOk: st.liveOk
+    };
+  };
+}
+async function tickTokenChart() {
+  const st = chartState;
+  if (!st || st.kind !== 'token' || !st.pairAddress) return;
+  if (document.visibilityState !== 'visible' || route().name !== 'token') return;
+  try {
+    const p = await fetchDsPair(st.chain, st.pairAddress);
+    if (!p || chartState !== st) return;
+    const px = +p.priceUsd;
+    const mc = pairMc(p);
+    let volDelta = 0;
+    const h24 = p.volume && +p.volume.h24;
+    if (h24 && st._h24 && h24 > st._h24) volDelta = h24 - st._h24;
+    if (h24) st._h24 = h24;
+    pairCache.set(st.key, { pair: p, ts: Date.now() });
+    applyLiveTick(st, px, mc, volDelta);
+  } catch (e) {
+    st.liveOk = false;
+    setLivePill(false, st.mcap);
+    if (st.chain === 'solana' && st.addr) {
+      try {
+        const d = await getJSON('https://api.jup.ag/price/v3?ids=' + encodeURIComponent(st.addr), 8000);
+        const x = d && (d[st.addr] || d[Object.keys(d)[0]]);
+        const px = x && +x.usdPrice;
+        if (px && chartState === st) applyLiveTick(st, px, st.fac ? px * st.fac : st.mcap, 0);
+        else console.warn('live tick', e);
+      } catch { console.warn('live tick', e); }
+    } else console.warn('live tick', e);
+  }
+}
+function startLiveFeed(st) {
+  stopLiveFeed(st);
+  if (!st || st.kind !== 'token') return;
+  const gen = (st.liveGen = (st.liveGen || 0) + 1);
+  const loop = async () => {
+    if (chartState !== st || st.liveGen !== gen) return;
+    const t0 = Date.now();
+    if (document.visibilityState === 'visible' && route().name === 'token') await tickTokenChart();
+    if (chartState !== st || st.liveGen !== gen) return;
+    st.liveTimer = setTimeout(loop, Math.max(250, 1000 - (Date.now() - t0)));
+  };
+  st.onVis = () => { if (document.visibilityState === 'visible' && chartState === st) tickTokenChart(); };
+  document.addEventListener('visibilitychange', st.onVis);
+  setLivePill(!!(st.price || st.mcap), st.mcap);
+  exposeLiveDebug();
+  loop();
 }
 function signalMarkers(candles, kind, tfId) {
   const n = candles.length, out = [];
@@ -1208,6 +1434,24 @@ function paintOhlc(i) {
   ohlc.hidden = false;
   ohlc.innerHTML = fmtOhlcHud(bars[idx], bars[idx - 1]);
 }
+function chartDate(time) {
+  if (time && typeof time === 'object' && time.year) return new Date(time.year, (time.month || 1) - 1, time.day || 1);
+  return new Date((+time || 0) * 1000);
+}
+function formatChartTick(time, type) {
+  const d = chartDate(time);
+  const T = window.LightweightCharts && window.LightweightCharts.TickMarkType;
+  if (T && type === T.Year) return String(d.getFullYear());
+  if (T && type === T.Month) return d.toLocaleString(undefined, { month: 'short' });
+  if (T && type === T.DayOfMonth) return String(d.getDate());
+  const withSec = (T && type === T.TimeWithSeconds) || type === 4;
+  return d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: withSec ? '2-digit' : undefined, hour12: false });
+}
+function formatChartTime(time) {
+  const d = chartDate(time);
+  const sec = chartState.tf === '1s' || chartState.tf === '1m';
+  return d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: sec ? '2-digit' : undefined, hour12: false });
+}
 function createMcChart(host) {
   const LW = window.LightweightCharts;
   if (!LW) { host.innerHTML = '<div class="chart-empty mut">Chart library failed to load.</div>'; return null; }
@@ -1218,13 +1462,13 @@ function createMcChart(host) {
     grid: { vertLines: { color: 'rgba(255,255,255,0.06)' }, horzLines: { color: 'rgba(255,255,255,0.06)' } },
     rightPriceScale: { borderColor: 'rgba(255,255,255,0.08)', scaleMargins: { top: 0.08, bottom: 0.05 } },
     leftPriceScale: { visible: false },
-    timeScale: { borderColor: 'rgba(255,255,255,0.08)', timeVisible: true, secondsVisible: false, rightOffset: 4 },
+    timeScale: { borderColor: 'rgba(255,255,255,0.08)', timeVisible: true, secondsVisible: chartState.tf === '1s' || chartState.tf === '1m', rightOffset: 4, tickMarkFormatter: formatChartTick },
     crosshair: {
       mode: LW.CrosshairMode.Normal,
       vertLine: { color: 'rgba(242,242,244,.35)', labelBackgroundColor: '#1c1c21' },
       horzLine: { color: 'rgba(242,242,244,.35)', labelBackgroundColor: '#1c1c21' }
     },
-    localization: { priceFormatter: fmtMcVal },
+    localization: { priceFormatter: fmtMcVal, timeFormatter: formatChartTime },
     handleScroll: { vertTouchDrag: false }
   });
   const series = chart.addSeries(LW.CandlestickSeries, {
@@ -1268,86 +1512,67 @@ async function loadAndDrawChart() {
   const seq = (st.seq = (st.seq || 0) + 1);
   host.innerHTML = '<div class="chart-empty mut">Loading chart…</div>';
   try {
-    const raw = await fetchOhlcv(st, tf);
+    let raw = null, trades = [];
+    if (st.kind === 'token' && st.pairAddress) {
+      const jobs = [];
+      if (tf.id !== '1s') jobs.push(fetchOhlcv(st, tf).then(v => { raw = v; }).catch(e => { st._ohlcvErr = e; }));
+      jobs.push(fetchGtTrades(st.chain, st.pairAddress).then(v => { trades = v; }).catch(() => {}));
+      await Promise.all(jobs);
+    } else {
+      raw = await fetchOhlcv(st, tf);
+    }
     if (seq !== chartState.seq || !$('#mcchart')) return;
     const fac = mcFactor(st.mcap, st.price);
     st.fac = fac;
-    if (!raw || !raw.length) { host.innerHTML = `<div class="chart-empty mut">No candle data for this timeframe.${st.dsUrl ? `<br><a href="${esc(st.dsUrl)}" target="_blank" rel="noopener">Open DexScreener</a>` : ''}</div>`; return; }
-    const packed = barsFromOhlcvList(raw, fac || 1);
-    st.bars = packed.candles;
+    let packed;
+    if (st.kind === 'token') {
+      st.ohlcvList = raw || [];
+      const fresh = ticksFromTrades(trades, st.addr);
+      const old = st.ticks || [];
+      st.ticks = fresh.concat(old);
+      st.ticks.sort((a, b) => a.t - b.t);
+      if (st.price && isFinite(st.price) && st.price > 0) st.ticks.push({ t: Date.now() / 1000, px: st.price, vol: 0 });
+      pruneTicks(st.ticks, tf.id === '1s' ? 1800 : 6 * 3600);
+      const hist = tf.id === '1s' ? [] : st.ohlcvList;
+      st.usdRows = mergeUsdRows(hist, st.ticks, TF_SEC[tf.id]);
+      packed = packUsdToMc(st.usdRows, fac || 1);
+    } else {
+      packed = barsFromOhlcvList(raw || [], fac || 1);
+    }
+    if (!packed || !packed.candles.length) {
+      host.innerHTML = `<div class="chart-empty mut">No candle data for this timeframe.${st.dsUrl ? `<br><a href="${esc(st.dsUrl)}" target="_blank" rel="noopener">Open DexScreener</a>` : ''}</div>`;
+      if (st.kind === 'token') startLiveFeed(st);
+      return;
+    }
     if (st.chart) { try { st.chart.remove(); } catch {} st.chart = st.series = st.vol = st.markers = st.badges = null; }
     const inst = createMcChart(host);
     if (!inst) return;
     st.chart = inst.chart; st.series = inst.series; st.vol = inst.vol;
-    inst.series.setData(packed.candles.map(({ time, open, high, low, close }) => ({ time, open, high, low, close })));
-    inst.vol.setData(packed.volume);
-    const marks = signalMarkers(packed.candles, st.kind === 'coin' ? 'coin' : 'token', st.tf);
-    st.markCount = marks.length;
-    applyChartBadges(inst.series, marks, st.plan, fac);
-    inst.chart.timeScale().fitContent();
-    paintOhlc();
+    applyPacked(st, packed, true);
     inst.chart.subscribeCrosshairMove(param => {
       if (!chartState.bars) return;
       if (!param || param.time == null) { paintOhlc(); return; }
       const i = chartState.bars.findIndex(b => b.time === param.time);
       if (i >= 0) paintOhlc(i);
     });
+    if (st.kind === 'token') startLiveFeed(st);
   } catch (e) {
     console.warn('chart', e);
     if (seq !== chartState.seq || !$('#mcchart')) return;
     host.innerHTML = `<div class="chart-empty mut">Couldn't load candles.${st.dsUrl ? ` <a href="${esc(st.dsUrl)}" target="_blank" rel="noopener">Open DexScreener</a>` : ''}</div>`;
+    if (st.kind === 'token') startLiveFeed(st);
   }
 }
-async function tickTokenChart() {
-  const st = chartState;
-  if (!st || st.kind !== 'token') return;
-  if (document.visibilityState !== 'visible' || route().name !== 'token') return;
-  try {
-    const m = await pairsFor([{ chain: st.chain, addr: st.addr }], 0);
-    const p = m.get(st.key); if (!p) return;
-    st.price = +p.priceUsd; st.mcap = pairMc(p);
-    const fac = mcFactor(st.mcap, st.price); if (fac) st.fac = fac;
-    const big = $('#bigpx'); if (big) big.textContent = fmtPrimaryMc(st.mcap, st.price);
-    const sub = $('#pxsub'); if (sub) sub.textContent = fmtPrice(st.price);
-    if (st.series && st.bars && st.bars.length && st.price) {
-      const sec = TF_SEC[st.tf], t = Math.floor(Date.now() / 1000 / sec) * sec;
-      const val = st.fac ? st.price * st.fac : (st.mcap || st.price);
-      let last = st.bars[st.bars.length - 1];
-      if (t > last.time) {
-        last = { time: t, open: last.close, high: val, low: val, close: val, volume: 0 };
-        st.bars.push(last);
-      } else {
-        last.close = val; last.high = Math.max(last.high, val); last.low = Math.min(last.low, val);
-      }
-      st.series.update({ time: last.time, open: last.open, high: last.high, low: last.low, close: last.close });
-      paintOhlc();
-    }
-    const key = [st.kind, st.key, st.tf, st.pairAddress || ''].join('|');
-    const hit = ohlcvCache.get(key);
-    if (!hit || Date.now() - hit.ts > 60e3) {
-      ohlcvCache.delete(key);
-      const tf = CHART_TF.find(x => x.id === st.tf);
-      const raw = await fetchOhlcv(st, tf);
-      if (raw && raw.length && st.series && chartState === st) {
-        const packed = barsFromOhlcvList(raw, st.fac || 1);
-        st.bars = packed.candles;
-        st.series.setData(packed.candles.map(({ time, open, high, low, close }) => ({ time, open, high, low, close })));
-        st.vol.setData(packed.volume);
-        const marks = signalMarkers(packed.candles, 'token', st.tf);
-        st.markCount = marks.length;
-        applyChartBadges(st.series, marks, st.plan, st.fac);
-        paintOhlc();
-      }
-    }
-  } catch (e) { console.warn('chart tick', e); }
-}
 function bindMcChart(opts) {
-  const keepTf = (chartState.key === opts.key && chartState.kind === opts.kind && chartState.tf) ? chartState.tf : null;
+  const same = chartState.key === opts.key && chartState.kind === opts.kind;
+  const keepTf = same && chartState.tf ? chartState.tf : null;
+  const keepTicks = same ? (chartState.ticks || []) : [];
+  const keepOhlcv = same ? (chartState.ohlcvList || []) : [];
   destroyMcChart();
   const host = $('#mcchart'); if (!host) return;
   const saved = keepTf || ls.get('chartTf:' + opts.kind, opts.defaultTf);
   const tf = CHART_TF.some(t => t.id === saved) ? saved : opts.defaultTf;
-  chartState = { ...opts, tf, lines: [], seq: 0 };
+  chartState = { ...opts, tf, lines: [], seq: 0, ticks: keepTicks, ohlcvList: keepOhlcv };
   document.querySelectorAll('[data-ctf]').forEach(b => {
     b.classList.toggle('on', b.dataset.ctf === tf);
     b.onclick = () => {
@@ -1358,7 +1583,6 @@ function bindMcChart(opts) {
     };
   });
   loadAndDrawChart();
-  if (opts.kind === 'token') chartState.timer = setInterval(tickTokenChart, 12000);
 }
 
 function swingPlanCard(w, fac) {

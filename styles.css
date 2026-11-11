@@ -201,6 +201,14 @@ canvas.chart{width:100%;display:block;touch-action:pan-y}
 .chartcard h3{align-items:flex-start}
 .chartcard h3 .seg{flex-wrap:wrap;justify-content:flex-end}
 .chartcard h3 .seg button{padding:6px 8px;font-size:12px;min-height:32px}
+.chart-h{display:inline-flex;align-items:center;gap:8px;flex-wrap:wrap;color:var(--mut);font-size:13px;font-weight:600}
+.livepill{display:inline-flex;align-items:center;gap:5px;padding:2px 8px 2px 6px;border-radius:999px;font-size:10px;font-weight:800;letter-spacing:.6px;background:rgba(50,208,116,.14);color:var(--green);vertical-align:middle;line-height:1.2}
+.livepill i{width:6px;height:6px;border-radius:50%;background:var(--green);box-shadow:0 0 0 0 rgba(50,208,116,.65);animation:livepulse 1.4s ease-out infinite;flex:none}
+.livepill b{font:inherit}
+.livepill.off{color:var(--mut);background:var(--card2)}
+.livepill.off i{background:var(--mut);animation:none;box-shadow:none}
+@keyframes livepulse{0%{box-shadow:0 0 0 0 rgba(50,208,116,.55)}70%{box-shadow:0 0 0 6px rgba(50,208,116,0)}100%{box-shadow:0 0 0 0 rgba(50,208,116,0)}}
+.livemc{color:var(--txt);font-size:13px;font-weight:700;font-variant-numeric:tabular-nums;letter-spacing:0}
 .ohlc{display:flex;flex-wrap:wrap;gap:6px 10px;font-size:11.5px;color:var(--mut);font-variant-numeric:tabular-nums;margin:0 0 8px;min-height:16px}
 .ohlc b{color:var(--txt);font-weight:650}
 .chartbox{height:360px;position:relative;background:#000;margin:0 -4px;user-select:none;-webkit-user-select:none}

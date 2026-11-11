@@ -797,9 +797,41 @@
     return sign + '$' + a.toLocaleString('en-US', { minimumFractionDigits: dec, maximumFractionDigits: dec });
   }
   function fmtCount(n) { return n >= 1000 ? n.toLocaleString('en-US') : String(n); }
-  function clockNow() { return new Date().toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' }); }
-  function clockAt(t) { return new Date(t).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' }); }
+  function clockNow() {
+    if (bot._demoClock) return bot._demoClock;
+    return new Date().toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+  }
+  function clockAt(t) {
+    return new Date(t).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+  }
   const openN = () => bot.positions.length;
+  function seriesNow() { return bot._demoNow || Date.now(); }
+  function moneyTxt(n) {
+    if (n == null || !isFinite(n)) return '—';
+    return (n < 0 ? '−' : '') + fmtUsd(Math.abs(n));
+  }
+  function fmtMc(n) {
+    if (n == null || !isFinite(n) || n === 0) return '—';
+    const sign = n < 0 ? '−' : '', a = Math.abs(n);
+    if (a >= 1e6) {
+      const v = a / 1e6;
+      let s = v >= 10 ? v.toFixed(1) : v.toFixed(2);
+      s = s.replace(/\.0+$/, '');
+      return sign + '$' + s + 'M';
+    }
+    if (a >= 1e3) {
+      const v = a / 1e3;
+      const s = (v >= 100 || Math.abs(v - Math.round(v)) < 0.05) ? String(Math.round(v)) : v.toFixed(1);
+      return sign + '$' + s + 'K';
+    }
+    return sign + '$' + Math.round(a);
+  }
+  function sublineLeft() {
+    const p = bot.positions[0];
+    const name = (p && p.symbol) ? p.symbol : 'Solana';
+    const ico = p ? tokAv(p.icon, p.symbol, 'tav xs') : tokAv(null, 'SOL', 'tav xs');
+    return ico + ' <span>' + esc(name) + ' · ' + openN() + ' open</span>';
+  }
   function pnlState() {
     const eq = equityNow();
     const start = bot.startUsd || eq;
@@ -821,18 +853,25 @@
     else toast('Copy failed');
   }
 
+  function slotEyes(cx, cy, gap, w, h, fill) {
+    const x1 = cx - gap / 2 - w, x2 = cx + gap / 2, y = cy - h / 2, r = w / 2;
+    return '<rect x="'+x1+'" y="'+y+'" width="'+w+'" height="'+h+'" rx="'+r+'" fill="'+fill+'"/>' +
+           '<rect x="'+x2+'" y="'+y+'" width="'+w+'" height="'+h+'" rx="'+r+'" fill="'+fill+'"/>';
+  }
   function agentIcon(name, status) {
-    const col = { scanner: '#2ee6c7', analyst: '#ff5a52', executor: '#b084ff', brain: '#ff8a3d' }[name];
-    const ring = status === 'danger' ? '#ff5a52' : col;
-    const spin = bot.running && status !== 'idle' ? 'term-ring-spin' : '';
-    const dash = status === 'idle' ? '92 145' : status === 'danger' ? '128 145' : '112 145';
+    const body = { scanner: '#12a8a2', analyst: '#f83c3c', executor: '#8f6af0', brain: '#f86e0c' }[name];
+    const ok = '#1ee36a';
+    const ring = name === 'scanner' ? '#5ac8f8' : (status === 'danger' ? '#f85840' : (status === 'idle' ? 'rgba(255,255,255,.22)' : ok));
+    const circ = (2 * Math.PI * 23).toFixed(2);
+    const pct = name === 'scanner' ? 0.50 : status === 'danger' ? 0.95 : status === 'idle' ? 0.38 : 0.86;
+    const dash = (pct * 2 * Math.PI * 23).toFixed(2) + ' ' + circ;
     const face = {
-      scanner: '<g><ellipse cx="26" cy="27" rx="12" ry="11.2" fill="'+col+'"/><path d="M23.2 16.2h5.6M23 18.2h6M25.2 14.8v4.6M27.4 14.8v4.6" fill="none" stroke="#06332c" stroke-width="1.25" stroke-linecap="round"/><circle cx="21.4" cy="25.2" r="1.7" fill="#06332c"/><circle cx="30.6" cy="25.2" r="1.7" fill="#06332c"/><circle cx="21.9" cy="24.6" r=".45" fill="#fff" opacity=".55"/><circle cx="31.1" cy="24.6" r=".45" fill="#fff" opacity=".55"/><path d="M21.8 31c2.5 2.3 6.9 2.3 9.4 0" fill="none" stroke="#06332c" stroke-width="1.55" stroke-linecap="round"/></g>',
-      analyst: '<g><path d="M26 9.8l15 27.4H11L26 9.8z" fill="'+col+'" stroke="'+col+'" stroke-linejoin="round" stroke-width="1.6"/><circle cx="22.2" cy="28.2" r="1.75" fill="#2a0808"/><circle cx="29.8" cy="28.2" r="1.75" fill="#2a0808"/><circle cx="22.7" cy="27.6" r=".45" fill="#fff" opacity=".45"/><path d="M22.6 32.6c2.1 1.9 4.7 1.9 6.8 0" fill="none" stroke="#2a0808" stroke-width="1.35" stroke-linecap="round"/></g>',
-      executor: '<g><path d="M15.5 24.2c0-6.4 4.4-11.5 10.5-11.5s10.5 5.1 10.5 11.5v11.6c0 1.25-.95 1.55-1.7.7l-2.3-2.55-2.25 2.7c-.6.7-1.65.7-2.25 0l-2-2.5-2 2.5c-.6.7-1.65.7-2.25 0l-2.25-2.7-2.3 2.55c-.75.85-1.7.55-1.7-.7V24.2z" fill="'+col+'"/><circle cx="22.2" cy="23.4" r="1.7" fill="#1a1028"/><circle cx="29.8" cy="23.4" r="1.7" fill="#1a1028"/><circle cx="22.7" cy="22.8" r=".45" fill="#fff" opacity=".5"/><path d="M22.4 28.2c2.2 1.8 5 1.8 7.2 0" fill="none" stroke="#1a1028" stroke-width="1.35" stroke-linecap="round"/></g>',
-      brain: '<g><path d="M26 14.2c1.1-2.6 3.8-3.6 5.2-3.4" fill="none" stroke="'+col+'" stroke-width="2.3" stroke-linecap="round"/><ellipse cx="26" cy="27" rx="12.4" ry="11.5" fill="'+col+'"/><circle cx="21.5" cy="25.2" r="1.7" fill="#2a1408"/><circle cx="30.5" cy="25.2" r="1.7" fill="#2a1408"/><circle cx="22" cy="24.6" r=".45" fill="#fff" opacity=".45"/><path d="M21.8 31c2.5 2.2 6.9 2.2 9.4 0" fill="none" stroke="#2a1408" stroke-width="1.5" stroke-linecap="round"/></g>'
+      scanner: '<g><circle cx="26.00" cy="21.15" r="5.55" fill="'+body+'"/><circle cx="30.20" cy="23.57" r="5.55" fill="'+body+'"/><circle cx="30.20" cy="28.42" r="5.55" fill="'+body+'"/><circle cx="26.00" cy="30.85" r="5.55" fill="'+body+'"/><circle cx="21.80" cy="28.43" r="5.55" fill="'+body+'"/><circle cx="21.80" cy="23.57" r="5.55" fill="'+body+'"/><circle cx="26" cy="26" r="7.1" fill="'+body+'"/>'+slotEyes(26, 26.1, 3.15, 2.2, 6.2, '#05332f')+'</g>',
+      analyst: '<g><path d="M26 12.4 L37.4 33.4 Q38.5 35.7 36.2 35.7 H15.8 Q13.5 35.7 14.6 33.4 Z" fill="'+body+'" stroke="'+body+'" stroke-linejoin="round" stroke-width="3.2"/>'+slotEyes(26, 27.4, 3.2, 2.35, 6.6, '#1a0505')+'</g>',
+      executor: '<g><path d="M14.6 25.2C13.2 18.8 17.2 15.2 21.2 16.2C22.1 12.4 26.8 12.2 28.8 15.6C32.2 13.6 37.4 16.2 36.8 21.6C39.6 23.6 39.2 29.6 35.4 31.1C34.4 35 28.2 36.6 24.2 34.1C20.2 36.6 14.6 34.6 14.1 30.2C11.8 28.6 12.2 26.2 14.6 25.2Z" fill="'+body+'"/>'+slotEyes(26.2, 24.8, 3.4, 2.2, 6.2, '#1a1030')+'</g>',
+      brain: '<g><path d="M27.6 13.4c.4-1.6 1.6-2.6 2.7-2.8" fill="none" stroke="#3c4a22" stroke-width="1.7" stroke-linecap="round"/><rect x="14.4" y="15.2" width="23.2" height="22.2" rx="8.4" fill="'+body+'"/>'+slotEyes(26, 26.2, 3.0, 3.05, 8.6, '#1a0c00')+'</g>'
     }[name];
-    return '<svg class="term-ring '+spin+'" viewBox="0 0 52 52" width="52" height="52" aria-hidden="true"><circle cx="26" cy="26" r="23" fill="none" stroke="rgba(255,255,255,.08)" stroke-width="4.5"/><circle cx="26" cy="26" r="23" fill="none" stroke="'+ring+'" stroke-width="4.5" stroke-linecap="round" stroke-dasharray="'+dash+'" transform="rotate(-90 26 26)"/>'+face+'</svg>';
+    return '<svg class="term-ring" viewBox="0 0 52 52" width="52" height="52" aria-hidden="true"><circle cx="26" cy="26" r="23" fill="none" stroke="rgba(255,255,255,.06)" stroke-width="4.4"/><circle cx="26" cy="26" r="23" fill="none" stroke="'+ring+'" stroke-width="4.4" stroke-linecap="round" stroke-dasharray="'+dash+'" transform="rotate(-90 26 26)"/>'+face+'</svg>';
   }
   function ghIcon() {
     return '<svg class="term-gh" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8a8 8 0 0 0 5.47 7.59c.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82A7.68 7.68 0 0 1 8 3.46c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8 8 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>';
@@ -845,7 +884,7 @@
   }
 
   function windowSeries(tf) {
-    const now = Date.now();
+    const now = seriesNow();
     const span = { LIVE: 20 * 60e3, '1H': 36e5, '4H': 4 * 36e5, '1D': 864e5, '1W': 7 * 864e5, ALL: Infinity }[tf] || 20 * 60e3;
     const pts = bot.equity.filter(p => now - p.t <= span);
     if (pts.length < 2) {
@@ -873,15 +912,15 @@
       const y = yOf(eqAt(tr.t));
       const w = tr.kind === 'buy' ? 128 : 146;
       const h = 38;
-      let bx = Math.max(8, Math.min(W - w - 8, x - w / 2));
-      let by = Math.max(58, y - 66);
-      if (bx + w > W - 86 && by < 52) bx = Math.max(8, W - w - 96);
+      let bx = Math.max(8, Math.min(W - w - 8, x - w * 0.62));
+      let by = Math.max(132, y - 92);
+      if (bx + w > W - 70 && by < 120) bx = Math.max(8, W - w - 78);
       let guard = 0;
       const overlap = () => placed.some(p => Math.abs((p.bx + p.w / 2) - (bx + w / 2)) < (p.w + w) / 2 - 2 && Math.abs(p.by - by) < (p.h + h) / 2 - 2);
       while (overlap() && guard++ < 16) {
-        by += (i % 2 ? 18 : -18);
-        if (by < 56) { by = 56; bx = Math.min(W - w - 8, bx + 28); }
-        if (by > y - 18) { by = Math.max(56, y - 72); bx = Math.max(8, bx - 22); }
+        by += (i % 2 ? 16 : -16);
+        if (by < 132) { by = 132; bx = Math.min(W - w - 8, bx + 28); }
+        if (by > y - 22) { by = Math.max(132, y - 84); bx = Math.max(8, bx - 22); }
       }
       placed.push({ tr, x, y, bx, by, w, h });
     });
@@ -919,8 +958,9 @@
       lo = mid - pad * 0.45;
       hi = mid + pad * 1.35;
     }
-    const padT = Math.max(118, Math.round(H * 0.42)), padB = 22;
-    const xOf = t => { const a = pts[0].t, b = pts[pts.length - 1].t || a + 1; return (t - a) / (b - a || 1) * (W - 8) + 4; };
+    const padT = Math.max(132, Math.round(H * 0.44)), padB = 20;
+    const padX = 4, padXR = 16;
+    const xOf = t => { const a = pts[0].t, b = pts[pts.length - 1].t || a + 1; return (t - a) / (b - a || 1) * (W - padX - padXR) + padX; };
     const yOf = v => padT + (1 - (v - lo) / (hi - lo || 1)) * (H - padT - padB);
     const path = () => { g.beginPath(); pts.forEach((p, i) => { const x = xOf(p.t), y = yOf(p.v); i ? g.lineTo(x, y) : g.moveTo(x, y); }); };
     path(); g.lineTo(xOf(pts[pts.length - 1].t), H); g.lineTo(xOf(pts[0].t), H); g.closePath();
@@ -937,22 +977,38 @@
     const latestStop = trades.find(tr => tr.kind === 'stop');
     trades.forEach(tr => {
       const x = xOf(tr.t), y = yOf(eqAt(tr.t));
-      if (tr.kind === 'stop') {
-        g.beginPath(); g.arc(x, y, 7, 0, Math.PI * 2); g.strokeStyle = 'rgba(255,80,70,.55)'; g.lineWidth = 2; g.stroke();
-        if (tr === latestStop) { g.beginPath(); g.arc(x, y, 11, 0, Math.PI * 2); g.strokeStyle = 'rgba(255,70,60,.4)'; g.lineWidth = 2; g.stroke(); }
-        g.beginPath(); g.arc(x, y, 3.2, 0, Math.PI * 2); g.fillStyle = '#ff5a52'; g.fill();
+      if (tr.kind === 'buy') {
+        g.beginPath(); g.arc(x, y, 4.2, 0, Math.PI * 2);
+        g.fillStyle = '#3d8bff'; g.fill();
+      } else if (tr.kind === 'stop') {
+        g.beginPath(); g.arc(x, y, 5.2, 0, Math.PI * 2);
+        g.strokeStyle = '#ff5a52'; g.lineWidth = 2.1; g.stroke();
+        if (tr === latestStop) { g.beginPath(); g.arc(x, y, 8.5, 0, Math.PI * 2); g.strokeStyle = 'rgba(255,70,60,.35)'; g.lineWidth = 1.6; g.stroke(); }
       } else {
-        g.beginPath(); g.arc(x, y, 4, 0, Math.PI * 2);
-        g.fillStyle = tr.kind === 'buy' ? '#3d8bff' : '#1ee36a'; g.fill();
+        g.beginPath(); g.arc(x, y, 5.2, 0, Math.PI * 2);
+        g.strokeStyle = '#1ee36a'; g.lineWidth = 2.1; g.stroke();
       }
     });
     const last = pts[pts.length - 1];
     const ex = xOf(last.t), ey = yOf(last.v);
-    g.beginPath(); g.arc(ex, ey, 8, 0, Math.PI * 2);
-    g.fillStyle = 'rgba(30,227,106,.18)'; g.fill();
-    g.beginPath(); g.arc(ex, ey, 3.4, 0, Math.PI * 2);
-    g.fillStyle = '#1ee36a'; g.fill();
-    if (dot) { dot.style.left = ex + 'px'; dot.style.top = ey + 'px'; dot.hidden = false; }
+    const endTok = (bot.positions[0] && (bot.positions[0].icon || bot.positions[0].symbol))
+      ? bot.positions[0]
+      : (trades.length ? trades[0] : null);
+    const endAv = document.getElementById('termEndAv');
+    if (endAv && endTok && !empty) {
+      endAv.innerHTML = tokAv(endTok.icon, endTok.symbol, 'tav');
+      endAv.style.left = Math.max(12, Math.min(ex, W - 13)) + 'px';
+      endAv.style.top = ey + 'px';
+      endAv.hidden = false;
+      if (dot) dot.hidden = true;
+    } else {
+      if (endAv) { endAv.hidden = true; endAv.innerHTML = ''; }
+      g.beginPath(); g.arc(ex, ey, 8, 0, Math.PI * 2);
+      g.fillStyle = 'rgba(30,227,106,.18)'; g.fill();
+      g.beginPath(); g.arc(ex, ey, 3.4, 0, Math.PI * 2);
+      g.fillStyle = '#1ee36a'; g.fill();
+      if (dot) { dot.style.left = ex + 'px'; dot.style.top = ey + 'px'; dot.hidden = false; }
+    }
     if (hint) {
       hint.classList.toggle('off', !empty);
       if (empty) hint.style.top = Math.max(8, ey - 28) + 'px';
@@ -966,16 +1022,17 @@
         const line2 = typ === 'buy' ? 'bought ' + fmtUsd(tr.usd)
           : typ === 'stop' ? 'stop −' + fmtUsd(Math.abs(tr.pnlUsd || 0))
           : 'sold +' + fmtUsd(Math.abs(tr.pnlUsd || 0));
-        const connH = Math.max(8, b.y - b.by - 36);
+        const connH = Math.max(8, b.y - b.by - 40);
+        const connX = Math.max(14, Math.min(b.w - 14, b.x - b.bx));
         return '<div class="tbub '+typ+'" style="left:'+b.bx+'px;top:'+b.by+'px">'+
           tokAv(tr.icon, tr.symbol, 'tav sm')+'<div class="tbub-t"><div class="tbub-h"><b>'+esc(tr.symbol)+'</b>'+pill+'</div><span>'+line2+'</span></div>'+
-          '<i class="tconn" style="height:'+connH+'px"></i></div>';
+          '<i class="tconn" style="left:'+connX+'px;height:'+connH+'px"></i></div>';
       }).join('');
     }
   }
 
   function pillLive() {
-    if (bot.settings.mode === 'LIVE') return '<span class="term-mode live'+(bot.running ? '' : ' off')+'"><i></i>Live</span>';
+    if (bot._demoLive || bot.settings.mode === 'LIVE') return '<span class="term-mode live'+(bot.running || bot._demoLive ? '' : ' off')+'"><i></i>Live</span>';
     return '<span class="term-mode paper"><i></i>Paper</span>';
   }
   function odometerHTML(value, cls) {
@@ -1011,29 +1068,37 @@
 
   function agentsHTML() {
     const a = bot.agents;
+    const featured = () => {
+      if (a.brain && a.brain.status === 'danger') return 'brain';
+      if (a.brain && a.brain.status === 'hot') return 'brain';
+      if (a.executor && a.executor.status === 'hot') return 'executor';
+      if (a.analyst && a.analyst.status === 'hot') return 'analyst';
+      return '';
+    };
     const glow = (key, ag) => {
       if (ag.status === 'danger') return 'on-red';
-      if (ag.status !== 'hot') return '';
-      return 'on-' + ({ scanner: 'teal', analyst: 'red', executor: 'purple', brain: 'green' }[key] || 'teal');
+      if (key === featured() && ag.status !== 'idle') return 'on-green';
+      return '';
     };
     const card = (key, title, src, bottom) => {
       const ag = a[key];
       return '<div class="agcard '+glow(key, ag)+'" data-ag="'+key+'">'+agentIcon(key, ag.status)+
-        '<div class="agbody"><div class="agtitle">'+title+'</div><div class="agsrc">'+ghIcon()+' '+esc(src)+'</div><div class="agbot">'+bottom(ag)+'</div></div></div>';
+        '<div class="agbody"><div class="agtitle">'+title+'</div><div class="agsrc">'+ghIcon()+'<span>'+esc(src)+'</span></div><div class="agbot">'+bottom(ag)+'</div></div></div>';
     };
     return '<div class="term-agents">'+
-      card('scanner', 'Scanner', 'dexscreener', ag => tokAv(null, '#', 'tav xs')+' <span class="ok">'+esc(ag.detail)+'</span>')+
+      card('scanner', 'Scanner', 'dexscreener', ag => tokAv(null, '#', 'tav xs')+'<span class="agline"><span class="ok">'+esc(ag.detail)+'</span></span>')+
       card('analyst', 'Analyst', 'rugcheck', ag => {
-        const t = ag.token;
-        return (t ? tokAv(t.icon, t.symbol, 'tav xs')+' ' : '')+'<span class="ok">'+(t ? esc(t.symbol)+' score '+(ag.score || (t.sig && t.sig.score) || '') : esc(ag.detail))+'</span>';
+        const tok = ag.token;
+        const score = ag.score || (tok && tok.sig && tok.sig.score) || '';
+        return (tok ? tokAv(tok.icon, tok.symbol, 'tav xs') : '')+'<span class="agline">'+(tok ? '<span class="agtok">'+esc(tok.symbol)+'</span> ' : '')+'<span class="ok">'+(tok ? 'score '+score : esc(ag.detail))+'</span></span>';
       })+
       card('executor', 'Executor', 'jupiter', ag => {
-        const t = ag.token;
-        return (t ? tokAv(t.icon, t.symbol || t.mint, 'tav xs')+' ' : '')+'<span class="ok">'+esc(ag.detail)+'</span>';
+        const tok = ag.token;
+        return (tok ? tokAv(tok.icon, tok.symbol || tok.mint, 'tav xs') : '')+'<span class="agline"><span class="ok">'+esc(ag.detail)+'</span></span>';
       })+
-      card('brain', 'Brain', 'brain', ag => {
-        const t = ag.token;
-        return (t ? tokAv(t.icon, t.symbol, 'tav xs')+' ' : '')+'<span class="ok">'+esc(ag.detail)+'</span>';
+      card('brain', 'Brain', 'strategy', ag => {
+        const tok = ag.token;
+        return (tok ? tokAv(tok.icon, tok.symbol, 'tav xs') : '')+'<span class="agline"><span class="ok">'+esc(ag.detail)+'</span></span>';
       })+
     '</div>';
   }
@@ -1046,15 +1111,20 @@
       '<span>Safety checks come first. Fast Solana coins only, after every gate passes.</span></div>';
     return rows.map(tr => {
       const badge = tr.kind === 'buy' ? 'b-buy' : tr.kind === 'stop' ? 'b-stop' : 'b-sell';
-      const mark = tr.kind === 'buy' ? '↓' : tr.kind === 'stop' ? '×' : '✓';
+      const mark = tr.kind === 'buy'
+        ? '<svg viewBox="0 0 12 12" width="8" height="8" aria-hidden="true"><path d="M3 9L9 3M5 3h4v4" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+        : tr.kind === 'stop' ? '×' : '✓';
       const title = tr.kind === 'buy' ? 'Bought '+esc(tr.symbol)
         : tr.kind === 'stop' ? 'Stopped '+esc(tr.symbol)
         : (tr.frac && tr.frac < 0.99 ? 'Sold '+Math.round(tr.frac * 100)+'% '+esc(tr.symbol) : 'Sold '+esc(tr.symbol));
-      const sub = esc(tr.agent || '')+' · '+esc(tr.note || '')+' · '+clockAt(tr.t);
-      const amt = tr.kind === 'buy' ? fmtUsd(tr.usd) : ((tr.pnlUsd || 0) >= 0 ? '+' : '')+fmtUsd(tr.pnlUsd || 0);
+      const bits = [tr.agent];
+      if (tr.kind !== 'buy' && tr.note) bits.push(tr.note);
+      bits.push(tr.clock || clockAt(tr.t));
+      const sub = bits.filter(Boolean).map(esc).join(' · ');
+      const amt = tr.kind === 'buy' ? fmtUsd(tr.usd) : ((tr.pnlUsd || 0) >= 0 ? '+' : '') + moneyTxt(tr.pnlUsd || 0);
       const amtCls = tr.kind === 'buy' ? '' : ((tr.pnlUsd || 0) >= 0 ? 'up' : 'dn');
-      const right2 = tr.kind === 'buy' && tr.mc ? fmtBig(tr.mc)+' MC'
-        : tr.kind === 'stop' && tr.pnlPct != null ? (tr.pnlPct * 100).toFixed(1)+'%'
+      const right2 = tr.kind === 'buy' && tr.mc ? fmtMc(tr.mc)+' MC'
+        : tr.kind === 'stop' && tr.pnlPct != null ? (tr.pnlPct * 100).toFixed(1).replace('-', '−')+'%'
         : tr.mult ? tr.mult.toFixed(1)+'x' : '';
       return '<div class="act"><div class="act-av">'+tokAv(tr.icon, tr.symbol)+'<i class="'+badge+'">'+mark+'</i></div>'+
         '<div class="act-m"><div class="act-t">'+title+'</div><div class="act-s">'+sub+'</div></div>'+
@@ -1087,11 +1157,11 @@
   function termHeader(title) {
     return '<header class="term-top"><button type="button" class="term-back" id="termBack" aria-label="Back">'+chev()+'</button>'+
       '<div class="term-title">'+title+'</div>'+
-      '<button type="button" class="term-share" id="termShare"><svg viewBox="0 0 24 24" width="16" height="16"><path d="M4 12v7a1 1 0 001 1h14a1 1 0 001-1v-7M16 6l-4-4-4 4M12 2v14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg> Share</button></header>';
+      '<button type="button" class="term-share" id="termShare"><svg viewBox="0 0 24 24" width="16" height="16"><path d="M12 14V4M8.5 7.5L12 4l3.5 3.5M7 10v8.5A1.5 1.5 0 008.5 20h7a1.5 1.5 0 001.5-1.5V10" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"/></svg> Share</button></header>';
   }
   function chev() { return '<svg viewBox="0 0 24 24" width="22" height="22"><path d="M15 18l-6-6 6-6" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>'; }
   function botFace() {
-    return '<span class="term-face" aria-hidden="true"><svg viewBox="0 0 32 32" width="28" height="28"><circle cx="16" cy="16" r="16" fill="#f4f4f5"/><circle cx="11.5" cy="14" r="2" fill="#111"/><circle cx="20.5" cy="14" r="2" fill="#111"/><path d="M11 20c1.6 2.2 8.4 2.2 10 0" fill="none" stroke="#111" stroke-width="1.7" stroke-linecap="round"/></svg></span>';
+    return '<span class="term-face" aria-hidden="true"><svg viewBox="0 0 32 32" width="28" height="28"><circle cx="16" cy="16" r="16" fill="#f2f2f4"/><rect x="10.15" y="10.2" width="3.7" height="11.6" rx="1.85" fill="#111"/><rect x="18.15" y="10.2" width="3.7" height="11.6" rx="1.85" fill="#111"/></svg></span>';
   }
 
   function renderTerm() {
@@ -1103,15 +1173,15 @@
       bannerHTML()+
       '<div class="term-botrow"><button type="button" class="term-botid" id="termBotBtn">'+botFace()+' <span>Meme Bot</span> <i>›</i></button>'+pillLive()+'</div>'+
       '<div class="term-hero">'+
-      '<div class="term-chart" id="termChart"><canvas></canvas><div class="term-dot" id="termDot"></div><div class="term-hint" id="termHint">Waiting for first trade…</div><div class="term-bubs"></div></div>'+
-      '<div class="term-sub"><span>Solana · '+openN()+' open</span><span id="termClock">'+clockNow()+'</span></div>'+
+      '<div class="term-chart" id="termChart"><canvas></canvas><div class="term-dot" id="termDot"></div><div class="term-endav" id="termEndAv" hidden></div><div class="term-hint" id="termHint">Waiting for first trade…</div><div class="term-bubs"></div></div>'+
+      '<div class="term-sub"><span class="term-sub-l" id="termSubLeft">'+sublineLeft()+'</span><span id="termClock">'+clockNow()+'</span></div>'+
       '<div class="term-balwrap">'+odometerHTML(p.eq, balCls)+flashHTML()+'</div>'+
-      '<div class="term-pnl"><span class="'+(p.pnl >= 0 ? 'up' : 'dn')+'">'+(p.pnl >= 0 ? '▲' : '▼')+' '+fmtUsd(Math.abs(p.pnl))+' ('+Math.abs(p.pct).toFixed(2)+'%)</span><span class="term-mult">'+p.mult.toFixed(2)+'×</span></div>'+
+      '<div class="term-pnl"><span class="'+(p.pnl >= 0 ? 'up' : 'dn')+'">'+(p.pnl >= 0 ? '▲' : '▼')+' '+fmtUsd(Math.abs(p.pnl))+' ('+Math.abs(p.pct).toFixed(2)+'%)</span><span class="term-mult">'+p.mult.toFixed(2)+'x</span></div>'+
       '</div>'+
       '<div class="term-tfs">'+['LIVE','1H','4H','1D','1W','ALL'].map(t => '<button type="button" data-tf="'+t+'" class="'+(bot.tf === t ? 'on' : '')+'">'+(t === 'LIVE' ? '• LIVE' : t)+'</button>').join('')+'</div>'+
-      '<div class="term-h3">Agents <span>4 running</span></div>'+agentsHTML()+
+      '<div class="term-h3">Agents <span>'+(bot.running || bot._demoLive ? '4 running' : 'idle')+'</span></div>'+agentsHTML()+
       '<div class="term-h3">Activity <span>'+bot.trades.length+' trade'+(bot.trades.length === 1 ? '' : 's')+'</span></div>'+
-      '<div class="term-act">'+activityHTML()+'</div>'+positionsHTML()+
+      '<div class="term-act">'+activityHTML()+'</div>'+(bot._demoApplied ? '' : positionsHTML())+
       '<div class="term-foot"><button type="button" class="term-cta '+(bot.running ? 'stop' : '')+'" id="termToggle">'+(bot.running ? 'Pause bot' : (bot.settings.mode === 'LIVE' ? 'Start LIVE bot' : 'Start paper bot'))+'</button>'+
       '<button type="button" class="term-link" id="termWallet">Wallet</button>'+
       '<button type="button" class="term-link" id="termSettings">Settings</button></div>'+
@@ -1153,6 +1223,7 @@
       else { el.className = 'term-bal ' + cls; el.dataset.v = p.eq; el.textContent = fmtUsd(p.eq); fitBalance(el, el.textContent); }
     }
     const cl = $('#termClock'); if (cl) cl.textContent = clockNow();
+    const sl = $('#termSubLeft'); if (sl) sl.innerHTML = sublineLeft();
     const wrap = document.querySelector('.term-balwrap');
     if (wrap) {
       const f = wrap.querySelector('.term-flash');
@@ -1161,7 +1232,7 @@
       else if (!html && f) f.remove();
     }
     const pnl = document.querySelector('.term-pnl');
-    if (pnl) pnl.innerHTML = '<span class="'+(p.pnl >= 0 ? 'up' : 'dn')+'">'+(p.pnl >= 0 ? '▲' : '▼')+' '+fmtUsd(Math.abs(p.pnl))+' ('+Math.abs(p.pct).toFixed(2)+'%)</span><span class="term-mult">'+p.mult.toFixed(2)+'×</span>';
+    if (pnl) pnl.innerHTML = '<span class="'+(p.pnl >= 0 ? 'up' : 'dn')+'">'+(p.pnl >= 0 ? '▲' : '▼')+' '+fmtUsd(Math.abs(p.pnl))+' ('+Math.abs(p.pct).toFixed(2)+'%)</span><span class="term-mult">'+p.mult.toFixed(2)+'x</span>';
     const ag = document.querySelector('.term-agents');
     if (ag) ag.outerHTML = agentsHTML();
     const act = document.querySelector('.term-act');
@@ -1342,60 +1413,84 @@
     const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40"><circle cx="20" cy="20" r="20" fill="'+bg+'"/><text x="20" y="25" text-anchor="middle" font-size="15" font-family="-apple-system,system-ui,sans-serif" font-weight="700" fill="#fff">'+letter+'</text></svg>';
     return 'data:image/svg+xml;utf8,' + encodeURIComponent(svg);
   }
+  function icoPussy() {
+    const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40"><circle cx="20" cy="20" r="20" fill="#0b2f16"/><path fill="#d4ff3d" d="M20 6.5l11.2 21.2-11.2-4.6-11.2 4.6z"/><path fill="#8fbf22" d="M20 23.1l11.2 4.6L20 33.6z"/></svg>';
+    return 'data:image/svg+xml;utf8,' + encodeURIComponent(svg);
+  }
+  function icoAlice() {
+    const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40"><defs><clipPath id="c"><circle cx="20" cy="20" r="20"/></clipPath></defs><g clip-path="url(#c)"><rect width="40" height="40" fill="#1a1428"/><ellipse cx="20" cy="24" rx="16" ry="16" fill="#1c1018"/><ellipse cx="20" cy="36" rx="8" ry="7" fill="#2a1628"/><ellipse cx="20" cy="33.5" rx="5.5" ry="5" fill="#d4a07a"/><ellipse cx="20" cy="20" rx="8.6" ry="10" fill="#e6b48c"/><path d="M6 22 Q10 4 20 5.5 Q30 4 34 22 Q31 8 20 8.5 Q9 8 6 22Z" fill="#14080e"/><path d="M12 8 Q20 2 28 8" fill="#1c0c12"/><ellipse cx="16.6" cy="21" rx="1.25" ry="1.55" fill="#1a1010"/><ellipse cx="23.4" cy="21" rx="1.25" ry="1.55" fill="#1a1010"/><path d="M18 25.4 Q20 26.8 22 25.4" fill="none" stroke="#c47868" stroke-width=".9" stroke-linecap="round"/><path d="M6 40 Q20 29 34 40" fill="#2a1630"/></g></svg>';
+    return 'data:image/svg+xml;utf8,' + encodeURIComponent(svg);
+  }
   function loadDemoData() {
     const now = Date.now();
-    const T = m => now - (18 - m) * 60e3;
-    const icoN = demoIcon('#3d8bff', 'N');
-    const icoR = demoIcon('#ff7a3d', 'R');
-    const icoP = demoIcon('#1ee36a', 'P');
+    bot._demoNow = now;
+    bot._demoClock = '10:46 PM';
+    const ago = (min, sec) => now - (min * 60 + (sec || 0)) * 1000;
+    const icoP = icoPussy();
+    const icoA = icoAlice();
+    const icoB = demoIcon('#6b7280', 'P');
+    // Equity: $231.70 start → $816.87. Visual: wiggle, rise, long plateau with dots, rocket.
     const key = [
-      [0, 200], [1, 200.2], [2, 199.8], [2.8, 200],
-      [3, 200], [4, 206], [5, 214], [6, 228], [7, 238],
-      [8, 248], [8.2, 248], [10, 248], [10.5, 252], [11, 246], [11.5, 242],
-      [12, 244.9], [13, 245], [14, 245], [14.5, 258], [15, 272], [15.5, 290],
-      [16, 308], [16.5, 322], [17, 307], [17.2, 312], [17.6, 318], [18, 324.4]
+      [19.8, 231.70], [19.2, 233.4], [18.7, 229.8], [18.2, 231.70],
+      [17.8, 231.70],
+      [17.0, 280], [16.3, 340], [15.6, 380], [15.2, 394.36],
+      [14.8, 394.36], [13.6, 396.2], [12.4, 393.4], [11.2, 394.8],
+      [10.2, 394.36], [9.2, 395.0], [8.2, 393.8], [7.2, 394.36],
+      [6.6, 391.99], [6.2, 391.99],
+      [5.6, 430], [5.1, 468], [4.6, 510], [4.2, 490],
+      [3.7, 560], [3.2, 620], [2.8, 598], [2.3, 680],
+      [1.8, 730], [1.3, 710], [0.9, 778], [0.5, 804], [0.2, 792], [0, 816.87]
     ];
-    const pts = key.map(([m, v]) => ({ t: T(m), v }));
+    // minutes-ago → timestamp; later keys override earlier at same t via interpolation
+    const pts = key.map(([m, v]) => ({ t: now - m * 60e3, v }));
+    pts.sort((a, b) => a.t - b.t);
     bot.equity = [];
-    for (let ts = pts[0].t; ts <= now; ts += 12000) {
+    for (let ts = pts[0].t; ts <= now; ts += 8000) {
       let a = pts[0], b = pts[pts.length - 1];
       for (let i = 0; i < pts.length - 1; i++) if (ts >= pts[i].t && ts <= pts[i + 1].t) { a = pts[i]; b = pts[i + 1]; break; }
       if (ts >= pts[pts.length - 1].t) { bot.equity.push({ t: ts, v: pts[pts.length - 1].v }); continue; }
       const k = (ts - a.t) / (b.t - a.t || 1);
       bot.equity.push({ t: ts, v: a.v + (b.v - a.v) * k });
     }
-    bot.equity.push({ t: now, v: 324.40 });
-    bot.startUsd = 200;
-    bot.startTs = T(0);
-    bot.cashUsd = 324.40;
-    bot.dayStartEquity = 200;
-    bot.positions = [];
+    bot.equity.push({ t: now, v: 816.87 });
+    bot.startUsd = 816.87 / 3.5255;
+    bot.startTs = pts[0].t;
+    bot.cashUsd = 215.60;
+    bot.dayStartEquity = bot.startUsd;
+    bot.positions = [{
+      id: 'd-open', mint: 'demo-pussy', symbol: 'PUSSY', icon: icoP,
+      amount: 1, entryPx: 176.40, peakPx: 601.27, costUsd: 176.40,
+      entryMc: 375000, _mc: 375000, openedAt: ago(10)
+    }];
     bot.trades = [
-      { id: 'd1', t: T(17), kind: 'sell', symbol: 'PEBBLE', icon: icoP, usd: 90, pnlUsd: 62, pnlPct: 62 / 28, mult: 3.21, agent: 'Brain', note: 'took profit', mc: 412000, frac: 1 },
-      { id: 'd2', t: T(14), kind: 'buy', symbol: 'PEBBLE', icon: icoP, usd: 28, agent: 'Executor', note: 'entry', mc: 280000 },
-      { id: 'd3', t: T(12), kind: 'stop', symbol: 'RIPP', icon: icoR, usd: 20.9, pnlUsd: -3.10, pnlPct: -0.129, agent: 'Brain', note: 'stop −12%', mc: 190000 },
-      { id: 'd4', t: T(10), kind: 'buy', symbol: 'RIPP', icon: icoR, usd: 24, agent: 'Executor', note: 'entry', mc: 210000 },
-      { id: 'd5', t: T(8), kind: 'sell', symbol: 'NOVA', icon: icoN, usd: 68, pnlUsd: 48, pnlPct: 2.4, mult: 3.40, agent: 'Brain', note: 'took profit', mc: 640000, frac: 1 },
-      { id: 'd6', t: T(3), kind: 'buy', symbol: 'NOVA', icon: icoN, usd: 20, agent: 'Executor', note: 'entry', mc: 375000 }
+      { id: 'd1', t: ago(6.2), kind: 'buy', symbol: 'PUSSY', icon: icoP, usd: 176.40, agent: 'Executor', note: 'entry', mc: 375000, clock: '10:36 PM' },
+      { id: 'd2', t: ago(7.4), kind: 'stop', symbol: 'Alice', icon: icoA, usd: 37.07, pnlUsd: -2.37, pnlPct: -0.06, agent: 'Brain', note: 'stop −6%', mc: 261000, clock: '10:35 PM' },
+      { id: 'd3', t: ago(9.0), kind: 'buy', symbol: 'Alice', icon: icoA, usd: 39.44, agent: 'Executor', note: 'entry', mc: 261000, clock: '10:33 PM' },
+      { id: 'd4', t: ago(15.2), kind: 'sell', symbol: 'Alice', icon: icoA, usd: 278.85, pnlUsd: 162.66, pnlPct: 1.40, mult: 2.40, agent: 'Brain', note: 'took profit', mc: 310000, frac: 1, clock: '10:32 PM' },
+      { id: 'd5', t: ago(17.8), kind: 'buy', symbol: 'Alice', icon: icoA, usd: 116.19, agent: 'Executor', note: 'entry', mc: 190000, clock: '10:29 PM' },
+      { id: 'd6', t: ago(19.4), kind: 'sell', symbol: 'PEBBLE', icon: icoB, usd: 48.1, pnlUsd: 22.10, pnlPct: 0.85, mult: 1.85, agent: 'Brain', note: 'took profit', mc: 140000, frac: 1, clock: '10:27 PM' }
     ];
-    bot.lastFlash = { t: now - 20000, usd: 62, kind: 'sell' };
+    bot.lastFlash = null;
     bot.agents = {
-      scanner: { status: 'hot', detail: '1,284 pools', n: 1284 },
-      analyst: { status: 'hot', detail: 'PEBBLE score 88', token: { symbol: 'PEBBLE', icon: icoP }, score: 88 },
-      executor: { status: 'hot', detail: 'bought $28', token: { symbol: 'PEBBLE', icon: icoP } },
-      brain: { status: 'hot', detail: 'sold 3.21x', token: { symbol: 'PEBBLE', icon: icoP } }
+      scanner: { status: 'hot', detail: '2,030 pools', n: 2030 },
+      analyst: { status: 'hot', detail: 'PUSSY score 92', token: { symbol: 'PUSSY', icon: icoP }, score: 92 },
+      executor: { status: 'hot', detail: 'bought $176', token: { symbol: 'PUSSY', icon: icoP } },
+      brain: { status: 'hot', detail: 'sold 3.5x', token: { symbol: 'PUSSY', icon: icoP } }
     };
     bot.tf = 'LIVE';
     bot.settings.mode = 'PAPER';
     bot.running = false;
+    bot._demoLive = true;
     bot.halted = null;
     bot._skipSave = true;
   }
   function applyDemo() {
     if (bot._demoApplied) return;
     bot._demoApplied = true;
+    try { ls.set('bot:hideBanner', 1); } catch {}
     loadDemoData();
   }
+
   async function renderBot() {
     document.body.classList.add('term-on');
     $('#backBtn').hidden = true;

@@ -1,6 +1,6 @@
-const VERSION = 'memesignals-v5';
-const SHELL = ['./', './index.html', './styles.css', './app.js',
-  './vendor/lightweight-charts.standalone.production.js', './manifest.webmanifest',
+const VERSION = 'memesignals-v6';
+const SHELL = ['./', './index.html', './styles.css', './app.js', './bot-strategy.js', './bot.js',
+  './vendor/lightweight-charts.standalone.production.js', './vendor/solana.bundle.js', './manifest.webmanifest',
   './icons/icon-192.png', './icons/icon-512.png', './icons/icon-maskable-512.png',
   './icons/apple-touch-icon.png', './icons/favicon-32.png'];
 const IMG_CACHE = 'coinsignals-img';

@@ -362,3 +362,27 @@ svg.term-empty-ico{width:52px!important;height:52px!important}
   .tabbar a svg{width:22px;height:22px}
 }
 
+/* v10: six agents + agent log */
+.term-agents.six{gap:10px}
+.term-agents.six .agcard{min-height:82px;padding:11px 8px;text-align:left;color:inherit;font:inherit;width:100%;cursor:pointer;-webkit-appearance:none;appearance:none}
+.agbot .bad{color:#ff5a52;font-weight:650}
+.agbot .warn{color:#ffb340;font-weight:650}
+.term-h3 .lg-open{background:none;border:0;color:#1ee36a;font-size:14px;font-weight:600;padding:0;cursor:pointer}
+.lg-chips{display:flex;gap:6px;overflow-x:auto;padding:4px 16px 10px;scrollbar-width:none;-webkit-overflow-scrolling:touch}
+.lg-chips::-webkit-scrollbar{display:none}
+.lg-chips button{flex:none;display:inline-flex;align-items:center;gap:6px;border:1px solid rgba(255,255,255,.1);background:#1c1c1e;color:#d1d1d6;border-radius:999px;padding:7px 12px;font-size:13px;font-weight:650;cursor:pointer}
+.lg-chips button.on{background:#f2f2f4;color:#000;border-color:#f2f2f4}
+.lg-chips i{width:8px;height:8px;border-radius:50%;display:inline-block}
+.lg-cycle{color:#8e8e93;font-size:12px;padding:0 16px 8px}
+.lg-sum{display:flex;flex-wrap:wrap;gap:6px;padding:0 16px 10px}
+.lg-chip{background:rgba(255,90,82,.12);color:#ff8a84;border-radius:8px;padding:4px 8px;font-size:12px;font-weight:600}
+.lg-chip b{color:#fff;margin-left:2px}
+.lgr{display:grid;grid-template-columns:48px 1fr auto;gap:10px;align-items:start;padding:10px 16px;border-bottom:1px solid rgba(255,255,255,.05)}
+.lgr .act-av{margin-top:2px}
+.lgr .act-t{font-size:14px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lg-st{font-weight:800}
+.lgr.k-kill .lg-st{color:#ff5a52}
+.lgr.k-pass .lg-st,.lgr.k-trade .lg-st{color:#1ee36a}
+.lg-why{color:#8e8e93;font-size:12px;margin-top:2px;line-height:1.35;word-break:break-word;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.act-av i.lg-dot{width:12px;height:12px;right:-1px;bottom:-1px}
+.lgr .act-r{font-size:14px;white-space:nowrap}

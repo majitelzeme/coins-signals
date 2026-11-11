@@ -839,6 +839,7 @@ function tfSegHTML(active) {
 function destroyMcChart() {
   if (chartState.timer) { clearInterval(chartState.timer); }
   if (chartState.ro) { try { chartState.ro.disconnect(); } catch {} }
+  if (chartState.badges && chartState.series) { try { chartState.series.detachPrimitive(chartState.badges); } catch {} }
   if (chartState.markers && chartState.markers.detach) { try { chartState.markers.detach(); } catch {} }
   if (chartState.chart) { try { chartState.chart.remove(); } catch {} }
   chartState = {};
@@ -923,12 +924,9 @@ function signalMarkers(candles, kind, tfId) {
   const n = candles.length, out = [];
   if (n < 13) return out;
   const closes = candles.map(c => c.close);
-  const hi = Math.max(...candles.map(c => c.high));
   const push = (i, dir) => {
-    const low = hi ? candles[i].low / hi < 0.18 : false;
-    out.push(dir === 'buy'
-      ? { time: candles[i].time, position: low ? 'aboveBar' : 'belowBar', color: '#32d074', shape: 'arrowUp', text: 'BUY', size: 1.5 }
-      : { time: candles[i].time, position: 'aboveBar', color: '#ff5a52', shape: 'arrowDown', text: 'SELL', size: 1.5 });
+    const c = candles[i];
+    out.push({ time: c.time, dir, price: dir === 'buy' ? c.low : c.high, low: c.low, high: c.high });
   };
   const confirm = 2, cooldown = Math.max(8, Math.round(n / 20));
   const emit = (raw) => {
@@ -984,24 +982,221 @@ function signalMarkers(candles, kind, tfId) {
   emit(raw);
   return out;
 }
+const BADGE = {
+  buy: '#16c784', sell: '#ea3943', entry: '#5e9eff',
+  buyGlow: 'rgba(22,199,132,.55)', sellGlow: 'rgba(234,57,67,.55)', entryGlow: 'rgba(94,158,255,.5)'
+};
+function planItems(plan, fac) {
+  const items = [];
+  if (!plan) return items;
+  const add = (pricePx, color, title) => {
+    const price = fac ? pricePx * fac : pricePx;
+    if (!isFinite(price)) return;
+    items.push({ price, color, title, label: title + '  ' + fmtMcVal(price) });
+  };
+  if (plan.entry && Array.isArray(plan.entry)) {
+    add(plan.entry[0], BADGE.entry, 'Entry');
+    if (Math.abs(plan.entry[1] - plan.entry[0]) / Math.max(Math.abs(plan.entry[1]), 1e-12) > 0.006) add(plan.entry[1], BADGE.entry, 'Entry');
+  } else if (plan.price) add(plan.price, BADGE.entry, 'Entry');
+  if (plan.stop) add(plan.stop, BADGE.sell, 'Stop');
+  if (plan.tp) add(plan.tp, BADGE.buy, 'TP');
+  if (plan.tp1) add(plan.tp1, BADGE.buy, 'TP1');
+  if (plan.tp2) add(plan.tp2, BADGE.buy, 'TP2');
+  return items;
+}
 function setPlanLines(series, plan, fac, LW) {
   (chartState.lines || []).forEach(l => { try { series.removePriceLine(l); } catch {} });
   chartState.lines = [];
   if (!plan || !series) return;
-  const add = (pricePx, color, title) => {
-    const price = fac ? pricePx * fac : pricePx;
-    if (!isFinite(price)) return;
-    chartState.lines.push(series.createPriceLine({ price, color, lineWidth: 1, lineStyle: LW.LineStyle.Dashed, axisLabelVisible: true, title }));
-  };
-  if (plan.entry && Array.isArray(plan.entry)) {
-    add(plan.entry[0], '#5e9eff', 'Entry');
-    add(plan.entry[1], '#5e9eff', 'BUY');
-  } else if (plan.price) add(plan.price, '#5e9eff', 'BUY');
-  if (plan.stop) add(plan.stop, '#ff5a52', 'Stop');
-  if (plan.tp) add(plan.tp, '#32d074', 'TP');
-  if (plan.tp1) add(plan.tp1, '#32d074', 'TP1');
-  if (plan.tp2) add(plan.tp2, '#2bb866', 'TP2');
+  planItems(plan, fac).forEach(it => {
+    chartState.lines.push(series.createPriceLine({
+      price: it.price, color: it.color, lineWidth: 1, lineStyle: LW.LineStyle.Dashed,
+      axisLabelVisible: false, title: '', lastValueVisible: false
+    }));
+  });
 }
+function lightenHex(hex, amt) {
+  const n = hex.replace('#', '');
+  const r = parseInt(n.slice(0, 2), 16), g = parseInt(n.slice(2, 4), 16), b = parseInt(n.slice(4, 6), 16);
+  const m = v => Math.min(255, Math.round(v + (255 - v) * amt));
+  return `rgb(${m(r)},${m(g)},${m(b)})`;
+}
+function roundRectPath(ctx, x, y, w, h, r) {
+  const rr = Math.min(r, w / 2, h / 2);
+  ctx.moveTo(x + rr, y);
+  ctx.arcTo(x + w, y, x + w, y + h, rr);
+  ctx.arcTo(x + w, y + h, x, y + h, rr);
+  ctx.arcTo(x, y + h, x, y, rr);
+  ctx.arcTo(x, y, x + w, y, rr);
+  ctx.closePath();
+}
+function measurePill(ctx, text, fontSize) {
+  const size = fontSize || 11;
+  ctx.font = '700 ' + size + 'px -apple-system,BlinkMacSystemFont,"SF Pro Text",system-ui,sans-serif';
+  return { w: Math.ceil(ctx.measureText(text).width) + 14, h: size >= 11 ? 20 : 18, size };
+}
+function drawBadgePill(ctx, box, text, color, glow, pointer, fontSize) {
+  const { x, y, w, h } = box;
+  const cx = x + w / 2, cy = y + h / 2;
+  const triW = 6.5, triH = 5, r = Math.min(8, h / 2);
+  ctx.save();
+  // tight drop shadow, light color glow
+  ctx.shadowColor = 'rgba(0,0,0,.55)';
+  ctx.shadowBlur = 5;
+  ctx.shadowOffsetY = 1;
+  ctx.shadowOffsetX = 0;
+  const fillBody = () => {
+    const grad = ctx.createLinearGradient(0, y, 0, y + h);
+    grad.addColorStop(0, lightenHex(color, 0.18));
+    grad.addColorStop(0.6, color);
+    grad.addColorStop(1, color);
+    ctx.fillStyle = grad;
+    ctx.fill();
+  };
+  ctx.beginPath();
+  roundRectPath(ctx, x, y, w, h, r);
+  fillBody();
+  ctx.shadowColor = 'transparent';
+  ctx.shadowBlur = 0;
+  // crisp pointer, slightly overlapping the body so it reads as one badge
+  ctx.beginPath();
+  if (pointer === 'up') { ctx.moveTo(cx - triW / 2, y + 1.2); ctx.lineTo(cx, y - triH); ctx.lineTo(cx + triW / 2, y + 1.2); }
+  else if (pointer === 'down') { ctx.moveTo(cx - triW / 2, y + h - 1.2); ctx.lineTo(cx, y + h + triH); ctx.lineTo(cx + triW / 2, y + h - 1.2); }
+  else if (pointer === 'left') { ctx.moveTo(x + 1.2, cy - triW / 2); ctx.lineTo(x - triH, cy); ctx.lineTo(x + 1.2, cy + triW / 2); }
+  ctx.closePath();
+  ctx.fillStyle = pointer === 'up' || pointer === 'left' ? lightenHex(color, 0.12) : color;
+  ctx.fill();
+  // soft color halo (no blur-blob)
+  ctx.globalAlpha = 0.28;
+  ctx.shadowColor = glow;
+  ctx.shadowBlur = 8;
+  ctx.beginPath();
+  roundRectPath(ctx, x, y, w, h, r);
+  ctx.fillStyle = color;
+  ctx.fill();
+  ctx.globalAlpha = 1;
+  ctx.shadowColor = 'transparent';
+  ctx.shadowBlur = 0;
+  // sheen
+  ctx.beginPath();
+  roundRectPath(ctx, x + 0.6, y + 0.6, w - 1.2, Math.max(6, h * 0.42), r - 1);
+  ctx.fillStyle = 'rgba(255,255,255,.18)';
+  ctx.fill();
+  ctx.font = '700 ' + (fontSize || 11) + 'px -apple-system,BlinkMacSystemFont,"SF Pro Text",system-ui,sans-serif';
+  ctx.fillStyle = '#fff';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, cx, cy + 0.4);
+  ctx.restore();
+}
+function overlaps(a, b, pad) {
+  const p = pad || 3;
+  return a.x < b.x + b.w + p && a.x + a.w + p > b.x && a.y < b.y + b.h + p && a.y + a.h + p > b.y;
+}
+class ChartBadges {
+  constructor() { this._marks = []; this._plans = []; this._boxes = []; this._pv = [{ zOrder: () => 'top', renderer: () => this._renderer() }]; }
+  attached(param) { this._chart = param.chart; this._series = param.series; this._requestUpdate = param.requestUpdate; }
+  detached() { this._chart = this._series = this._requestUpdate = null; }
+  setData(marks, plans) { this._marks = marks || []; this._plans = plans || []; if (this._requestUpdate) this._requestUpdate(); }
+  boxes() { return this._boxes; }
+  updateAllViews() {}
+  paneViews() { return this._pv; }
+  _renderer() {
+    const self = this;
+    return {
+      draw(target) {
+        const chart = self._chart, series = self._series;
+        if (!chart || !series) return;
+        const paint = (ctx, width, height) => {
+          const ts = chart.timeScale();
+          const boxes = [];
+          const planReserve = 92;
+          // --- plan labels on the right first, so marks can avoid them ---
+          const plans = (self._plans || []).slice().sort((a, b) => b.price - a.price);
+          const planBoxes = [];
+          plans.forEach(it => {
+            const y = series.priceToCoordinate(it.price);
+            if (y == null) return;
+            const sz = measurePill(ctx, it.label, 10);
+            let x0 = Math.round(width - sz.w - 6);
+            let y0 = Math.round(y - sz.h / 2);
+            y0 = Math.max(2, Math.min(height - sz.h - 2, y0));
+            const box = { x: x0, y: y0, w: sz.w, h: sz.h, text: it.label, color: it.color, glow: it.color === BADGE.sell ? BADGE.sellGlow : it.color === BADGE.entry ? BADGE.entryGlow : BADGE.buyGlow, pointer: 'left', kind: 'plan', size: 10 };
+            planBoxes.forEach(p => {
+              if (overlaps(box, p, 3)) {
+                if (box.y >= p.y) box.y = Math.min(height - box.h - 2, p.y + p.h + 3);
+                else box.y = Math.max(2, p.y - box.h - 3);
+              }
+            });
+            planBoxes.push(box);
+            boxes.push(box);
+          });
+          // --- signal markers ---
+          const placed = [];
+          const marks = self._marks || [];
+          const xs = marks.map(m => ts.timeToCoordinate(m.time));
+          marks.forEach((m, idx) => {
+            const x = xs[idx];
+            const yAnchor = series.priceToCoordinate(m.dir === 'buy' ? m.low : m.high);
+            if (x == null || yAnchor == null) return;
+            if (x > width - planReserve) return; // keep the right edge for plan labels
+            let close = false;
+            xs.forEach((nx, j) => { if (j !== idx && nx != null && Math.abs(nx - x) < 50) close = true; });
+            const text = m.dir === 'buy' ? (close ? 'B' : 'BUY') : (close ? 'S' : 'SELL');
+            const sz = measurePill(ctx, text, close ? 11 : 11);
+            const gap = 8, tri = 5;
+            let pointer = m.dir === 'buy' ? 'up' : 'down';
+            let x0 = Math.round(x - sz.w / 2), y0;
+            if (pointer === 'up') y0 = Math.round(yAnchor + gap + tri);
+            else y0 = Math.round(yAnchor - gap - tri - sz.h);
+            if (y0 < 2) { pointer = 'up'; y0 = Math.round(yAnchor + gap + tri); }
+            if (y0 + sz.h > height - 2) { pointer = 'down'; y0 = Math.round(yAnchor - gap - tri - sz.h); }
+            x0 = Math.max(2, Math.min(width - planReserve - sz.w, x0));
+            y0 = Math.max(2, Math.min(height - sz.h - 2, y0));
+            const box = { x: x0, y: y0, w: sz.w, h: sz.h, text, color: m.dir === 'buy' ? BADGE.buy : BADGE.sell, glow: m.dir === 'buy' ? BADGE.buyGlow : BADGE.sellGlow, pointer, kind: 'mark', dir: m.dir, size: 11 };
+            [...placed, ...planBoxes].forEach(p => {
+              if (!overlaps(box, p, 4)) return;
+              if (box.dir === 'buy') box.y = Math.min(height - box.h - 2, Math.max(p.y + p.h + 4, box.y));
+              else box.y = Math.max(2, Math.min(p.y - box.h - 4, box.y));
+            });
+            if (planBoxes.some(p => overlaps(box, p, 2))) return;
+            placed.push(box);
+            boxes.push(box);
+          });
+          boxes.filter(b => b.kind === 'plan').forEach(b => drawBadgePill(ctx, b, b.text, b.color, b.glow, b.pointer, b.size));
+          boxes.filter(b => b.kind === 'mark').forEach(b => drawBadgePill(ctx, b, b.text, b.color, b.glow, b.pointer, b.size));
+          self._boxes = boxes;
+          chartState.badgeBoxes = boxes;
+          try {
+            const el = series.getPane && series.getPane().getHTMLElement && series.getPane().getHTMLElement();
+            const r = el && el.getBoundingClientRect();
+            window.__badgeBoxes = { boxes, pane: r ? { x: r.left, y: r.top, w: r.width, h: r.height, dpr: window.devicePixelRatio || 1 } : null };
+          } catch { window.__badgeBoxes = { boxes, pane: null }; }
+        };
+        if (target.useMediaCoordinateSpace) {
+          target.useMediaCoordinateSpace(({ context, mediaSize }) => paint(context, mediaSize.width, mediaSize.height));
+        } else {
+          target.useBitmapCoordinateSpace(({ context, horizontalPixelRatio, verticalPixelRatio, mediaSize }) => {
+            context.save();
+            context.scale(horizontalPixelRatio, verticalPixelRatio);
+            paint(context, mediaSize.width, mediaSize.height);
+            context.restore();
+          });
+        }
+      }
+    };
+  }
+}
+function applyChartBadges(series, marks, plan, fac) {
+  const LW = window.LightweightCharts;
+  setPlanLines(series, plan, fac, LW);
+  if (!chartState.badges) {
+    chartState.badges = new ChartBadges();
+    series.attachPrimitive(chartState.badges);
+  }
+  chartState.badges.setData(marks, planItems(plan, fac));
+}
+
 function fmtOhlcHud(bar, prev) {
   if (!bar) return '';
   const ch = prev && prev.close ? (bar.close / prev.close - 1) * 100 : null;
@@ -1080,18 +1275,15 @@ async function loadAndDrawChart() {
     if (!raw || !raw.length) { host.innerHTML = `<div class="chart-empty mut">No candle data for this timeframe.${st.dsUrl ? `<br><a href="${esc(st.dsUrl)}" target="_blank" rel="noopener">Open DexScreener</a>` : ''}</div>`; return; }
     const packed = barsFromOhlcvList(raw, fac || 1);
     st.bars = packed.candles;
-    if (st.chart) { try { st.chart.remove(); } catch {} st.chart = st.series = st.vol = st.markers = null; }
+    if (st.chart) { try { st.chart.remove(); } catch {} st.chart = st.series = st.vol = st.markers = st.badges = null; }
     const inst = createMcChart(host);
     if (!inst) return;
-    const LW = window.LightweightCharts;
     st.chart = inst.chart; st.series = inst.series; st.vol = inst.vol;
     inst.series.setData(packed.candles.map(({ time, open, high, low, close }) => ({ time, open, high, low, close })));
     inst.vol.setData(packed.volume);
     const marks = signalMarkers(packed.candles, st.kind === 'coin' ? 'coin' : 'token', st.tf);
     st.markCount = marks.length;
-    st.markers = LW.createSeriesMarkers(inst.series, marks, { autoScale: false });
-
-    setPlanLines(inst.series, st.plan, fac, LW);
+    applyChartBadges(inst.series, marks, st.plan, fac);
     inst.chart.timeScale().fitContent();
     paintOhlc();
     inst.chart.subscribeCrosshairMove(param => {
@@ -1142,9 +1334,8 @@ async function tickTokenChart() {
         st.series.setData(packed.candles.map(({ time, open, high, low, close }) => ({ time, open, high, low, close })));
         st.vol.setData(packed.volume);
         const marks = signalMarkers(packed.candles, 'token', st.tf);
-        if (st.markers && st.markers.setMarkers) st.markers.setMarkers(marks);
-        else st.markers = window.LightweightCharts.createSeriesMarkers(st.series, marks);
-        setPlanLines(st.series, st.plan, st.fac, window.LightweightCharts);
+        st.markCount = marks.length;
+        applyChartBadges(st.series, marks, st.plan, st.fac);
         paintOhlc();
       }
     }

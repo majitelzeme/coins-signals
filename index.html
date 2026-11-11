@@ -33,7 +33,8 @@
   <a href="#/" data-tab="fast"><svg viewBox="0 0 24 24"><path d="M13 2L4 14h7l-1 8 9-12h-7z"/></svg><span>Fast</span></a>
   <a href="#/slow" data-tab="slow"><svg viewBox="0 0 24 24"><path d="M3 17l5-5 4 4 8-8M15 8h5v5"/></svg><span>Slow</span></a>
   <a href="#/live" data-tab="live"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="2"/><path d="M16.2 7.8a6 6 0 0 1 0 8.4M7.8 16.2a6 6 0 0 1 0-8.4M19 5a10 10 0 0 1 0 14M5 19A10 10 0 0 1 5 5"/></svg><span>Live</span></a>
-  <a href="#/watch" data-tab="watch"><svg viewBox="0 0 24 24"><path d="M12 3l2.8 5.7 6.2.9-4.5 4.4 1 6.2L12 17.3 6.5 20.2l1-6.2L3 9.6l6.2-.9z"/></svg><span>Watchlist</span></a>
+  <a href="#/bot" data-tab="bot"><svg viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="14" rx="2"/><path d="M8 10h.01M12 10h.01M16 10h.01M9 14h6"/></svg><span>Bot</span></a>
+  <a href="#/watch" data-tab="watch"><svg viewBox="0 0 24 24"><path d="M12 3l2.8 5.7 6.2.9-4.5 4.4 1 6.2L12 17.3 6.5 20.2l1-6.2L3 9.6l6.2-.9z"/></svg><span>Watch</span></a>
   <a href="#/about" data-tab="about"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5v.5"/></svg><span>Info</span></a>
 </nav>
 <div id="installBar" class="installbar" hidden>
@@ -42,6 +43,9 @@
   <button id="installClose" class="x" aria-label="Dismiss">✕</button>
 </div>
 <script src="vendor/lightweight-charts.standalone.production.js"></script>
+<script src="vendor/solana.bundle.js"></script>
+<script src="bot-strategy.js"></script>
 <script src="app.js"></script>
+<script src="bot.js"></script>
 </body>
 </html>

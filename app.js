@@ -670,6 +670,8 @@ function renderAbout() {
     <p><b>Risk</b> is never "low" for these. Points for: very young pair, thin liquidity, FDV many times liquidity, more sells than buys, sharp drop, parabolic pump, no socials. <span class="risk rh">⚠ HIGH</span> <span class="risk rv">⚠ VERY HIGH</span> <span class="risk rx">⚠ EXTREME</span>. The app does <i>not</i> check mint authority, LP locks, holders or honeypot taxes. Check those on the chart page.</p>
     <h2>🐢 Slow (1–3 day swings)</h2>
     <p>Established memecoins from CoinGecko's meme category (Binance as backup). Swing score = half the hourly indicator score (RSI, SMA20/50, MACD, momentum) + 4h trend (EMA9 vs EMA21) ±20 + 4h trend slope ±10 + 7-day trend ±15, a bonus for a pullback inside an uptrend, and penalties for coins already up 25%+ today or overbought. Buy setups show an entry zone, a stop under recent swing lows, a 2:1 target and a suggested hold time.</p>
+    <h2>🤖 Bot (Meme Terminal)</h2>
+    <p>A paper or live flip bot that only trades <b>Fast Solana</b> memecoins (never Slow 2-day coins), holding about 60–90 minutes. It uses the Fast momentum score plus a strict analyst gate (RugCheck mint/freeze/LP, holder concentration, liquidity, age, volume, Jupiter price impact and a sell-side honeypot quote). Default is PAPER (live quotes, fake money). LIVE spends real SOL from a <b>separate burner wallet</b> generated on this phone — not your Phantom seed. The bot only runs while the app is open on screen.</p>
     <h2>📡 Live (J7Tracker-style)</h2>
     <p>A live stream of tokens that just got a DexScreener profile or boost, refreshed every 20 seconds, with new ones highlighted. Tap 𝕏 to open the coin's X account in the X app, <b>CA</b> to copy the contract address, Chart for DexScreener. A boost is <i>paid</i> promotion, not proof of quality.</p>
     <p class="mut">Live tweet tracking (like J7Tracker's tweet feed) needs paid X/J7 API keys, so this app links to each token's X account instead of streaming tweets.</p>
@@ -679,7 +681,7 @@ function renderAbout() {
 }
 
 // ---------- router ----------
-const TITLES = { fast: 'Fast flips', slow: 'Slow swings', live: 'Live feed', watch: 'Watchlist', about: 'How it works' };
+const TITLES = { fast: 'Fast flips', slow: 'Slow swings', live: 'Live feed', bot: 'Meme Terminal', watch: 'Watchlist', about: 'How it works' };
 function route() {
   const h = location.hash || '#/';
   if (h.startsWith('#/coin/')) return { name: 'coin', id: decodeURIComponent(h.slice(7)) };
@@ -695,8 +697,10 @@ function render() {
   const key = r.name + (r.id || r.addr || '');
   if (key !== lastRoute) { window.scrollTo(0, 0); app.style.animation = 'none'; void app.offsetWidth; app.style.animation = ''; if (r.name === 'coin' && !lastRoute.startsWith('coin')) state.tf = '7d'; lastRoute = key; }
   if (r.name !== 'coin' && r.name !== 'token') destroyMcChart();
+  if (r.name !== 'bot' && window.__botLeave) window.__botLeave();
   if (r.name === 'coin') renderDetail(r.id); else if (r.name === 'token') renderToken(r.chain, r.addr);
-  else if (r.name === 'slow') renderSlow(); else if (r.name === 'live') renderLive(); else if (r.name === 'watch') renderWatch(); else if (r.name === 'about') renderAbout(); else renderFast();
+  else if (r.name === 'slow') renderSlow(); else if (r.name === 'live') renderLive(); else if (r.name === 'bot') (window.renderBot || function(){ app.innerHTML = '<div class="empty">Bot failed to load.</div>'; })();
+  else if (r.name === 'watch') renderWatch(); else if (r.name === 'about') renderAbout(); else renderFast();
   schedule();
 }
 window.addEventListener('hashchange', render);
@@ -713,15 +717,15 @@ async function run(mod, fn, rerender) {
 }
 const on = (...names) => () => names.includes(route().name);
 const refreshSlow = (force = true) => run(state, () => loadMarkets(force), on('slow', 'watch', 'coin'));
-const refreshFast = (force = true) => run(fast, () => loadFast(force), on('fast', 'watch'));
+const refreshFast = (force = true) => run(fast, () => loadFast(force), on('fast', 'watch', 'bot'));
 const refreshLive = () => run(live, loadLive, on('live'));
-async function refresh() { const n = route().name; if (n === 'live') return refreshLive(); if (n === 'fast' || n === 'token') { if (n === 'token') render(); return refreshFast(true); } if (n === 'watch') { watchPairs = null; refreshFast(true); } return refreshSlow(true); }
+async function refresh() { const n = route().name; if (n === 'live') return refreshLive(); if (n === 'bot') { if (window.renderBot) window.renderBot(); return refreshFast(true); } if (n === 'fast' || n === 'token') { if (n === 'token') render(); return refreshFast(true); } if (n === 'watch') { watchPairs = null; refreshFast(true); } return refreshSlow(true); }
 window.refresh = refresh;
 $('#refreshBtn').onclick = () => refresh();
 function schedule() {
   if (document.visibilityState !== 'visible') return; const n = route().name, now = Date.now();
   if (n === 'live' && now - live.ts > LIVE_REFRESH) refreshLive();
-  if ((n === 'fast' || n === 'watch') && now - fast.ts > FAST_REFRESH) refreshFast(true);
+  if ((n === 'fast' || n === 'watch' || n === 'bot') && now - fast.ts > FAST_REFRESH) refreshFast(true);
   if ((n === 'slow' || n === 'watch' || n === 'coin') && now - state.ts > AUTO_REFRESH) refreshSlow(true);
 }
 setInterval(schedule, 5000);

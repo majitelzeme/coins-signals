@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Memecoin Signals</title>
+<meta name="description" content="Memecoins with live technical buy/sell signals">
+<meta name="theme-color" content="#0b0f1a">
+<meta name="color-scheme" content="dark">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="MemeSignals">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" type="image/png" sizes="32x32" href="icons/favicon-32.png">
+<link rel="apple-touch-icon" sizes="180x180" href="icons/apple-touch-icon.png">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <button class="iconbtn" id="backBtn" aria-label="Back" hidden>
+    <svg viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6"/></svg>
+  </button>
+  <div class="brand" id="title"><span class="logo"></span>Memecoin Signals</div>
+  <button class="iconbtn" id="refreshBtn" aria-label="Refresh">
+    <svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 5v6h-6"/></svg>
+  </button>
+</header>
+<div id="ptr" class="ptr"><div class="spinner"></div></div>
+<main id="app"></main>
+<div id="toast" class="toast" hidden></div>
+<nav class="tabbar">
+  <a href="#/" data-tab="home"><svg viewBox="0 0 24 24"><path d="M4 19V9M10 19V5M16 19v-7M22 19H2"/></svg><span>Coins</span></a>
+  <a href="#/watch" data-tab="watch"><svg viewBox="0 0 24 24"><path d="M12 3l2.8 5.7 6.2.9-4.5 4.4 1 6.2L12 17.3 6.5 20.2l1-6.2L3 9.6l6.2-.9z"/></svg><span>Watchlist</span></a>
+  <a href="#/about" data-tab="about"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5v.5"/></svg><span>How it works</span></a>
+</nav>
+<div id="installBar" class="installbar" hidden>
+  <span>Install Memecoin Signals on your home screen</span>
+  <button id="installBtn">Install</button>
+  <button id="installClose" class="x" aria-label="Dismiss">✕</button>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

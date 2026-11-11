@@ -73,17 +73,19 @@
   function migrateSettings(s) {
     const out = Object.assign(S.cloneDefaults(), s || {});
     if (!s) return out;
-    if (s.minLiq === 30000 || s.minLiq === 12000) out.minLiq = S.DEFAULTS.minLiq;
+    if (s.minLiq === 30000 || s.minLiq === 12000 || s.minLiq === 10000) out.minLiq = S.DEFAULTS.minLiq;
     if (s.minAgeMin === 25) out.minAgeMin = S.DEFAULTS.minAgeMin;
     if (s.maxImpactPct === 2) out.maxImpactPct = S.DEFAULTS.maxImpactPct;
-    if (s.scoreScans === 3) out.scoreScans = S.DEFAULTS.scoreScans;
+    if (s.scoreScans === 3 || s.scoreScans === 2) out.scoreScans = S.DEFAULTS.scoreScans;
     if (s.max1hChg === 300) out.max1hChg = S.DEFAULTS.max1hChg;
     if (s.liqDropPct === 0.30) out.liqDropPct = S.DEFAULTS.liqDropPct;
     if (s.posPct === 0.10) out.posPct = S.DEFAULTS.posPct;
-    if (s.maxOpen === 2) out.maxOpen = S.DEFAULTS.maxOpen;
+    if (s.maxOpen === 2 || s.maxOpen === 8) out.maxOpen = S.DEFAULTS.maxOpen;
     if (s.maxAgeH === 72) out.maxAgeH = S.DEFAULTS.maxAgeH;
-    if (s.minScore === 62) out.minScore = S.DEFAULTS.minScore;
+    if (s.minScore === 62 || s.minScore === 58) out.minScore = S.DEFAULTS.minScore;
     if (s.minLiqMcRatio === 0.06) out.minLiqMcRatio = S.DEFAULTS.minLiqMcRatio;
+    if (s.minQuoteLiq === 6000) out.minQuoteLiq = S.DEFAULTS.minQuoteLiq;
+    if (s.consecLossLimit === 2) out.consecLossLimit = S.DEFAULTS.consecLossLimit;
     return out;
   }
   function load() {
@@ -667,10 +669,21 @@
     const gate = S.canOpenMore(bot, bot.settings, now, { solPx: bot.solPx, reserveUsd: reserveUsd() });
     if (!gate.ok) { bot.agents.analyst.detail = gate.reason; bot.agents.analyst.status = 'idle'; return; }
     if (bot.cashUsd - reserveUsd() < 2) { bot.agents.analyst.detail = 'need more cash / reserve'; return; }
-    const top = scanned.candidates.slice(0, 5);
+    const slots = Math.max(1, (bot.settings.maxOpen || 10) - bot.positions.length);
+    const top = scanned.candidates.slice(0, Math.max(16, slots * 3));
     bot.agents.analyst.status = 'hot';
     if (!top.length) { bot.agents.analyst.detail = 'no safe candidates'; noteReject(['no safe candidates']); return; }
+    let bought = 0;
     for (const it of top) {
+      const gateNow = S.canOpenMore(bot, bot.settings, Date.now(), { solPx: bot.solPx, reserveUsd: reserveUsd() });
+      if (!gateNow.ok) {
+        bot.agents.analyst.detail = bought ? ('opened ' + bought + ' · ' + gateNow.reason) : gateNow.reason;
+        break;
+      }
+      if (bot.cashUsd - reserveUsd() < 2) {
+        bot.agents.analyst.detail = bought ? ('opened ' + bought + ' · need more cash') : 'need more cash / reserve';
+        break;
+      }
       if (bot.positions.some(p => p.mint === it.addr)) continue;
       if (S.tokenOnCooldown(bot, it.addr, now)) { noteReject(['token cooldown']); continue; }
       const hist = bot.scoreHist[it.addr] || (bot.scoreHist[it.addr] = []);
@@ -694,7 +707,7 @@
       }
       const solPx = await solPrice();
       const usd = S.positionUsd(equityNow(), bot.settings, reserveUsd(), bot.solPx || solPx);
-      if (usd < 1) { bot.agents.analyst.detail = 'size too small'; return; }
+      if (usd < 1) { bot.agents.analyst.detail = bought ? ('opened ' + bought + ' · size too small') : 'size too small'; break; }
       const lamports = Math.floor((usd / solPx) * 1e9);
       let quoteBuy, quoteSell;
       try {
@@ -715,9 +728,10 @@
         bot.agents.analyst.detail = (it.symbol + ' rejected: ' + verdict.reasons[0]).slice(0, 52);
         continue;
       }
-      await executeBuy(it, usd);
-      return;
+      const pos = await executeBuy(it, usd);
+      if (pos) bought++;
     }
+    if (bought) bot.agents.analyst.detail = 'opened ' + bought + ' · ' + bot.positions.length + ' open';
   }
 
   async function tickLoop() {
@@ -735,7 +749,8 @@
     } catch (e) { console.warn('bot tick', e); }
   }
   async function scanLoop() {
-    if (!bot.running) return;
+    if (!bot.running || bot._scanBusy) return;
+    bot._scanBusy = true;
     try {
       const eq = equityNow();
       bot.equityUsd = eq;
@@ -743,6 +758,7 @@
       await scanAndMaybeEnter();
       if (route().name === 'bot') patchLiveUI();
     } catch (e) { console.warn('bot scan', e); }
+    finally { bot._scanBusy = false; }
   }
   function startTimers() {
     stopTimers();
@@ -1356,7 +1372,7 @@
       '<div class="note">'+(s.mode === 'LIVE' ? 'LIVE uses real SOL in the burner wallet. Trades are signed on this phone and sent to Solana.' : 'PAPER simulates fills from live Jupiter quotes. No real money moves.')+'</div></div>'+
       '<div class="card"><h3>Risk (quick flips, capital first)</h3>'+
       setNum('posPct', 'Position size', (s.posPct * 100).toFixed(0), '% of equity, default 5, max 10')+
-      setNum('maxOpen', 'Max open positions', s.maxOpen, 'default 8, hard cap 8 (~40% if size is 5%)')+
+      setNum('maxOpen', 'Max open positions', s.maxOpen, 'default 10, hard cap 10 (~50% if size is 5%)')+
       setNum('tpPct', 'Take profit', (s.tpPct * 100).toFixed(0), '% · sell half')+
       setNum('tpSellPct', 'Sell at TP', (s.tpSellPct * 100).toFixed(0), '% of the position')+
       setNum('trailPct', 'Trailing stop', (s.trailPct * 100).toFixed(0), '% off peak after TP or +20%')+
@@ -1386,7 +1402,7 @@
       const val = id => parseFloat(document.getElementById(id).value);
       const pct = (id, max) => { const v = val(id); if (isFinite(v)) bot.settings[id] = Math.min(max != null ? max : 99, v / 100); };
       pct('posPct', 0.10);
-      bot.settings.maxOpen = Math.max(1, Math.min(8, Math.round(val('maxOpen') || 8)));
+      bot.settings.maxOpen = Math.max(1, Math.min(10, Math.round(val('maxOpen') || 10)));
       pct('tpPct'); pct('tpSellPct', 1); pct('trailPct'); pct('slPct'); pct('dailyLossPct');
       if (isFinite(val('maxHoldMin'))) bot.settings.maxHoldMin = Math.max(30, Math.min(180, val('maxHoldMin')));
       if (isFinite(val('slippageBps'))) bot.settings.slippageBps = val('slippageBps');

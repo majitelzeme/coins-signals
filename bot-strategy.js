@@ -5,7 +5,7 @@
   const DEFAULTS = {
     mode: 'PAPER',
     posPct: 0.05,
-    maxOpen: 8,
+    maxOpen: 10,
     tpPct: 0.35,
     tpSellPct: 0.50,
     trailPct: 0.12,
@@ -15,19 +15,19 @@
     maxHoldMin: 90,
     minSolReserve: 0.02,
     slippageBps: 150,
-    minLiq: 10000,
+    minLiq: 8000,
     minAgeMin: 5,
     maxAgeH: 120,
-    minScore: 58,
-    scoreScans: 2,
+    minScore: 52,
+    scoreScans: 1,
     cooldownMin: 40,
-    consecLossLimit: 2,
+    consecLossLimit: 0,
     max1hChg: 180,
     maxImpactPct: 4,
     maxTopHoldersPct: 40,
     abortMovePct: 3,
     liqDropPct: 0.25,
-    minQuoteLiq: 6000,
+    minQuoteLiq: 5000,
     minLiqMcRatio: 0.05,
     tokenCooldownMin: 30,
     minPosSol: 0.02,
@@ -511,7 +511,7 @@
     const s = Object.assign({}, DEFAULTS, settings || {});
     if (pnl < 0) {
       state.consecLosses = (state.consecLosses || 0) + 1;
-      if (state.consecLosses >= s.consecLossLimit) {
+      if (s.consecLossLimit > 0 && state.consecLosses >= s.consecLossLimit) {
         state.cooldownUntil = (now || Date.now()) + s.cooldownMin * 60e3;
         state.consecLosses = 0;
         return { cooldown: true, until: state.cooldownUntil };

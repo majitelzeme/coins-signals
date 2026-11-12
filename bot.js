@@ -418,7 +418,24 @@
     if (bot.trades.length > 200) bot.trades.length = 200;
     bot.lastFlash = { t: Date.now(), usd: tr.pnlUsd != null ? tr.pnlUsd : 0, kind: tr.kind };
   }
-  function reserveUsd() { return (bot.settings.minSolReserve || 0.02) * (bot.solPx || 0); }
+  // v13: small paper accounts. LIVE keeps the 0.02 SOL minimum trade + fee reserve unchanged.
+  const PAPER_MIN_USD = 0.5;          // smallest simulated paper trade
+  const PAPER_TX_FEE_SOL = 0.00008;   // simulated network + priority fee per swap (paper only)
+  const isPaper = () => bot.settings.mode !== 'LIVE';
+  function reserveUsd() {
+    const r = (bot.settings.minSolReserve || 0.02) * (bot.solPx || 0);
+    if (!isPaper()) return r;
+    // Paper: same reserve as before, but never more than 5% of a small account (min ≈ fees for a few swaps).
+    const eq = Math.max(0, +bot.cashUsd || 0) + (bot.positions || []).reduce((a, p) => a + (+p.costUsd || 0), 0);
+    return Math.min(r, Math.max(0.003 * (bot.solPx || 0), eq * 0.05));
+  }
+  /** Settings used for sizing gates: in PAPER the min trade is PAPER_MIN_USD instead of 0.02 SOL. */
+  function sizingSettings(extra) {
+    const s = Object.assign({}, bot.settings, extra || {});
+    if (isPaper() && bot.solPx > 0) { s.minPosSol = PAPER_MIN_USD / bot.solPx; s.minSolReserve = PAPER_MIN_USD / bot.solPx; }
+    return s;
+  }
+  function paperFeeUsd(solPx) { return isPaper() ? PAPER_TX_FEE_SOL * (+solPx || bot.solPx || 0) : 0; }
 
   async function ensureFast() {
     try { if (!fast.ts || Date.now() - fast.ts > 45000) await loadFast(true); }
@@ -463,7 +480,8 @@
         const mid = midPx(p);
         const alreadyDown = mid && p.entryPx && mid / p.entryPx - 1 <= -0.04;
         const stale = !bot._pxTs[p.mint] || (Date.now() - bot._pxTs[p.mint] > 2500);
-        const due = !bot._jupTs || !bot._jupTs[p.mint] || (Date.now() - bot._jupTs[p.mint] > 2000);
+        const wsLive = p.strat === 'fresh' && PP.px[p.mint] && Date.now() - PP.px[p.mint].t < 5000;
+        const due = !bot._jupTs || !bot._jupTs[p.mint] || (Date.now() - bot._jupTs[p.mint] > (wsLive ? 4000 : 2000));
         if (stale || alreadyDown || due || !pair) await jupSellMark(p);
       } catch (e) { console.warn('px', e); }
     }));
@@ -484,6 +502,7 @@
           if (qRug) pos._quoteLiq = pos._quoteLiq ? Math.min(pos._quoteLiq, qRug) : qRug;
         } catch {}
       }
+      if (pos.strat === 'fresh') { if (F) await freshExitCheck(pos, 'tick'); continue; }
       if (!(pos.stopPx > 0)) {
         // Positions opened before v10 get a stop registered now (−slPct from entry).
         pos.stopPx = pos.entryPx * (1 - bot.settings.slPct);
@@ -514,14 +533,14 @@
     }
   }
 
-  async function executeSell(pos, frac, reason) {
+  async function executeSell(pos, frac, reason, why) {
     // Never sell the same position twice concurrently (1s ticks, manual sell, kill switch can overlap).
     if (!pos || pos._selling || !bot.positions.includes(pos)) return null;
     pos._selling = true;
-    try { return await executeSellInner(pos, frac, reason); }
+    try { return await executeSellInner(pos, frac, reason, why); }
     finally { pos._selling = false; }
   }
-  async function executeSellInner(pos, frac, reason) {
+  async function executeSellInner(pos, frac, reason, why) {
     const px0 = lastPx(pos);
     bot.agents.executor.status = 'hot';
     bot.agents.executor.detail = 'selling ' + Math.round(frac * 100) + '%';
@@ -541,10 +560,11 @@
           fillQty = qty;
           fillPx = fillUsd / qty;
         } else { fillUsd = qty * px0; fillQty = qty; }
+        fillUsd = Math.max(0, fillUsd - paperFeeUsd());
       }
       const res = S.applySell(bot, pos, frac, { usd: fillUsd, px: fillPx, reason });
       if (bot.settings.mode === 'LIVE') await reconcileLiveCash();
-      const kind = reason === 'stop' || reason === 'liquidity' || reason === 'sell_spike' ? 'stop' : 'sell';
+      const kind = reason === 'stop' || reason === 'liquidity' || reason === 'sell_spike' || ((reason === 'dump' || reason === 'dev_sell' || reason === 'whale_sell') && fillPx < pos.entryPx) ? 'stop' : 'sell';
       const mult = fillPx / pos.entryPx;
       addTrade({
         id: 't' + Date.now() + Math.random().toString(16).slice(2, 6),
@@ -552,22 +572,24 @@
         usd: fillUsd, qty: res.qty, px: fillPx, mc: pos._mc || pos.entryMc,
         pnlUsd: res.pnl, pnlPct: fillPx / pos.entryPx - 1, mult,
         agent: reason === 'manual' || reason === 'kill' ? 'Executor' : 'Risk',
-        note: reason === 'stop' ? 'stop −' + Math.round(bot.settings.slPct * 100) + '%'
+        note: reason === 'stop' ? 'stop −' + Math.round((pos.strat === 'fresh' ? fcfg().slPct : bot.settings.slPct) * 100) + '%'
           : reason === 'tp' ? 'took profit' : reason === 'trail' ? 'trailing stop'
           : reason === 'time' ? 'time stop' : reason === 'liquidity' ? 'liquidity drop'
-          : reason === 'sell_spike' ? 'sell spike' : reason === 'kill' ? 'kill switch' : reason === 'manual' ? 'manual sell' : reason,
+          : reason === 'sell_spike' ? 'sell spike' : reason === 'kill' ? 'kill switch' : reason === 'manual' ? 'manual sell'
+          : reason === 'dump' ? 'dump detected' : reason === 'dev_sell' ? 'dev sold' : reason === 'whale_sell' ? 'whale sold' : reason === 'stale' ? 'no momentum' : reason,
         frac
       });
       if (res.closed) S.recordLossStreak(bot, res.pnl, bot.settings, Date.now());
       if (kind === 'stop' || reason === 'liquidity' || reason === 'sell_spike') {
         S.armTokenCooldown(bot, pos.mint, bot.settings, Date.now());
       }
-      bot.agents.executor.detail = kind === 'stop' ? ('stopped −$' + Math.abs(res.pnl).toFixed(2)) : ('sold ' + (mult.toFixed(2)) + 'x');
+      bot.agents.executor.detail = kind === 'stop' ? ('stopped −' + fmtUsd(Math.abs(res.pnl))) : ('sold ' + (mult.toFixed(2)) + 'x');
       bot.agents.risk.detail = bot.agents.executor.detail;
       bot.agents.risk.status = kind === 'stop' ? 'danger' : 'hot';
       bot.stats.exits++;
-      logEvent({ stage: 'risk', kind: 'trade', side: kind, mint: pos.mint, symbol: pos.symbol, icon: pos.icon,
-        reason: (reason === 'stop' ? 'hard stop −' + Math.round(bot.settings.slPct * 100) + '%' : reason === 'trail' ? 'trailing stop (' + Math.round((pos.trailPct || bot.settings.trailPct) * 100) + '% off peak)' : reason),
+      const reactMs = pos._exitSignalAt ? Date.now() - pos._exitSignalAt : null;
+      logEvent({ stage: 'risk', kind: 'trade', side: kind, mint: pos.mint, symbol: pos.symbol, icon: pos.icon, tag: pos.strat === 'fresh' ? 'fresh' : undefined, reactMs,
+        reason: why ? (why + (reactMs != null ? ' · sold ' + reactMs + ' ms after signal' : '')) : (reason === 'stop' ? 'hard stop −' + Math.round(bot.settings.slPct * 100) + '%' : reason === 'trail' ? 'trailing stop (' + Math.round((pos.trailPct || bot.settings.trailPct) * 100) + '% off peak)' : reason),
         usd: fillUsd, pnlUsd: res.pnl, pnlPct: fillPx / pos.entryPx - 1, frac });
       pushEquity(equityNow());
       save();
@@ -972,12 +994,12 @@
       // v12: cycles run every 12 s — a coin whose last ticket was blocked/aborted is re-quoted at most every 30 s (Jupiter pacing).
       bot._execRetry = bot._execRetry || {};
       if (bot._execRetry[p.mint] && now - bot._execRetry[p.mint] < 30000) continue;
-      const gate = S.canOpenMore(bot, bot.settings, now, { solPx: bot.solPx, reserveUsd: reserveUsd() });
+      const gate = S.canOpenMore(bot, sizingSettings(), now, { solPx: bot.solPx, reserveUsd: reserveUsd() });
       if (!gate.ok) { E.detail = gate.reason; logEvent({ stage: 'executor', kind: 'skip', code: 'gate', mint: p.mint, symbol: p.symbol, icon: p.icon, reason: gate.reason }); break; }
       const solPx = await solPrice();
       const eq = equityNow();
-      const usd = S.executorSize(eq, bot.cashUsd, bot.settings, reserveUsd(), solPx);
-      if (!(usd > 0)) { E.detail = 'size below floor'; logEvent({ stage: 'executor', kind: 'skip', code: 'size', mint: p.mint, symbol: p.symbol, reason: 'size below 0.02 SOL floor' }); break; }
+      const usd = S.executorSize(eq, bot.cashUsd, sizingSettings(), reserveUsd(), solPx);
+      if (!(usd > 0)) { E.detail = 'size below floor'; logEvent({ stage: 'executor', kind: 'skip', code: 'size', mint: p.mint, symbol: p.symbol, reason: isPaper() ? 'size below $' + PAPER_MIN_USD + ' paper minimum' : 'size below 0.02 SOL floor' }); break; }
       E.status = 'hot'; E.token = p; E.detail = 'quoting ' + p.symbol;
       // Scout data can be ~40s old: re-read the live pair so the signal price is current.
       let livePx = p.priceUsd, livePair = p.pair;
@@ -1004,7 +1026,7 @@
   async function agentRisk(ticket) {
     const R = bot.agents.risk;
     const st = { positions: bot.positions, cashUsd: bot.cashUsd, equityUsd: equityNow(), dayStartEquity: bot.dayStartEquity, halted: bot.halted, cooldownUntil: bot.cooldownUntil, tokenCooldownUntil: bot.tokenCooldownUntil };
-    const v = S.riskApprove(ticket, st, bot.settings, Date.now(), { solPx: bot.solPx, reserveUsd: reserveUsd() });
+    const v = S.riskApprove(ticket, st, sizingSettings(), Date.now(), { solPx: bot.solPx, reserveUsd: reserveUsd() });
     if (!v.ok) {
       bot.stats.riskBlocks++;
       bot.stats.killByCode['risk_' + (v.reasons[0] || 'x').split(' ')[0]] = (bot.stats.killByCode['risk_' + (v.reasons[0] || 'x').split(' ')[0]] || 0) + 1;
@@ -1028,7 +1050,7 @@
     const px = +ticket.expectedPx || +p.priceUsd;
     const usd = ticket.usd;
     bot.agents.executor.status = 'hot';
-    bot.agents.executor.detail = 'buying $' + usd.toFixed(0);
+    bot.agents.executor.detail = 'buying ' + fmtUsd(usd, usd < 10 ? 2 : 0);
     bot.agents.executor.token = { symbol: ticket.symbol, icon: ticket.icon };
     try {
       const solPx = await solPrice();
@@ -1046,7 +1068,8 @@
       } else {
         const q = ticket.quoteBuy;
         if (!q || !q.ok) throw new Error('buy quote failed');
-        if (q.impactPct > bot.settings.maxImpactPct) throw new Error('impact ' + q.impactPct.toFixed(2) + '%');
+        const fx = ticket.strat === 'fresh' ? fcfg() : null;
+        if (q.impactPct > (fx ? fx.maxImpactPct : bot.settings.maxImpactPct)) throw new Error('impact ' + q.impactPct.toFixed(2) + '%');
         const rugHit = bot.rugCache[mint] && bot.rugCache[mint].d;
         if (rugHit && rugHit.token && isFinite(+rugHit.token.decimals)) decimals = +rugHit.token.decimals;
         else {
@@ -1056,9 +1079,10 @@
         }
         amount = q.outAmount / Math.pow(10, decimals);
         fillPx = amount ? usd / amount : px;
-        const chk = S.abortIfMoved(px, fillPx, bot.settings);
+        const chk = S.abortIfMoved(px, fillPx, fx ? Object.assign({}, bot.settings, { abortMovePct: fx.abortMovePct }) : bot.settings);
         if (chk.abort) throw new Error(chk.reason);
-        costUsd = usd;
+        // Jupiter quote already includes pool/bonding-curve fees + price impact; add the network/priority fee.
+        costUsd = usd + paperFeeUsd(solPx);
       }
       const id = 'p' + Date.now() + Math.random().toString(16).slice(2, 6);
       const rugHit = bot.rugCache[mint] && bot.rugCache[mint].d;
@@ -1076,14 +1100,15 @@
       pos.trailPct = ticket.risk.trailPct;
       pos.score = ticket.score;
       pos._pair = p;
+      if (ticket.strat === 'fresh') { pos.strat = 'fresh'; pos.creator = ticket.creator || PP.creatorOf[mint] || null; pos.peakAt = Date.now(); }
       bot.stats.entries++;
       addTrade({
         id: 't' + id, t: Date.now(), kind: 'buy', mint, symbol: ticket.symbol, icon: ticket.icon,
         usd: costUsd, qty: amount, px: fillPx, mc: item.mcap || pairMc(p), agent: 'Executor', note: 'score ' + ticket.score
       });
-      logEvent({ stage: 'executor', kind: 'trade', side: 'buy', mint, symbol: ticket.symbol, icon: ticket.icon, usd: costUsd, score: ticket.score,
-        reason: 'bought ' + fmtUsd(costUsd) + ' (' + (costUsd / Math.max(1e-9, equityNow()) * 100).toFixed(1) + '% equity) · score ' + ticket.score + ' · stop ' + fmtPx(pos.stopPx) });
-      bot.agents.executor.detail = 'bought $' + costUsd.toFixed(0);
+      logEvent({ stage: 'executor', kind: 'trade', side: 'buy', mint, symbol: ticket.symbol, icon: ticket.icon, usd: costUsd, score: ticket.score, tag: ticket.strat === 'fresh' ? 'fresh' : undefined,
+        reason: (ticket.strat === 'fresh' ? 'FRESH · ' : '') + 'bought ' + fmtUsd(costUsd) + ' (' + (costUsd / Math.max(1e-9, equityNow()) * 100).toFixed(1) + '% equity) · score ' + ticket.score + ' · stop ' + fmtPx(pos.stopPx) });
+      bot.agents.executor.detail = 'bought ' + fmtUsd(costUsd, costUsd < 10 ? 2 : 0);
       bot.agents.risk.detail = bot.positions.length + ' open · −' + Math.round(bot.settings.slPct * 100) + '%';
       bot.agents.risk.status = 'hot';
       bot.agents.risk.token = pos;
@@ -1092,12 +1117,308 @@
       return pos;
     } catch (e) {
       console.warn('buy failed', e);
-      logEvent({ stage: 'executor', kind: 'kill', code: 'fill_abort', mint, symbol: ticket.symbol, icon: ticket.icon, reason: 'fill aborted: ' + (e.message || e) });
+      logEvent({ stage: 'executor', kind: 'kill', code: 'fill_abort', mint, symbol: ticket.symbol, icon: ticket.icon, reason: 'fill aborted: ' + (e.message || e), tag: ticket.strat === 'fresh' ? 'fresh' : undefined });
       bot.agents.executor.detail = 'aborted';
       return null;
     }
   }
-  function fmtPx(x) { if (!(x > 0)) return '—'; return x >= 1 ? '$' + x.toFixed(4) : '$' + x.toPrecision(3); }
+  function fmtPx(x) { if (!(x > 0)) return '—'; const y = x * FX.rate(); return FX.wrap('', y >= 1 ? FX.fixed(y, 4) : (FX.currency === 'CZK' ? y.toPrecision(3).replace('.', ',') : y.toPrecision(3))); }
+
+  /* ======================= v13 Fresh (pump.fun) strategy ======================= */
+  const F = window.FreshStrategy;
+  const strategyOf = () => (bot.settings.strategy === 'FRESH' || bot.settings.strategy === 'BOTH') ? bot.settings.strategy : 'STRONG';
+  const freshOn = () => strategyOf() !== 'STRONG' && !!F;
+  const strongOn = () => strategyOf() !== 'FRESH';
+  const fcfg = () => F ? F.cfg(bot.settings.fresh) : {};
+  const PUMP_PROGRAM = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
+  const QUOTE_MINTS = new Set([WSOL, USDC, 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', 'pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn']);
+  bot.agentsF = idleAgents();
+
+  /* ---- PumpPortal websocket (free): new tokens, migrations, and live trades for held/considered mints ---- */
+  const PP = { ws: null, state: 'off', retry: 0, timer: null, lastMsg: 0, newTok: new Map(), migrated: new Map(), trades: {}, subs: new Set(), devSell: {}, bigSell: {}, creatorOf: {}, px: {} };
+  PP.launches = (() => { try { return JSON.parse(localStorage.getItem('bot:devLaunches') || '{}') || {}; } catch { return {}; } })();
+  function ppSaveLaunches() {
+    const cut = Date.now() - 24 * 36e5; const out = {}; let n = 0;
+    Object.keys(PP.launches).forEach(d => { const l = PP.launches[d].filter(t => t > cut); if (l.length && n < 1500) { out[d] = l.slice(-50); n++; } });
+    PP.launches = out; try { localStorage.setItem('bot:devLaunches', JSON.stringify(out)); } catch {}
+  }
+  function ppWanted() { return bot.running && freshOn(); }
+  function ppConnect() {
+    if (PP.ws || !ppWanted() || typeof WebSocket === 'undefined') return;
+    PP.state = 'connecting';
+    let ws;
+    try { ws = new WebSocket('wss://pumpportal.fun/api/data'); } catch (e) { ppRetry(); return; }
+    PP.ws = ws;
+    ws.onopen = () => {
+      PP.state = 'live'; PP.retry = 0; PP.subs = new Set();
+      ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
+      ws.send(JSON.stringify({ method: 'subscribeMigration' }));
+      ppSyncSubs();
+    };
+    ws.onmessage = ev => { PP.lastMsg = Date.now(); let d; try { d = JSON.parse(ev.data); } catch { return; } ppOnMsg(d); };
+    ws.onerror = () => {};
+    ws.onclose = () => { PP.ws = null; PP.state = 'off'; PP.subs = new Set(); if (ppWanted()) ppRetry(); };
+  }
+  function ppRetry() {
+    clearTimeout(PP.timer);
+    const ms = Math.min(60000, 3000 * Math.pow(2, PP.retry++));
+    PP.state = 'retry in ' + Math.round(ms / 1000) + 's';
+    PP.timer = setTimeout(ppConnect, ms);
+  }
+  function ppStop() { clearTimeout(PP.timer); if (PP.ws) { try { PP.ws.onclose = null; PP.ws.close(); } catch {} } PP.ws = null; PP.state = 'off'; PP.subs = new Set(); }
+  function ppOnMsg(d) {
+    if (!d || !d.mint) return;
+    const now = Date.now();
+    if (d.txType === 'create') {
+      PP.newTok.set(d.mint, { t: now, creator: d.traderPublicKey, symbol: d.symbol, name: d.name, checks: 0, lastCheck: 0 });
+      PP.creatorOf[d.mint] = d.traderPublicKey;
+      if (d.traderPublicKey) (PP.launches[d.traderPublicKey] || (PP.launches[d.traderPublicKey] = [])).push(now);
+      if (PP.newTok.size > 4000) { const cut = now - 50 * 60e3; for (const [k, v] of PP.newTok) if (v.t < cut) PP.newTok.delete(k); }
+      if (!ppOnMsg._sv || now - ppOnMsg._sv > 60000) { ppOnMsg._sv = now; ppSaveLaunches(); }
+      return;
+    }
+    if (d.txType === 'migrate') { PP.migrated.set(d.mint, now); return; }
+    if (d.txType !== 'buy' && d.txType !== 'sell') return;
+    const tr = { t: now, buy: d.txType === 'buy', sol: +d.solAmount || 0, tokens: +d.tokenAmount || 0, trader: d.traderPublicKey };
+    const L = PP.trades[d.mint] || (PP.trades[d.mint] = []);
+    L.push(tr); while (L.length && now - L[0].t > 180000) L.shift(); if (L.length > 500) L.splice(0, L.length - 500);
+    if (+d.marketCapSol > 0 && bot.solPx > 0) PP.px[d.mint] = { px: (+d.marketCapSol * bot.solPx) / 1e9, t: now };
+    const pos = bot.positions.find(p => p.mint === d.mint && p.strat === 'fresh');
+    const creator = (pos && pos.creator) || PP.creatorOf[d.mint];
+    if (!tr.buy && creator && tr.trader === creator) PP.devSell[d.mint] = now;
+    const supPct = tr.tokens / 1e9 * 100;   // pump.fun supply = 1B tokens
+    if (!tr.buy && supPct >= fcfg().whaleSellSupplyPct) PP.bigSell[d.mint] = { t: now, pct: supPct };
+    if (pos) freshExitCheck(pos, 'stream');   // react to the trade immediately, not on the next tick
+  }
+  function ppSyncSubs() {
+    if (!PP.ws || PP.state !== 'live') return;
+    const want = new Set(bot.positions.filter(p => p.strat === 'fresh').map(p => p.mint).concat((bot._frWatch || []).slice(0, 12)));
+    const add = [...want].filter(m => !PP.subs.has(m)), del = [...PP.subs].filter(m => !want.has(m));
+    try {
+      if (add.length) PP.ws.send(JSON.stringify({ method: 'subscribeTokenTrade', keys: add }));
+      if (del.length) PP.ws.send(JSON.stringify({ method: 'unsubscribeTokenTrade', keys: del }));
+    } catch {}
+    add.forEach(m => PP.subs.add(m)); del.forEach(m => { PP.subs.delete(m); if (!bot.positions.some(p => p.mint === m)) delete PP.trades[m]; });
+  }
+
+  /* ---- Dev history: RugCheck creator data + PumpPortal-observed launches + public-RPC sampling of the creator's txs ---- */
+  const devCache = (() => { try { return JSON.parse(localStorage.getItem('bot:devCache') || '{}') || {}; } catch { return {}; } })();
+  function devSave() { const ks = Object.keys(devCache).sort((a, b) => devCache[b].t - devCache[a].t).slice(0, 300); const o = {}; ks.forEach(k => o[k] = devCache[k]); try { localStorage.setItem('bot:devCache', JSON.stringify(o)); } catch {} }
+  async function devCheck(creator, mint, report) {
+    const c = fcfg();
+    if (!creator) return { ok: true, unknown: true, why: 'creator unknown' };
+    const hit = devCache[creator];
+    let d = hit && Date.now() - hit.t < 30 * 60e3 ? hit : null;
+    if (!d) {
+      d = { t: Date.now(), sigs: 0, sigs24: 0, sampled: 0, creates: 0, mints: [], dead: 0, rpcOk: false };
+      try {
+        const sigs = ((await rpc('getSignaturesForAddress', [creator, { limit: 1000 }], 8000)) || []).filter(x => !x.err);
+        d.sigs = sigs.length; d.sigs24 = sigs.filter(x => x.blockTime && Date.now() / 1000 - x.blockTime < 86400).length; d.rpcOk = true;
+        const N = Math.min(10, sigs.length);
+        const idx = [...new Set(Array.from({ length: N }, (_, i) => Math.floor(i * sigs.length / N)))];
+        const found = new Set();
+        await pool(idx, 2, async i => {
+          const tx = await rpc('getTransaction', [sigs[i].signature, { maxSupportedTransactionVersion: 0, encoding: 'json' }], 8000);
+          const logs = (tx && tx.meta && tx.meta.logMessages) || [];
+          d.sampled++;
+          if (logs.some(l => l.includes(PUMP_PROGRAM)) && logs.some(l => /Instruction: Create/.test(l))) {
+            d.creates++;
+            ((tx.meta.postTokenBalances) || []).forEach(b => { if (b.mint && !QUOTE_MINTS.has(b.mint) && b.mint !== mint) found.add(b.mint); });
+          }
+        });
+        d.mints = [...found].slice(0, 30);
+        if (d.mints.length) {
+          const pm = await pairsFor(d.mints.map(m => ({ chain: 'solana', addr: m })), 10 * 60e3);
+          d.dead = d.mints.filter(m => { const p = pm.get(tkey('solana', m)); const mc = p ? (+p.marketCap || +p.fdv || 0) : 0; const age = p && p.pairCreatedAt ? Date.now() - p.pairCreatedAt : 0; return !p ? false : (mc < 5000 && age > 60 * 60e3); }).length;
+        }
+      } catch (e) { /* RPC limited: decide on what we have */ }
+      devCache[creator] = d; devSave();
+    }
+    const seen24 = (PP.launches[creator] || []).filter(t => Date.now() - t < 24 * 36e5).length;
+    const est = d.sampled ? Math.round(d.creates / d.sampled * d.sigs24) : 0;   // creates share × 24h tx count
+    const launches24 = Math.max(seen24, d.creates >= 2 ? est : d.creates);
+    const rcHist = report ? S.devHistory(report, { deadLaunchMc: 5000 }, Date.now()) : { rugFlag: false, dead: 0 };
+    const dead = Math.max(d.dead, rcHist.dead);
+    let why = null;
+    if (rcHist.rugFlag) why = 'dev has rug history (RugCheck)';
+    else if (dead >= 2) why = 'dev has ' + dead + ' dead earlier launches (< $5K MC)';
+    else if (launches24 > 5) why = 'serial launcher: ~' + launches24 + ' launches in 24h';
+    return { ok: !why, why, launches24, dead, sampled: d.sampled, rpcOk: d.rpcOk, seen24 };
+  }
+
+  /* ---- Fresh pipeline: Scout → Filter (+dev check) → Analyst → Executor → Risk, logged with tag "fresh" ---- */
+  const FR_LISTS = { profile: DSAPI + '/token-profiles/latest/v1', boost: DSAPI + '/token-boosts/latest/v1', boostTop: DSAPI + '/token-boosts/top/v1', cto: DSAPI + '/community-takeovers/latest/v1', ad: DSAPI + '/ads/latest/v1' };
+  const FR_GT = ['/networks/solana/dexes/pump-fun/pools?sort=h24_tx_count_desc&page=1', '/networks/solana/dexes/pumpswap/pools?sort=h24_volume_usd_desc&page=1'];
+  bot._frGt = {}; bot._frGtAt = 0; bot._frGtRot = 0;
+  function frLog(ev) { ev.tag = 'fresh'; logEvent(ev); }
+  async function frScout() {
+    const A = bot.agentsF.scout; const c = fcfg(); const now = Date.now();
+    const cache = bot._frScout;
+    if (cache && now - cache.ts < 24000) return cache;
+    A.status = 'hot'; A.detail = 'scanning…';
+    const flags = {};
+    const flag = (m, k) => { (flags[m] || (flags[m] = {}))[k] = true; };
+    const lists = await Promise.all(Object.keys(FR_LISTS).map(async k => [k, await cachedJSONx(FR_LISTS[k], k === 'cto' || k === 'ad' ? 60000 : 33000, 10000)]));
+    let dsOk = 0;
+    lists.forEach(([k, x]) => { if (x.ok) dsOk++; (Array.isArray(x.d) ? x.d : []).forEach(it => { if (it && it.chainId === 'solana' && F.isPumpToken(it.tokenAddress)) flag(it.tokenAddress, k === 'boostTop' ? 'boost' : k); }); });
+    // GeckoTerminal pump.fun / PumpSwap busiest pools: one paced call every 2 min in the background.
+    if (now - bot._frGtAt > 120000 && Date.now() >= gtGate.pauseUntil) {
+      bot._frGtAt = now; const u = GT + FR_GT[bot._frGtRot++ % FR_GT.length] + '&include=base_token';
+      gtGet(u).then(d => { if (d && d.data) bot._frGt[u] = { ts: Date.now(), d }; }).catch(() => {});
+    }
+    Object.keys(bot._frGt).forEach(u => { const e = bot._frGt[u]; if (now - e.ts > 10 * 60e3) { delete bot._frGt[u]; return; }
+      (e.d.data || []).forEach(pl => { const id = pl.relationships && pl.relationships.base_token && pl.relationships.base_token.data && pl.relationships.base_token.data.id; if (id && id.indexOf('solana_') === 0) flag(id.slice(7), 'gt'); }); });
+    // PumpPortal: tokens created minAge…45 min ago, each checked up to 3× (≥4 min apart); graduations of the last 6 h.
+    let due = 0;
+    for (const [m, v] of PP.newTok) {
+      const age = now - v.t;
+      if (age < c.minAgeMin * 60e3 || age > 45 * 60e3 || v.checks >= 3 || now - v.lastCheck < 4 * 60e3) continue;
+      if (due >= 60) break;
+      v.checks++; v.lastCheck = now; flag(m, 'new'); due++;
+    }
+    for (const [m, t] of PP.migrated) { if (now - t > 6 * 36e5) PP.migrated.delete(m); else flag(m, 'migrated'); }
+    const mints = Object.keys(flags).slice(0, 150);
+    let pm = new Map();
+    try { pm = await pairsFor(mints.map(m => ({ chain: 'solana', addr: m })), 20000); } catch {}
+    const cands = []; const skip = {};
+    mints.forEach(m => {
+      const p = pm.get(tkey('solana', m));
+      if (!p || p.baseToken.address !== m) { skip['no pair'] = (skip['no pair'] || 0) + 1; return; }
+      if (!F.isPumpToken(m, p.dexId)) { skip['not pump.fun'] = (skip['not pump.fun'] || 0) + 1; return; }
+      const g = F.scoutPair(p, now, c);
+      if (!g.ok) { skip[g.why] = (skip[g.why] || 0) + 1; return; }
+      const fl = flags[m];
+      const pre = F.score(p, fl);
+      cands.push({ mint: m, symbol: p.baseToken.symbol, icon: (p.info && p.info.imageUrl) || '', pair: p, pairAddress: p.pairAddress, flags: fl, ageMin: g.ageMin, mcap: g.mc, pre: pre.score, priceUsd: +p.priceUsd });
+    });
+    cands.sort((a, b) => b.pre - a.pre);
+    const out = { ts: now, cands, seen: mints.length, skip, dsOk, pp: PP.state };
+    bot._frScout = out;
+    bot._frWatch = cands.slice(0, 8).map(x => x.mint); ppSyncSubs();
+    A.n = cands.length;
+    A.status = dsOk || PP.state === 'live' ? 'hot' : 'danger';
+    A.detail = cands.length + ' fresh · ws ' + (PP.state === 'live' ? 'live' : PP.state);
+    bot._frSeen = bot._frSeen || {};
+    cands.slice(0, 12).forEach(x => { if (bot._frSeen[x.mint] && now - bot._frSeen[x.mint] < 20 * 60e3) return; bot._frSeen[x.mint] = now;
+      frLog({ stage: 'scout', kind: 'found', mint: x.mint, symbol: x.symbol, icon: x.icon, reason: 'age ' + fmtAge(x.ageMin) + ' · MC ' + fmtMc(x.mcap) + ' · ' + Object.keys(x.flags).join('+') }); });
+    return out;
+  }
+  async function frFilter(sc) {
+    const A = bot.agentsF.filter; const c = fcfg(); const now = Date.now();
+    bot._frKill = bot._frKill || {};
+    const top = sc.cands.filter(x => !(bot._frKill[x.mint] && now - bot._frKill[x.mint] < 3 * 60e3)).slice(0, 8);
+    const pass = []; let killed = 0;
+    await pool(top, 3, async x => {
+      let rep = null; try { rep = await rugReport(x.mint, 120000); } catch {}
+      const s = F.safety(x.pair, rep, c);
+      if (s.pass) {
+        const creator = (rep && rep.creator) || PP.creatorOf[x.mint];
+        const dv = await devCheck(creator, x.mint, rep);
+        if (!dv.ok) s.kills.push({ code: 'f_dev', reason: dv.why }), s.pass = false;
+        x.creator = creator; x.dev = dv;
+      }
+      x.safety = s.facts;
+      if (s.pass) pass.push(x);
+      else {
+        killed++; if (rep) bot._frKill[x.mint] = now;
+        frLog({ stage: 'filter', kind: 'kill', code: s.kills[0].code, mint: x.mint, symbol: x.symbol, icon: x.icon, reason: s.kills.map(k => k.reason).join('; ') });
+      }
+    });
+    A.status = top.length ? 'hot' : 'idle'; A.n = killed;
+    A.detail = top.length ? killed + ' killed · ' + pass.length + ' pass' : 'nothing to check';
+    return pass;
+  }
+  function frAnalyst(pass) {
+    const A = bot.agentsF.analyst; const c = fcfg();
+    const scored = pass.map(x => { const r = F.score(x.pair, x.flags); return Object.assign(x, { score: r.score, comps: r.comps }); }).sort((a, b) => b.score - a.score);
+    bot._frLastScore = bot._frLastScore || {};
+    scored.forEach(x => {
+      const prev = bot._frLastScore[x.mint];
+      if (prev && Math.abs(prev - x.score) < 4) return; bot._frLastScore[x.mint] = x.score;
+      const k = x.comps;
+      frLog({ stage: 'analyst', kind: x.score >= c.passScore ? 'pass' : 'kill', code: x.score >= c.passScore ? 'score_pass' : 'f_score_low', mint: x.mint, symbol: x.symbol, icon: x.icon, score: x.score,
+        reason: 'score ' + x.score + (x.score >= c.passScore ? ' ≥ ' : ' < ') + c.passScore + ' · buzz ' + k.buzz + ' · surge ' + k.surge + ' · pressure ' + k.pressure + ' · vol↑ ' + k.volAccel + ' · mom ' + k.momentum + (x.dev ? ' · dev ' + (x.dev.unknown ? '?' : x.dev.launches24 + '/24h') : '') });
+    });
+    const best = scored[0];
+    A.status = scored.length ? 'hot' : 'idle'; A.token = best ? { symbol: best.symbol, icon: best.icon } : null; A.score = best ? best.score : null;
+    A.detail = best ? (best.score >= c.passScore ? 'pass ' + best.score : 'best ' + best.score + ' < ' + c.passScore) : 'waiting';
+    return scored.filter(x => x.score >= c.passScore);
+  }
+  async function frExecutor(passed) {
+    const E = bot.agentsF.executor; const c = fcfg();
+    let fills = 0;
+    for (const p of passed) {
+      const now = Date.now();
+      if (bot.positions.some(x => x.mint === p.mint)) continue;
+      bot._execRetry = bot._execRetry || {};
+      if (bot._execRetry[p.mint] && now - bot._execRetry[p.mint] < 30000) continue;
+      const openF = bot.positions.filter(x => x.strat === 'fresh').length;
+      if (openF >= c.maxOpen) { E.detail = 'max ' + c.maxOpen + ' fresh open'; break; }
+      const eq = equityNow();
+      const gate = S.canOpenMore(Object.assign({}, bot, { positions: [], equityUsd: eq }), sizingSettings({ maxOpen: 99, posPct: c.posPct }), now, { solPx: bot.solPx, reserveUsd: reserveUsd() });
+      if (!gate.ok) { E.detail = gate.reason; frLog({ stage: 'executor', kind: 'skip', code: 'gate', mint: p.mint, symbol: p.symbol, reason: gate.reason }); break; }
+      const solPx = await solPrice();
+      const usd = S.executorSize(eq, bot.cashUsd, sizingSettings({ posPct: c.posPct }), reserveUsd(), solPx);
+      if (!(usd > 0)) { E.detail = 'size below floor'; break; }
+      E.status = 'hot'; E.token = p; E.detail = 'quoting ' + p.symbol;
+      let livePx = p.priceUsd, livePair = p.pair;
+      try { const fr = await dsBestPair(p.mint, p.pairAddress, true); if (fr && +fr.priceUsd > 0) { livePx = +fr.priceUsd; livePair = fr; } } catch {}
+      let qb = null, qs = null;
+      try { qb = await jupQuote(WSOL, p.mint, Math.floor(usd / solPx * 1e9), c.slippageBps); if (qb && qb.ok) qs = await jupQuote(p.mint, WSOL, Math.max(1, qb.outAmount), c.slippageBps); } catch {}
+      const reasons = [];
+      if (!qb || !qb.ok) reasons.push('no buy quote (Jupiter)');
+      else if (Math.abs(+qb.impactPct || 0) > c.maxImpactPct) reasons.push('buy impact ' + Math.abs(+qb.impactPct).toFixed(2) + '%');
+      if (!qs || !qs.ok) reasons.push('sell quote failed (honeypot)');
+      else if (Math.abs(+qs.impactPct || 0) > c.maxImpactPct + 4) reasons.push('sell impact ' + Math.abs(+qs.impactPct).toFixed(2) + '%');
+      if ((bot.tokenCooldownUntil || {})[p.mint] > now) reasons.push('token cooldown');
+      if (reasons.length) { bot._execRetry[p.mint] = now; frLog({ stage: 'risk', kind: 'kill', code: 'risk', mint: p.mint, symbol: p.symbol, icon: p.icon, reason: reasons.join('; ') }); continue; }
+      const ticket = { strat: 'fresh', mint: p.mint, symbol: p.symbol, icon: p.icon, usd, score: p.score, expectedPx: livePx, priceUsd: livePx, quoteBuy: qb, quoteSell: qs, creator: p.creator,
+        risk: { stopPct: c.slPct, trailArmPct: c.trailArmPct, trailPct: c.trailPct, registeredAt: now },
+        scout: { pair: livePair || p.pair, mcap: p.mcap, liqUsd: (livePair && livePair.liquidity && +livePair.liquidity.usd) || 0, pairAddress: p.pairAddress } };
+      frLog({ stage: 'risk', kind: 'plan', mint: p.mint, symbol: p.symbol, icon: p.icon, reason: 'stop −' + Math.round(c.slPct * 100) + '% · TP ' + Math.round(c.tpSellPct * 100) + '% at +' + Math.round(c.tpPct * 100) + '% · trail ' + Math.round(c.trailPct * 100) + '% · dump/dev-sell exits · max ' + c.maxHoldMin + ' min' });
+      const pos = await executeBuy(ticket);
+      if (pos) { fills++; delete bot._execRetry[p.mint]; ppSyncSubs(); } else bot._execRetry[p.mint] = Date.now();
+    }
+    if (fills) E.detail = 'bought ' + fills; else if (!passed.length) { E.status = 'idle'; E.detail = bot.positions.filter(x => x.strat === 'fresh').length + ' fresh open'; }
+    return fills;
+  }
+  async function runFresh() {
+    const t0 = Date.now();
+    if (!PP.ws && !PP.timer) ppConnect();
+    const sc = await frScout();
+    const pass = await frFilter(sc);
+    const passed = frAnalyst(pass);
+    const fills = await frExecutor(passed);
+    bot._lastFreshCycle = { t: Date.now(), ms: Date.now() - t0, cands: sc.cands.length, checked: Math.min(8, sc.cands.length), survivors: pass.length, passed: passed.length, fills, ws: PP.state };
+    const R = bot.agentsF.risk; const nF = bot.positions.filter(p => p.strat === 'fresh').length;
+    if (!nF) { R.status = 'idle'; R.detail = 'no fresh positions'; }
+    else if (R.status !== 'danger') { R.status = 'hot'; R.detail = nF + ' open · −' + Math.round(fcfg().slPct * 100) + '% / TP +' + Math.round(fcfg().tpPct * 100) + '%'; }
+    return bot._lastFreshCycle;
+  }
+
+  /* ---- Fresh exits: every 1 s tick AND on every streamed trade ---- */
+  function freshMark(pos) {
+    const now = Date.now();
+    const ws = PP.px[pos.mint] && now - PP.px[pos.mint].t < 10000 ? PP.px[pos.mint].px : 0;
+    const ds = bot._px && bot._pxTs && now - (bot._pxTs[pos.mint] || 0) < 5000 ? bot._px[pos.mint] : 0;
+    const j = bot._jupPx && bot._jupTs && now - (bot._jupTs[pos.mint] || 0) < 8000 ? bot._jupPx[pos.mint] : 0;
+    const c = [ws, ds, j].filter(x => x > 0);
+    return { mark: c.length ? Math.min.apply(null, c) : 0, mid: ds || ws || j || 0, src: c.length };
+  }
+  function freshDecide(pos) {
+    const now = Date.now(); const { mark, mid } = freshMark(pos);
+    if (mid > (pos.peakPx || 0)) { pos.peakPx = mid; pos.peakAt = now; }
+    return F.decideExit(pos, mark, now, fcfg(), { pair: pos._pair, trades: PP.subs.has(pos.mint) ? PP.trades[pos.mint] || [] : null, lastDevSellT: PP.devSell[pos.mint], bigSell: PP.bigSell[pos.mint], rugged: !!pos._rugged, pairGone: !!pos._pairGone && !pos._pair });
+  }
+  async function freshExitCheck(pos, via) {
+    if (!pos || pos._selling || !bot.positions.includes(pos)) return;
+    const d = freshDecide(pos);
+    if (d.action === 'hold') return;
+    pos._exitVia = via; pos._exitSignalAt = Date.now();
+    const R = bot.agentsF.risk; R.status = d.reason === 'tp' || d.reason === 'trail' ? 'hot' : 'danger'; R.detail = d.why;
+    await executeSell(pos, d.action === 'sell_partial' ? d.pct : 1, d.reason, d.why + ' (' + via + ')');
+    ppSyncSubs();
+  }
 
   /** Pipeline: Scout → Filter → Analyst → Executor → Risk (each stage gets only the previous output). Logger records all. */
   async function runPipeline() {
@@ -1105,6 +1426,9 @@
     pushEquity(bot.equityUsd);
     bot.stats.cycles++;
     const t0 = Date.now();
+    if (freshOn()) { try { await runFresh(); } catch (e) { console.warn('fresh', e); } }
+    else if (PP.ws || PP.timer) ppStop();
+    if (!strongOn()) { bot._lastCycle = Object.assign({ t: Date.now(), ms: Date.now() - t0, fresh: true }, bot._lastFreshCycle || {}); saveLog(); return bot._lastCycle; }
     const scoutOut = await agentScout();
     const filterOut = await agentFilter(scoutOut);
     const analystOut = await agentAnalyst(filterOut);
@@ -1178,7 +1502,7 @@
     bot.agents = idleAgents();
     save(); startTimers(); renderBot();
   }
-  function stopBot() { bot.running = false; stopTimers(); save(); renderBot(); }
+  function stopBot() { bot.running = false; stopTimers(); ppStop(); save(); renderBot(); }
   async function killSwitch() {
     bot.halted = 'kill switch';
     toast('Kill switch: selling all positions…');
@@ -1188,12 +1512,28 @@
     toast('Kill switch complete. Bot stopped.');
   }
 
+  function resetPaperAccount(usd) {
+    if (bot.settings.mode === 'LIVE') return false;
+    const was = bot.running;
+    if (was) { bot.running = false; stopTimers(); }
+    usd = Math.round(usd * 100) / 100;
+    bot.settings.paperStartUsd = usd;
+    bot.positions = []; bot.trades = []; bot.equity = []; bot.log = [];
+    bot.cashUsd = usd; bot.startUsd = usd; bot.dayStartEquity = usd; bot.equityUsd = usd;
+    bot.startTs = 0; bot.dayKey = ''; bot.halted = null; bot.consecLosses = 0; bot.cooldownUntil = 0;
+    bot.tokenCooldownUntil = {}; bot.stats = freshStats(); bot.agents = idleAgents(); bot.agentsF = idleAgents();
+    bot._execRetry = {}; bot.lastFlash = null;
+    save();
+    if (was) startBot(); else pushEquity(usd);
+    save();
+    return true;
+  }
   function fmtUsd(n, d) {
     if (n == null || !isFinite(n)) return '—';
     const sign = n < 0 ? '-' : '';
     const a = Math.abs(n);
     const dec = d != null ? d : 2;
-    return sign + '$' + a.toLocaleString('en-US', { minimumFractionDigits: dec, maximumFractionDigits: dec });
+    return FX.wrap(sign, FX.num(a * FX.rate(), dec, dec));
   }
   function fmtCount(n) { return n >= 1000 ? n.toLocaleString('en-US') : String(n); }
   function clockNow() {
@@ -1211,19 +1551,19 @@
   }
   function fmtMc(n) {
     if (n == null || !isFinite(n) || n === 0) return '—';
-    const sign = n < 0 ? '−' : '', a = Math.abs(n);
+    const sign = n < 0 ? '−' : '', a = Math.abs(n) * FX.rate();
     if (a >= 1e6) {
       const v = a / 1e6;
       let s = v >= 10 ? v.toFixed(1) : v.toFixed(2);
       s = s.replace(/\.0+$/, '');
-      return sign + '$' + s + 'M';
+      return FX.wrap(sign, (FX.currency === 'CZK' ? s.replace('.', ',') : s) + 'M');
     }
     if (a >= 1e3) {
       const v = a / 1e3;
       const s = (v >= 100 || Math.abs(v - Math.round(v)) < 0.05) ? String(Math.round(v)) : v.toFixed(1);
-      return sign + '$' + s + 'K';
+      return FX.wrap(sign, (FX.currency === 'CZK' ? s.replace('.', ',') : s) + 'K');
     }
-    return sign + '$' + Math.round(a);
+    return FX.wrap(sign, String(Math.round(a)));
   }
   function sublineLeft() {
     const p = bot.positions[0];
@@ -1477,7 +1817,8 @@
     ['logger', 'Logger', 'kill log']
   ];
   function agentsHTML() {
-    const a = bot.agents;
+    const strat = strategyOf();
+    const a = strat === 'FRESH' ? Object.assign({}, bot.agentsF, { logger: bot.agents.logger }) : bot.agents;
     const featured = () => {
       if (a.risk && a.risk.status === 'danger') return 'risk';
       if (a.executor && a.executor.status === 'hot' && a.executor.token) return 'executor';
@@ -1503,11 +1844,15 @@
       risk: ag => tokLine(null, ag.detail, ag.status === 'danger' ? 'bad' : 'ok'),
       logger: ag => tokLine(null, ag.detail)
     };
-    return '<div class="term-agents six">' + AG_ORDER.map(([key, title, src]) => {
+    const fa = bot.agentsF;
+    const freshStrip = strat === 'BOTH' ? '<div class="fr-strip"><span class="fr-tag">FRESH</span> scout ' + esc(fa.scout.detail) + ' · filter ' + esc(fa.filter.detail) + ' · analyst ' + esc(fa.analyst.detail) + ' · exec ' + esc(fa.executor.detail) + ' · risk ' + esc(fa.risk.detail) + '</div>' : '';
+    const srcOf = { scout: strat === 'FRESH' ? 'pump.fun · dexscreener' : 'dexscreener', filter: strat === 'FRESH' ? 'rugcheck · dev history' : 'rugcheck', analyst: strat === 'FRESH' ? 'hype score' : 'on-chain score', risk: strat === 'FRESH' ? 'tp · trail · dump' : 'stop · trail' };
+    return '<div class="term-agents six' + (strat === 'FRESH' ? ' fresh' : '') + '">' + AG_ORDER.map(([key, title, src0]) => {
+      const src = srcOf[key] || src0;
       const ag = a[key] || { status: 'idle', detail: '' };
       return '<button type="button" class="agcard ' + glow(key, ag) + '" data-ag="' + key + '"' + (ag.note ? ' title="' + esc(ag.note) + '"' : '') + '>' + agentIcon(key, ag.status) +
-        '<div class="agbody"><div class="agtitle">' + title + '</div><div class="agsrc">' + ghIcon() + '<span>' + esc(src) + '</span></div><div class="agbot">' + bottom[key](ag) + '</div></div></button>';
-    }).join('') + '</div>';
+        '<div class="agbody"><div class="agtitle">' + title + (strat === 'FRESH' ? ' <span class="fr-tag">FRESH</span>' : '') + '</div><div class="agsrc">' + ghIcon() + '<span>' + esc(src) + '</span></div><div class="agbot">' + bottom[key](ag) + '</div></div></button>';
+    }).join('') + freshStrip + '</div>';
   }
 
   const STAGE_LABEL = { scout: 'Scout', filter: 'Filter', analyst: 'Analyst', executor: 'Executor', risk: 'Risk', logger: 'Logger' };
@@ -1515,7 +1860,9 @@
     liq_mcap: 'liq/mcap too low', lp_unlocked: 'LP not burned/locked', lp_unknown: 'LP status unknown', mint_auth: 'mint not revoked',
     freeze_auth: 'freeze not revoked', dev_holds: 'dev holds >3%', dev_rugs: 'dev past rugs', bundled: 'bundled >10%',
     pumped_1h: '+80% in 1h', liq_floor: 'liquidity floor', no_rugcheck: 'no RugCheck', rugged: 'rugged', rc_danger: 'RugCheck danger',
-    score_low: 'score < 70', score_nodata: 'not enough data', risk: 'risk blocked', fill_abort: 'fill aborted'
+    score_low: 'score < 70', score_nodata: 'not enough data', risk: 'risk blocked', fill_abort: 'fill aborted',
+    f_pumped: 'Fresh: pumped too far', f_dead: 'Fresh: no activity', f_selling: 'Fresh: sellers in control', f_top10: 'Fresh: top-10 too high',
+    f_dev: 'Fresh: dev history', f_score_low: 'Fresh: hype score low'
   };
   function logRowHTML(e) {
     const st = e.stage || 'logger';
@@ -1527,7 +1874,7 @@
       : e.score != null ? '<div class="' + (e.score >= bot.settings.passScore ? 'up' : '') + '">' + e.score + '</div>'
       : e.kind === 'trade' ? '<div>' + fmtUsd(e.usd) + '</div>' : '';
     return '<div class="lgr lg-' + esc(st) + ' k-' + esc(e.kind) + '"><div class="act-av">' + tokAv(e.icon, e.symbol) + '<i class="lg-dot" style="background:' + (AG_COLORS[st] || '#888') + '"></i></div>' +
-      '<div class="act-m"><div class="act-t"><span class="lg-st">' + esc(STAGE_LABEL[st] || st) + '</span> ' + esc(verb) + ' ' + esc(e.symbol || '') + '</div>' +
+      '<div class="act-m"><div class="act-t">' + (e.tag === 'fresh' ? '<span class="fr-tag">FRESH</span> ' : '') + '<span class="lg-st">' + esc(STAGE_LABEL[st] || st) + '</span> ' + esc(verb) + ' ' + esc(e.symbol || '') + '</div>' +
       '<div class="lg-why">' + esc(e.reason || '') + '</div></div>' +
       '<div class="act-r">' + right + '<div class="act-s">' + esc(clockAt(e.t)) + (e.n > 1 ? ' · ×' + e.n : '') + '</div></div></div>';
   }
@@ -1630,7 +1977,7 @@
       '<div class="term-pnl"><span class="'+(p.pnl >= 0 ? 'up' : 'dn')+'">'+(p.pnl >= 0 ? '▲' : '▼')+' '+fmtUsd(Math.abs(p.pnl))+' ('+Math.abs(p.pct).toFixed(2)+'%)</span><span class="term-mult">'+p.mult.toFixed(2)+'x</span></div>'+
       '</div>'+
       '<div class="term-tfs">'+['LIVE','1H','4H','1D','1W','ALL'].map(t => '<button type="button" data-tf="'+t+'" class="'+(bot.tf === t ? 'on' : '')+'">'+(t === 'LIVE' ? '• LIVE' : t)+'</button>').join('')+'</div>'+
-      '<div class="term-h3">Agents <span>'+(bot.running || bot._demoLive ? '6 running' : 'idle')+'</span></div>'+agentsHTML()+
+      '<div class="term-h3">Agents <span>'+(bot.running || bot._demoLive ? (strategyOf() === 'STRONG' ? '6 running' : strategyOf() === 'FRESH' ? 'Fresh · 6 running' : 'Strong + Fresh') : 'idle')+'</span></div>'+agentsHTML()+
       '<div class="term-h3">Activity <span>'+bot.trades.length+' trade'+(bot.trades.length === 1 ? '' : 's')+'</span></div>'+
       '<div class="term-act">'+activityHTML()+'</div>'+(bot._demoApplied ? '' : positionsHTML())+
       '<div class="term-foot"><button type="button" class="term-cta '+(bot.running ? 'stop' : '')+'" id="termToggle">'+(bot.running ? 'Pause bot' : (bot.settings.mode === 'LIVE' ? 'Start LIVE bot' : 'Start paper bot'))+'</button>'+
@@ -1816,7 +2163,42 @@
       '<div class="card"><h3>Mode</h3><div class="seg" id="modeSeg">'+
       '<button type="button" data-mode="PAPER" class="'+(s.mode !== 'LIVE' ? 'on' : '')+'">PAPER</button>'+
       '<button type="button" data-mode="LIVE" class="'+(s.mode === 'LIVE' ? 'on' : '')+'">LIVE</button></div>'+
-      '<div class="note">'+(s.mode === 'LIVE' ? 'LIVE uses real SOL in the burner wallet. Trades are signed on this phone and sent to Solana.' : 'PAPER simulates fills from live Jupiter quotes. No real money moves.')+'</div></div>'+
+      '<div class="note">'+(s.mode === 'LIVE' ? 'LIVE uses real SOL in the burner wallet. Trades are signed on this phone and sent to Solana.' : 'PAPER simulates fills from live Jupiter quotes. No real money moves.')+'</div>'+
+      (function () {
+        const fi = FX.info(), cz = fi.currency === 'CZK';
+        const startUsd = +s.paperStartUsd > 0 ? +s.paperStartUsd : 200;
+        const shown = cz ? Math.round(startUsd * fi.rate) : +startUsd.toFixed(2);
+        return '<label class="set-lab">Display currency</label><div class="seg" id="curSeg">'+
+          '<button type="button" data-cur="USD" class="'+(cz ? '' : 'on')+'">USD $</button>'+
+          '<button type="button" data-cur="CZK" class="'+(cz ? 'on' : '')+'">CZK Kč</button></div>'+
+          '<div class="set-hint">'+(cz ? ('1 USD = '+fi.rate.toFixed(3).replace('.', ',')+' Kč'+(fi.approx ? ' (approx. — rate not loaded yet)' : ' · '+(fi.src || '')+' · '+clockAt(fi.ts))+'. ') : '')+'Display only — trades and accounting stay in USD.</div>'+
+          '<label class="set-lab">Paper balance ('+(cz ? 'Kč' : '$')+')</label><input class="set-in" id="paperStart" type="number" min="0" step="'+(cz ? '1' : '0.01')+'" value="'+esc(shown)+'">'+
+          '<div class="set-hint">Starting cash for the paper account (default '+(cz ? Math.round(200 * fi.rate)+' Kč ≈ $200' : '$200')+'). Applied when you tap Reset paper account. Paper min trade '+fmtUsd(PAPER_MIN_USD)+'; LIVE keeps the 0.02 SOL minimum.</div>'+
+          '<button type="button" class="term-cta" id="resetPaper" style="margin-top:8px;background:#2c2c2e;color:#fff"'+(s.mode === 'LIVE' ? ' disabled' : '')+'>Reset paper account</button>'+
+          (s.mode === 'LIVE' ? '<div class="set-hint">Switch to PAPER to reset the paper account.</div>' : '');
+      })()+'</div>'+
+      (function () {
+        const st = strategyOf(); const f = fcfg();
+        return '<div class="card"><h3>Strategy</h3><div class="seg" id="stratSeg">'+
+          [['STRONG', 'Strong'], ['FRESH', 'Fresh (pump.fun)'], ['BOTH', 'Both']].map(([k, t]) => '<button type="button" data-strat="'+k+'" class="'+(st === k ? 'on' : '')+'">'+t+'</button>').join('')+'</div>'+
+          '<div class="note">Strong = the 6-agent filter for established coins (30 min–72 h, $300K–$20M). Fresh = brand-new pump.fun coins with hype (5 min–6 h, $30K–$1M), small size, fast take-profit and dump exits. Both runs them side by side on the same balance.</div></div>'+
+          '<div class="card"><h3>Fresh (pump.fun) settings</h3>'+
+          setNum('f_minAgeMin', 'Min age', f.minAgeMin, 'minutes (default 5)')+
+          setNum('f_maxAgeH', 'Max age', f.maxAgeH, 'hours (default 6)')+
+          setNum('f_minMc', 'Min market cap', Math.round(f.minMc / 1000), '$K (default 30)')+
+          setNum('f_maxMc', 'Max market cap', Math.round(f.maxMc / 1000), '$K (default 1000)')+
+          setNum('f_passScore', 'Hype pass score', f.passScore, '0–100 (default 60)')+
+          setNum('f_maxTop10Pct', 'Max top-10 holders', f.maxTop10Pct, '% excl. bonding curve (default 35)')+
+          setNum('f_maxDevPct', 'Max dev holdings', f.maxDevPct, '% (default 10)')+
+          setNum('f_maxBundlePct', 'Max bundled / insiders', f.maxBundlePct, '% (default 20)')+
+          setNum('f_posPct', 'Position size', +(f.posPct * 100).toFixed(1), '% of equity (default 3, max 8)')+
+          setNum('f_maxOpen', 'Max open Fresh positions', f.maxOpen, 'default 6')+
+          setNum('f_slPct', 'Hard stop', +(f.slPct * 100).toFixed(1), '% below entry (default 12)')+
+          setNum('f_tpPct', 'Take profit at', +(f.tpPct * 100).toFixed(1), '% gain, sells half (default 25)')+
+          setNum('f_trailPct', 'Trailing distance', +(f.trailPct * 100).toFixed(1), '% off peak, 7% after take-profit (default 10)')+
+          setNum('f_maxHoldMin', 'Max hold', f.maxHoldMin, 'minutes (default 20)')+
+          '<div class="set-hint">Also exits at once on: creator selling, one wallet dumping ≥1.5% of supply, 2× more SOL sold than bought in 30 s, sells flipping buys on DexScreener, −15% from peak within 60 s, or no momentum after 6 min. Dev history is checked before every entry (serial launchers and dead/rugged earlier launches are skipped).</div></div>';
+      })()+
       '<div class="card"><h3>1 · Scout</h3>'+
       setNum('scoutMinAgeMin', 'Min pair age', s.scoutMinAgeMin, 'minutes (default 30)')+
       setNum('scoutMaxAgeH', 'Max pair age', s.scoutMaxAgeH, 'hours (default 72)')+
@@ -1861,8 +2243,23 @@
       bot.settings.mode = b.dataset.mode;
       save(); renderSettings();
     });
+    app.querySelectorAll('#curSeg [data-cur]').forEach(b => b.onclick = () => { FX.setCurrency(b.dataset.cur); renderSettings(); FX.refresh().then(() => { if (bot.view === 'settings' && document.getElementById('curSeg')) renderSettings(); }); });
+    const paperStartFromInput = () => {
+      const v = parseFloat(String(($('#paperStart') || {}).value || '').replace(',', '.'));
+      if (!isFinite(v) || v <= 0) return null;
+      return Math.max(1, Math.min(1e6, FX.fromLocal(v)));
+    };
+    $('#resetPaper').onclick = () => {
+      if (bot.settings.mode === 'LIVE') { toast('Switch to PAPER first'); return; }
+      const usd = paperStartFromInput();
+      if (!usd) { toast('Enter a paper balance'); return; }
+      if (!confirm('Reset the paper account to ' + fmtUsd(usd) + '? This clears all paper positions, trades, equity history and the activity log. LIVE wallet is not touched.')) return;
+      resetPaperAccount(usd);
+      renderSettings(); toast('Paper account reset to ' + fmtUsd(usd));
+    };
     $('#saveSet').onclick = () => {
       const val = id => parseFloat(document.getElementById(id).value);
+      { const ps = paperStartFromInput(); if (ps) bot.settings.paperStartUsd = +ps.toFixed(2); }
       const set = (id, lo, hi, mul) => { const v = val(id); if (isFinite(v)) bot.settings[id] = Math.max(lo, Math.min(hi, v * (mul || 1))); };
       set('scoutMinAgeMin', 0, 1440); set('scoutMaxAgeH', 1, 720);
       set('scoutMinMc', 0, 1e9, 1000); set('scoutMaxMc', 0.05e6, 1e10, 1e6);
@@ -1876,6 +2273,13 @@
       bot.settings.smartWallets = String($('#smartWallets').value || '').split(/[\s,]+/).map(x => x.trim()).filter(validWallet).slice(0, 10);
       bot.settings.rpcUrl = ($('#rpcUrl').value || '').trim() || S.DEFAULTS.rpcUrl;
       bot.settings.pipelineV = S.DEFAULTS.pipelineV;
+      const fr = Object.assign({}, bot.settings.fresh || {});
+      const fset = (id, key, lo, hi, mul) => { const v = val(id); if (isFinite(v)) fr[key] = Math.max(lo, Math.min(hi, v * (mul || 1))); };
+      fset('f_minAgeMin', 'minAgeMin', 0, 600); fset('f_maxAgeH', 'maxAgeH', 0.1, 72); fset('f_minMc', 'minMc', 0, 1e8, 1000); fset('f_maxMc', 'maxMc', 1000, 1e9, 1000);
+      fset('f_passScore', 'passScore', 0, 100); fset('f_maxTop10Pct', 'maxTop10Pct', 1, 100); fset('f_maxDevPct', 'maxDevPct', 0, 100); fset('f_maxBundlePct', 'maxBundlePct', 0, 100);
+      fset('f_posPct', 'posPct', 0.005, 0.08, 0.01); fset('f_maxOpen', 'maxOpen', 1, 10); fr.maxOpen = Math.round(fr.maxOpen || 6);
+      fset('f_slPct', 'slPct', 0.02, 0.5, 0.01); fset('f_tpPct', 'tpPct', 0.03, 5, 0.01); fset('f_trailPct', 'trailPct', 0.02, 0.5, 0.01); fset('f_maxHoldMin', 'maxHoldMin', 1, 240);
+      bot.settings.fresh = fr; bot._frScout = null;
       bot._scoutCache = null;
       save(); toast('Settings saved');
     };
@@ -1886,6 +2290,7 @@
       save(); renderSettings(); toast('Defaults restored');
     };
     $('#kill').onclick = () => { if (!confirm('Sell every open position now and stop the bot?')) return; killSwitch(); };
+    app.querySelectorAll('#stratSeg [data-strat]').forEach(b => b.onclick = () => { bot.settings.strategy = b.dataset.strat; bot._frScout = null; if (!freshOn()) ppStop(); save(); renderSettings(); });
   }
 
   function demoRequested() {
@@ -2015,7 +2420,7 @@
     start: startBot, stop: stopBot, kill: killSwitch,
     render: renderBot, save, ensureWallet, keypair, jupQuote, jupSwapTx, signSwap, simulateB64, sendB64,
     rpc, solPrice, loadLiveBalances, equityNow, scanAndMaybeEnter, checkExits, executeBuy, executeSell,
-    strategy: S, WSOL, USDC,
+    strategy: S, WSOL, USDC, sizingSettings, reserveUsd, resetPaperAccount,
     get rejectTally() { return bot.rejectTally || {}; },
     demo: function (on) {
       window.__BOT_DEMO = !!on;

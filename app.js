@@ -32,19 +32,19 @@ const ls = {
 };
 function fmtPrice(p) {
   if (p == null || !isFinite(p)) return '—';
-  const a = Math.abs(p);
-  const d = a >= 1000 ? 0 : a >= 1 ? 2 : a >= 0.01 ? 4 : a >= 0.0001 ? 6 : 8;
-  return '$' + p.toLocaleString('en-US', { minimumFractionDigits: a >= 1000 ? 0 : Math.min(d, 2), maximumFractionDigits: d });
+  const r = FX.rate(), q = p * r, b = Math.abs(q);
+  const d2 = b >= 1000 ? 0 : b >= 1 ? 2 : b >= 0.01 ? 4 : b >= 0.0001 ? 6 : 8;
+  return FX.wrap(q < 0 ? '-' : '', FX.num(b, b >= 1000 ? 0 : Math.min(d2, 2), d2));
 }
 const fmtPct = v => v == null || !isFinite(v) ? '—' : (v >= 0 ? '+' : '') + v.toFixed(2) + '%';
 const pctCls = v => v >= 0 ? 'up' : 'dn';
-function fmtBig(n) { if (n == null || !isFinite(n) || n === 0) return '—'; const sign = n < 0 ? '-' : ''; const a = Math.abs(n); const u = [[1e12,'T'],[1e9,'B'],[1e6,'M'],[1e3,'K']]; for (const [v, s] of u) if (a >= v) return sign + '$' + (a / v).toFixed(2) + s; return sign + '$' + a.toFixed(0); }
+function fmtBig(n) { if (n == null || !isFinite(n) || n === 0) return '—'; const sign = n < 0 ? '-' : ''; const a = Math.abs(n) * FX.rate(); const u = [[1e12,'T'],[1e9,'B'],[1e6,'M'],[1e3,'K']]; for (const [v, s] of u) if (a >= v) return FX.wrap(sign, FX.fixed(a / v, 2) + s); return FX.wrap(sign, FX.fixed(a, 0)); }
 function fmtMcVal(n) {
   if (n == null || !isFinite(n)) return '—';
-  const sign = n < 0 ? '-' : ''; const a = Math.abs(n);
+  const sign = n < 0 ? '-' : ''; const a = Math.abs(n) * FX.rate();
   const u = [[1e12,'T'],[1e9,'B'],[1e6,'M'],[1e3,'K']];
-  for (const [v, s] of u) if (a >= v) return sign + '$' + (a / v).toFixed(a >= 10 * v ? 1 : 2) + s;
-  return sign + '$' + a.toFixed(a >= 100 ? 0 : 2);
+  for (const [v, s] of u) if (a >= v) return FX.wrap(sign, FX.fixed(a / v, a >= 10 * v ? 1 : 2) + s);
+  return FX.wrap(sign, FX.fixed(a, a >= 100 ? 0 : 2));
 }
 const pairMc = p => { const n = p && (p.marketCap || p.fdv); return n && isFinite(n) ? +n : null; };
 const coinMc = c => c && c.mcap && isFinite(c.mcap) ? +c.mcap : null;

@@ -72,24 +72,106 @@ function timeAgo(ts) { const s = Math.round((Date.now() - ts) / 1000); if (s < 1
 function toast(msg, ms = 3200) { const t = $('#toast'); t.textContent = msg; t.hidden = false; clearTimeout(toast._t); toast._t = setTimeout(() => t.hidden = true, ms); }
 class HttpError extends Error { constructor(status, url) { super('HTTP ' + status); this.status = status; this.url = url; } }
 const fetchBackoff = {};
+/* v11 network layer: per-host pacing, honest per-source health, TypeError-as-probable-429 backoff.
+ * GeckoTerminal and DexScreener answer rate limits / Cloudflare challenges without CORS headers, so the browser
+ * reports them as a TypeError ("Load failed" on iOS) that looks exactly like being offline. */
+const HOST_GAP = { 'api.geckoterminal.com': 2500, 'api.dexscreener.com': 300 };
+const HOST_NAME = { 'api.geckoterminal.com': 'GeckoTerminal', 'api.dexscreener.com': 'DexScreener', 'api.rugcheck.xyz': 'RugCheck', 'api.coingecko.com': 'CoinGecko' };
+const hostGate = {};   // host -> { last, chain }
+const srcHealth = {};  // host -> { ok, fail, kind, streak }
+window.srcHealth = srcHealth;
+function noteSrc(host, ok, kind) {
+  if (!host) return; const h = srcHealth[host] || (srcHealth[host] = { ok: 0, fail: 0, kind: '', streak: 0 });
+  if (ok) { h.ok = Date.now(); h.streak = 0; h.kind = ''; } else { h.fail = Date.now(); h.kind = kind; h.streak++; }
+}
+/** 'ok' | 'limited' | 'down' | 'unknown' for a host, looking at the last few minutes. */
+function srcState(host) {
+  const h = srcHealth[host]; if (!h) return 'unknown';
+  if (h.fail > h.ok && Date.now() - h.fail < 5 * 60e3) return h.kind === 'http' ? 'down' : 'limited';
+  return h.ok ? 'ok' : 'unknown';
+}
+window.srcState = srcState;
+/** One-line, honest summary of the DEX data sources. Returns '' when everything is fine. */
+function srcSummary() {
+  if (navigator.onLine === false) return 'You are offline';
+  const gt = srcState('api.geckoterminal.com'), ds = srcState('api.dexscreener.com');
+  const bad = s => s === 'limited' || s === 'down';
+  if (bad(gt) && bad(ds)) return 'GeckoTerminal and DexScreener are rate-limiting this network';
+  if (bad(gt)) return 'GeckoTerminal limited — using DexScreener';
+  if (bad(ds)) return 'DexScreener limited — using GeckoTerminal';
+  return '';
+}
+window.srcSummary = srcSummary;
+async function hostWait(host, critical) {
+  const gap = HOST_GAP[host]; if (!gap) return;
+  const g = hostGate[host] || (hostGate[host] = { last: 0, chain: Promise.resolve() });
+  if (critical) { g.last = Math.max(g.last, Date.now()); return; }
+  const turn = g.chain.then(async () => { const w = g.last + gap - Date.now(); if (w > 0) await new Promise(r => setTimeout(r, w)); g.last = Date.now(); });
+  g.chain = turn.catch(() => {});
+  await turn;
+}
+function setBackoff(host, ms) { if (host) fetchBackoff[host] = Math.max(fetchBackoff[host] || 0, Date.now() + ms); }
 async function getJSON(url, timeout = 12000, opts) {
   const critical = !!(opts && opts.critical);
   const host = (() => { try { return new URL(url, location.href).host; } catch { return ''; } })();
-  if (host && fetchBackoff[host] && Date.now() < fetchBackoff[host] && !critical) throw new HttpError(429, url);
+  if (host && fetchBackoff[host] && Date.now() < fetchBackoff[host] && !critical) { const e = new HttpError(429, url); e.backoff = true; throw e; }
+  await hostWait(host, critical);
+  if (host && fetchBackoff[host] && Date.now() < fetchBackoff[host] && !critical) { const e = new HttpError(429, url); e.backoff = true; throw e; }
   const ctl = new AbortController(); const id = setTimeout(() => ctl.abort(), timeout);
   try {
-    const r = await fetch(url, { signal: ctl.signal });
+    let r;
+    try { r = await fetch(url, { signal: ctl.signal }); }
+    catch (e) {
+      // Network-level failure. If the device is online, GT/DS failures are almost always a 429 / Cloudflare block
+      // stripped of CORS headers — back off that host instead of hammering it and calling it "offline".
+      const aborted = e && e.name === 'AbortError';
+      const paced = !!HOST_GAP[host];
+      if (navigator.onLine !== false && host && !critical) {
+        const h = srcHealth[host]; const n = ((h && h.streak) || 0) + 1;
+        const base = host === 'api.geckoterminal.com' ? 30000 : paced ? 15000 : 8000;
+        setBackoff(host, Math.min(paced ? 90000 : 30000, base * Math.pow(1.6, n - 1)));
+      }
+      noteSrc(host, false, navigator.onLine === false ? 'offline' : aborted ? 'timeout' : 'blocked');
+      const ne = new HttpError(0, url); ne.net = true; ne.message = aborted ? 'timeout' : 'network/blocked'; throw ne;
+    }
     if (r.status === 429) {
       const ra = parseInt(r.headers.get('retry-after'), 10);
-      const fallback = critical ? 2500 : 12000;
-      const ms = Math.min(critical ? 4000 : 60000, Math.max(critical ? 1500 : 8000, (isFinite(ra) && ra > 0 && ra < 1000 ? ra * 1000 : (ra || 0)) || fallback));
-      if (host) fetchBackoff[host] = Date.now() + ms;
+      const fallback = critical ? 2500 : (host === 'api.geckoterminal.com' ? 30000 : 12000);
+      const ms = Math.min(critical ? 4000 : 90000, Math.max(critical ? 1500 : 8000, (isFinite(ra) && ra > 0 && ra < 1000 ? ra * 1000 : (ra || 0)) || fallback));
+      setBackoff(host, ms);
+      noteSrc(host, false, 'limited');
       throw new HttpError(429, url);
     }
-    if (!r.ok) throw new HttpError(r.status, url);
-    if (host && fetchBackoff[host]) delete fetchBackoff[host];
-    return await r.json();
+    if (!r.ok) {
+      // 403 (Cloudflare) / 5xx = the source is blocking or struggling; other 4xx just mean "no such item" (source is reachable).
+      if (r.status === 403 || r.status >= 500) { noteSrc(host, false, 'limited'); if (!critical) setBackoff(host, 15000); } else noteSrc(host, true);
+      throw new HttpError(r.status, url);
+    }
+    if (host && fetchBackoff[host] && !critical) delete fetchBackoff[host];
+    const j = await r.json();
+    noteSrc(host, true);
+    return j;
   } finally { clearTimeout(id); }
+}
+/* Shared JSON cache for list endpoints used by both the Fast tab and the bot's Scout: one network call serves both,
+ * concurrent callers share the in-flight request, and the last good answer is kept (up to 10 min) as a fallback. */
+const jsonCache = new Map(); // url -> { ts, d, p }
+const JSON_KEEP = 10 * 60e3;
+async function cachedJSON(url, ttl, timeout = 12000) {
+  const c = jsonCache.get(url);
+  if (c && c.d !== undefined && Date.now() - c.ts < ttl) return c.d;
+  if (c && c.p) return c.p;
+  const ent = c || {}; jsonCache.set(url, ent);
+  ent.p = getJSON(url, timeout).then(d => { ent.ts = Date.now(); ent.d = d; ent.fresh = true; return d; })
+    .catch(e => { if (ent.d !== undefined && Date.now() - ent.ts < JSON_KEEP) { ent.fresh = false; return ent.d; } throw e; })
+    .finally(() => { ent.p = null; });
+  return ent.p;
+}
+/** Like cachedJSON but tells the caller whether it got fresh data, cached fallback, or nothing. */
+async function cachedJSONx(url, ttl, timeout) {
+  const before = jsonCache.get(url); const hadFresh = before && before.d !== undefined && Date.now() - before.ts < ttl;
+  try { const d = await cachedJSON(url, ttl, timeout); const e = jsonCache.get(url); return { d, ok: true, stale: !hadFresh && e && e.fresh === false, age: e ? Date.now() - e.ts : 0 }; }
+  catch (err) { return { d: null, ok: false, err }; }
 }
 async function pool(items, n, fn) { const out = new Array(items.length); let i = 0; await Promise.all(Array.from({ length: n }, async () => { while (i < items.length) { const k = i++; try { out[k] = await fn(items[k]); } catch { out[k] = null; } } })); return out; }
 async function binance(path) { let err; for (const b of BINANCE) { try { return await getJSON(b + path); } catch (e) { err = e; } } throw err; }
@@ -329,7 +411,7 @@ async function pairsFor(tokens, maxAge = PAIR_TTL) {
     const q = best.get(k); if (!q || ((p.liquidity && p.liquidity.usd) || 0) > ((q.liquidity && q.liquidity.usd) || 0)) best.set(k, p);
   }
   best.forEach((p, k) => pairCache.set(k, { pair: p, ts: Date.now() }));
-  const out = new Map(); want.forEach(k => { const c = pairCache.get(k); if (c) out.set(k, c.pair); });
+  const out = new Map(); want.forEach(k => { const c = pairCache.get(k); if (c && Date.now() - c.ts < 10 * 60e3) out.set(k, c.pair); });
   return out;
 }
 function pairLinks(p, extra) {
@@ -406,6 +488,24 @@ function toFastItem(p, meta) {
   return { key: tkey(p.chainId, p.baseToken.address), chain: p.chainId, addr: p.baseToken.address, name: p.baseToken.name, symbol: p.baseToken.symbol,
     icon: (p.info && p.info.imageUrl) || dexIcon(meta && meta.icon), pair: p, sig: s, risk: r, src: (meta && meta.src) || [] };
 }
+/** Convert a GeckoTerminal pool (+ its included base token) into the DexScreener pair shape the app uses,
+ *  so the Fast list still works when DexScreener is rate-limited. */
+function gtPoolToPair(pl, tokById) {
+  const a = (pl && pl.attributes) || {}; const rel = pl && pl.relationships && pl.relationships.base_token && pl.relationships.base_token.data;
+  const id = rel && rel.id; if (!id || id.indexOf('_') < 0) return null;
+  const net = id.slice(0, id.indexOf('_')), addr = id.slice(id.indexOf('_') + 1); const chain = GT_NET[net]; if (!chain) return null;
+  const t = (tokById && tokById[id] && tokById[id].attributes) || {};
+  const pc = a.price_change_percentage || {}, tx = a.transactions || {}, v = a.volume_usd || {};
+  const T = k => tx[k] ? { buys: +tx[k].buys || 0, sells: +tx[k].sells || 0 } : undefined;
+  const nm = String(a.name || '').split(' / ');
+  return { chainId: chain, dexId: (pl.relationships && pl.relationships.dex && pl.relationships.dex.data && pl.relationships.dex.data.id) || '', pairAddress: a.address,
+    url: `https://www.geckoterminal.com/${net}/pools/${a.address}`, baseToken: { address: addr, name: t.name || nm[0] || '?', symbol: t.symbol || nm[0] || '?' },
+    priceUsd: a.base_token_price_usd, priceChange: { m5: +pc.m5 || 0, h1: +pc.h1 || 0, h6: +pc.h6 || 0, h24: +pc.h24 || 0 },
+    txns: { m5: T('m5'), h1: T('h1'), h6: T('h6'), h24: T('h24') }, volume: { m5: +v.m5 || 0, h1: +v.h1 || 0, h6: +v.h6 || 0, h24: +v.h24 || 0 },
+    liquidity: { usd: +a.reserve_in_usd || 0 }, fdv: +a.fdv_usd || 0, marketCap: +a.market_cap_usd || 0,
+    pairCreatedAt: a.pool_created_at ? Date.parse(a.pool_created_at) : 0, info: t.image_url && /^https?:/.test(t.image_url) ? { imageUrl: t.image_url } : undefined, _src: 'gecko' };
+}
+const FAST_DS_TTL = 60 * 1000, FAST_GT_TTL = 120 * 1000, FAST_GT6_TTL = 300 * 1000;
 async function loadFast(force = false) {
   const c = ls.get('fast');
   if (!force && c && Date.now() - c.ts < FAST_TTL) { fast.items = c.items.map(i => toFastItem(i.pair, i)); fast.ts = c.ts; return; }
@@ -415,26 +515,44 @@ async function loadFast(force = false) {
     const k = tkey(chain, addr); const m = meta.get(k) || { chain, addr, src: [] };
     if (!m.src.includes(src)) m.src.push(src); if (extra && extra.icon && !m.icon) m.icon = extra.icon; meta.set(k, m);
   };
-  const [prof, bl, bt, g1, g2] = await Promise.allSettled([
-    getJSON(DS + '/token-profiles/latest/v1'), getJSON(DS + '/token-boosts/latest/v1'), getJSON(DS + '/token-boosts/top/v1'),
-    getJSON(GT + '/networks/trending_pools?duration=1h&include=base_token'), getJSON(GT + '/networks/trending_pools?duration=6h&include=base_token')]);
-  if (prof.value) prof.value.forEach(x => add(x.chainId, x.tokenAddress, 'new profile', x));
-  if (bl.value) bl.value.forEach(x => add(x.chainId, x.tokenAddress, 'boosted', x));
-  if (bt.value) bt.value.forEach(x => add(x.chainId, x.tokenAddress, 'top boosted', x));
-  [g1, g2].forEach(g => g.value && (g.value.data || []).forEach(pl => {
-    const id = pl.relationships && pl.relationships.base_token && pl.relationships.base_token.data && pl.relationships.base_token.data.id; if (!id) return;
-    const net = id.slice(0, id.indexOf('_')), addr = id.slice(id.indexOf('_') + 1); if (GT_NET[net]) add(GT_NET[net], addr, 'trending');
-  }));
+  // Shared with the bot's Scout (same URLs → same cache); GeckoTerminal is paced per host.
+  const [prof, bl, bt, g1, g2] = await Promise.all([
+    cachedJSONx(DS + '/token-profiles/latest/v1', FAST_DS_TTL), cachedJSONx(DS + '/token-boosts/latest/v1', FAST_DS_TTL), cachedJSONx(DS + '/token-boosts/top/v1', FAST_DS_TTL),
+    cachedJSONx(GT + '/networks/trending_pools?duration=1h&include=base_token', FAST_GT_TTL), cachedJSONx(GT + '/networks/trending_pools?duration=6h&include=base_token', FAST_GT6_TTL)]);
+  const arr = x => Array.isArray(x.d) ? x.d : [];
+  arr(prof).forEach(x => add(x.chainId, x.tokenAddress, 'new profile', x));
+  arr(bl).forEach(x => add(x.chainId, x.tokenAddress, 'boosted', x));
+  arr(bt).forEach(x => add(x.chainId, x.tokenAddress, 'top boosted', x));
+  const gtPair = new Map();
+  [g1, g2].forEach(g => {
+    if (!g.d) return; const toks = {}; (g.d.included || []).forEach(t => { if (t && t.id) toks[t.id] = t; });
+    (g.d.data || []).forEach(pl => {
+      const gp = gtPoolToPair(pl, toks); if (!gp) return;
+      add(gp.chainId, gp.baseToken.address, 'trending');
+      const k = tkey(gp.chainId, gp.baseToken.address); const q = gtPair.get(k);
+      if (!q || gp.liquidity.usd > q.liquidity.usd) gtPair.set(k, gp);
+    });
+  });
+  const dsOk = prof.ok || bl.ok || bt.ok, gtOk = g1.ok || g2.ok;
+  fast.src = { ds: dsOk, gt: gtOk, stale: [prof, bl, bt, g1, g2].some(x => x.stale) };
   if (!meta.size) {
-    if (c) { fast.items = c.items.map(i => toFastItem(i.pair, i)); fast.ts = c.ts; toast('Offline or rate-limited — showing cached fresh coins'); return; }
-    throw new Error('Could not reach DexScreener / GeckoTerminal');
+    const why = navigator.onLine === false ? 'You are offline' : 'GeckoTerminal and DexScreener are not answering on this network (rate limit)';
+    if (c) { fast.items = c.items.map(i => toFastItem(i.pair, i)); fast.ts = c.ts; fast.src.cached = true; srcToast(why + ' — showing coins from ' + timeAgo(c.ts)); return; }
+    throw new Error(why + '. Retrying automatically.');
   }
   const pairs = await pairsFor([...meta.values()], FAST_TTL);
   const items = [];
-  pairs.forEach((p, k) => { if (p && +p.priceUsd > 0 && p.pairCreatedAt) items.push(toFastItem(p, meta.get(k))); });
+  meta.forEach((m, k) => {
+    const p = pairs.get(k) || gtPair.get(k);
+    if (p && +p.priceUsd > 0 && p.pairCreatedAt) items.push(toFastItem(p, m));
+  });
   fast.items = items; fast.ts = Date.now();
   ls.set('fast', { ts: fast.ts, items: items.map(i => ({ pair: i.pair, icon: i.icon, src: i.src })) });
+  const sum = srcSummary(); if (sum) srcToast(sum);
 }
+/** Source-status toast, at most once per 3 minutes per message (no toast spam on every refresh). */
+const _srcToastAt = {};
+function srcToast(msg) { const t = _srcToastAt[msg] || 0; if (Date.now() - t < 3 * 60e3) return; _srcToastAt[msg] = Date.now(); if (['fast', 'watch', 'live'].includes(route().name)) toast(msg, 4000); }
 function fastVisible() {
   const now = Date.now();
   let l = fast.items.filter(i => ((i.pair.liquidity && i.pair.liquidity.usd) || 0) >= 20e3 && ((i.pair.volume && i.pair.volume.h24) || 0) >= 10e3);
@@ -460,7 +578,7 @@ function renderFast() {
   app.innerHTML = `<div class="intro">⚡ <b>Fast flips</b> · fresh pairs (minutes–hours trades) ranked by momentum, buy pressure and volume. Liquidity ≥ $20K. Not predictions.</div>
     <div class="chips">${[[6, '< 6h'], [24, '< 24h'], [72, '< 72h'], [0, 'Any age']].map(([a, t]) => `<button class="chip ${fast.age === a ? 'on' : ''}" data-age="${a}">${t}</button>`).join('')}</div>
     <div class="chips">${chains.map(c => `<button class="chip sm ${fast.chain === c ? 'on' : ''}" data-ch="${c}">${c === 'all' ? 'All chains' : chainName(c)}</button>`).join('')}</div>
-    <div class="meta"><span class="live"><span class="dot"></span><span class="upd" data-ts="${fast.ts}">Updated ${timeAgo(fast.ts)}</span> · ${l.length} coins</span>
+    <div class="meta"><span class="live"><span class="dot"></span><span class="upd" data-ts="${fast.ts}">Updated ${timeAgo(fast.ts)}</span> · ${l.length} coins</span>${srcSummary() ? `<span class="srcwarn">⚠ ${esc(srcSummary())}</span>` : ''}
       <button class="chip sm" id="fsort">Sort: ${({ score: 'Momentum', h1: '1h %', age: 'Newest', risk: 'Lowest risk' })[fast.sort]}</button></div>
     <div class="list">${l.map(fastRowHTML).join('') || `<div class="empty">No fresh coins pass the filters right now.<br>Try a longer age window.</div>`}</div>
     ${DISCLAIMER}`;
@@ -472,8 +590,11 @@ function renderFast() {
 // ---------- Live feed (J7Tracker-style) ----------
 const live = { items: ls.get('live', []), ts: 0, loading: false, err: null, chain: 'all', boot: Date.now(), fresh: new Set() };
 async function loadLive() {
-  const [pr, bo] = await Promise.allSettled([getJSON(DS + '/token-profiles/latest/v1'), getJSON(DS + '/token-boosts/latest/v1')]);
-  if (!pr.value && !bo.value) { if (live.items.length) { toast('Live feed offline — retrying'); return; } throw new Error('Could not reach DexScreener'); }
+  const [pr, bo] = await Promise.allSettled([cachedJSON(DS + '/token-profiles/latest/v1', LIVE_REFRESH - 2000), cachedJSON(DS + '/token-boosts/latest/v1', LIVE_REFRESH - 2000)]);
+  if (!pr.value && !bo.value) {
+    const why = navigator.onLine === false ? 'You are offline' : 'DexScreener is rate-limiting this network';
+    if (live.items.length) { srcToast(why + ' — retrying'); return; } throw new Error(why + '. Retrying automatically.');
+  }
   const now = Date.now(); const map = new Map(live.items.map(i => [i.key, i])); const firstLoad = !live.items.length;
   const incoming = [];
   (pr.value || []).forEach(x => incoming.push({ x, kind: 'new' }));
@@ -734,13 +855,13 @@ const on = (...names) => () => names.includes(route().name);
 const refreshSlow = (force = true) => run(state, () => loadMarkets(force), on('slow', 'watch', 'coin'));
 const refreshFast = (force = true) => run(fast, () => loadFast(force), on('fast', 'watch', 'bot'));
 const refreshLive = () => run(live, loadLive, on('live'));
-async function refresh() { const n = route().name; if (n === 'live') return refreshLive(); if (n === 'bot') { if (window.renderBot) window.renderBot(); return refreshFast(true); } if (n === 'fast' || n === 'token') { if (n === 'token') render(); return refreshFast(true); } if (n === 'watch') { watchPairs = null; refreshFast(true); } return refreshSlow(true); }
+async function refresh() { const n = route().name; if (n === 'live') return refreshLive(); if (n === 'bot') { if (window.renderBot) window.renderBot(); return; } if (n === 'fast' || n === 'token') { if (n === 'token') render(); return refreshFast(true); } if (n === 'watch') { watchPairs = null; refreshFast(true); } return refreshSlow(true); }
 window.refresh = refresh;
 $('#refreshBtn').onclick = () => refresh();
 function schedule() {
   if (document.visibilityState !== 'visible') return; const n = route().name, now = Date.now();
   if (n === 'live' && now - live.ts > LIVE_REFRESH) refreshLive();
-  if ((n === 'fast' || n === 'watch' || n === 'bot') && now - fast.ts > FAST_REFRESH) refreshFast(true);
+  if ((n === 'fast' || n === 'watch') && now - fast.ts > FAST_REFRESH) refreshFast(true);
   if ((n === 'slow' || n === 'watch' || n === 'coin') && now - state.ts > AUTO_REFRESH) refreshSlow(true);
 }
 setInterval(schedule, 5000);

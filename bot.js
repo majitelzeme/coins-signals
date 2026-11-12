@@ -343,6 +343,20 @@
     pairs = pairs.slice().sort((a, b) => ((b.liquidity && +b.liquidity.usd) || 0) - ((a.liquidity && +a.liquidity.usd) || 0));
     return pairs[0];
   }
+  /** One DexScreener call for all open positions (instead of one per position per tick) → fills dsCache['tok:'+mint]. */
+  async function dsBatchPositions(mints) {
+    const list = Array.from(new Set(mints.filter(Boolean))).filter(m => { const h = dsCache['tok:' + m]; return !h || Date.now() - h.ts >= 600; });
+    for (let i = 0; i < list.length; i += 30) {
+      const ch = list.slice(i, i + 30);
+      try {
+        const d = await getJSON(DSAPI + '/tokens/v1/solana/' + ch.join(','), 8000, { critical: true });
+        if (!Array.isArray(d)) continue;
+        const by = {};
+        d.forEach(p => { if (p && (p.chainId || p.chain) === 'solana' && p.baseToken) (by[p.baseToken.address] || (by[p.baseToken.address] = [])).push(p); });
+        ch.forEach(m => { if (by[m] && by[m].length) dsCache['tok:' + m] = { ts: Date.now(), d: by[m] }; });
+      } catch (e) { /* per-position fallback below */ }
+    }
+  }
   async function rugReport(mint) {
     const hit = bot.rugCache[mint];
     if (hit && Date.now() - hit.ts < 180000) return hit.d;
@@ -424,6 +438,7 @@
     bot._px = bot._px || {};
     bot._pxTs = bot._pxTs || {};
     bot._jupPx = bot._jupPx || {};
+    if (bot.positions.length > 1) await dsBatchPositions(bot.positions.map(p => p.mint));
     await Promise.all(bot.positions.map(async p => {
       try {
         let pair = null;
@@ -637,48 +652,58 @@
     return { gtByMint, dsMeta };
   }
 
-  // GeckoTerminal allows ~30 calls/min per IP and answers 429 without CORS headers, so pace it.
-  const gtGate = { last: 0, pauseUntil: 0, gapMs: 2100 };
+  // GeckoTerminal allows ~30 calls/min per IP (shared by everyone on a mobile carrier's CGNAT address) and answers
+  // 429 without CORS headers. Pacing (≥2.5 s gap) and backoff live in the shared getJSON host gate in app.js.
+  const gtGate = { get pauseUntil() { return (fetchBackoff['api.geckoterminal.com'] || 0); } };
   async function gtGet(url) {
     if (Date.now() < gtGate.pauseUntil) throw new Error('GT paused');
-    const wait = gtGate.last + gtGate.gapMs - Date.now();
-    if (wait > 0) await sleep(wait);
-    gtGate.last = Date.now();
-    try { return await getJSON(url, 12000); }
-    catch (e) { gtGate.pauseUntil = Date.now() + 20000; throw e; }
+    return await getJSON(url, 12000);
   }
-  const GT_SCOUT = [
-    '/networks/solana/trending_pools?duration=1h&page=1', '/networks/solana/trending_pools?duration=6h&page=1',
+  const GT_CORE = ['/networks/solana/trending_pools?duration=1h&page=1', '/networks/solana/trending_pools?duration=6h&page=1'];
+  const GT_ROTATE = [
     '/networks/solana/trending_pools?duration=24h&page=1', '/networks/solana/trending_pools?duration=5m&page=1',
     '/networks/solana/pools?sort=h24_tx_count_desc&page=1', '/networks/solana/trending_pools?duration=1h&page=2',
     '/networks/solana/trending_pools?duration=6h&page=2', '/networks/solana/trending_pools?duration=24h&page=2'
   ];
+  const SCOUT_TTL = 120000;          // re-scout the market at most every 2 min
+  const SCOUT_KEEP = 10 * 60e3;      // keep last good source data up to 10 min
+  const DS_LISTS = [DSAPI + '/token-profiles/latest/v1', DSAPI + '/token-boosts/latest/v1', DSAPI + '/token-boosts/top/v1'];
+  bot._gtRes = {};                   // url -> { ts, d }
+  bot._gtRot = 0;
   async function scoutFetch() {
     const c = bot._scoutCache;
-    if (c && Date.now() - c.ts < 90000) return c;
+    if (c && Date.now() - c.ts < SCOUT_TTL) return c;
     const now = Date.now();
-    const gtUrls = GT_SCOUT.map(x => GT + x + '&include=base_token');
-    const dsUrls = [DSAPI + '/token-profiles/latest/v1', DSAPI + '/token-boosts/latest/v1', DSAPI + '/token-boosts/top/v1'];
-    const gtRes = [];
-    for (const u of gtUrls) { try { gtRes.push(await gtGet(u)); } catch { gtRes.push(null); if (Date.now() < gtGate.pauseUntil) break; } }
-    const dsRes = await pool(dsUrls, 3, u => getJSON(u, 10000));
+    // GeckoTerminal: 2 core lists + 1 rotating page per scout (3 calls / 2 min instead of 8 / 90 s).
+    const rot = GT_ROTATE[bot._gtRot++ % GT_ROTATE.length];
+    const gtUrls = GT_CORE.concat([rot]).map(x => GT + x + '&include=base_token');
+    let gtOk = 0, gtTried = 0;
+    for (const u of gtUrls) {
+      if (Date.now() < gtGate.pauseUntil) break;
+      gtTried++;
+      try { const d = await gtGet(u); if (d && d.data) { bot._gtRes[u] = { ts: Date.now(), d }; gtOk++; } }
+      catch { if (Date.now() < gtGate.pauseUntil) break; }
+    }
     const gtPools = [];
-    let gtOk = 0;
-    gtRes.forEach(d => { if (d && d.data) { gtOk++; d.data.forEach(x => gtPools.push(x)); } });
+    let gtCached = 0;
+    Object.keys(bot._gtRes).forEach(u => {
+      const e = bot._gtRes[u];
+      if (Date.now() - e.ts > SCOUT_KEEP) { delete bot._gtRes[u]; return; }
+      if (now - e.ts > 1000 + SCOUT_TTL) gtCached++;
+      (e.d.data || []).forEach(x => gtPools.push(x));
+    });
+    // DexScreener lists: shared cache with the Fast tab (one call serves both), last good kept up to 10 min.
+    const dsX = await Promise.all(DS_LISTS.map(u => cachedJSONx(u, 60000, 10000)));
+    const dsRes = dsX.map(x => x.d);
+    const dsOk = dsX.filter(x => x.ok && !x.stale).length, dsAny = dsX.filter(x => x.ok).length;
     const { gtByMint, dsMeta } = scoutCandidateRecords(gtPools, dsRes, null, now);
     (solanaFastItems() || []).forEach(it => { if (it.addr && !dsMeta[it.addr]) dsMeta[it.addr] = { icon: it.icon || '' }; });
     const mints = Array.from(new Set(Object.keys(gtByMint).concat(Object.keys(dsMeta)))).slice(0, 120);
-    const chunks = [];
-    for (let i = 0; i < mints.length; i += 30) chunks.push(mints.slice(i, i + 30));
-    const dsBatches = await pool(chunks, 2, ch => getJSON(DSAPI + '/tokens/v1/solana/' + ch.join(','), 12000));
+    // Pair data via the shared DexScreener pair cache (app.js pairsFor): only stale tokens are re-fetched.
+    let pmap = new Map();
+    try { pmap = await pairsFor(mints.map(m => ({ chain: 'solana', addr: m })), SCOUT_TTL); } catch (e) { console.warn('scout pairs', e); }
     const bestDs = {};
-    dsBatches.forEach(arr => (Array.isArray(arr) ? arr : []).forEach(p => {
-      if (!p || p.chainId !== 'solana' || !p.baseToken) return;
-      const m = p.baseToken.address;
-      if (!mints.includes(m)) return;
-      const cur = bestDs[m];
-      if (!cur || ((p.liquidity && +p.liquidity.usd) || 0) > ((cur.liquidity && +cur.liquidity.usd) || 0)) bestDs[m] = p;
-    }));
+    mints.forEach(m => { const p = pmap.get(tkey('solana', m)); if (p && p.chainId === 'solana' && p.baseToken && p.baseToken.address === m) bestDs[m] = p; });
     const records = [];
     mints.forEach(m => {
       const ds = bestDs[m], gt = gtByMint[m];
@@ -686,18 +711,50 @@
       if (ds) records.push(S.toScoutPair(ds, gt && gt.address === ds.pairAddress ? gt : null, { mint: m, icon: (dsMeta[m] && dsMeta[m].icon) || '', src }));
       else if (gt) records.push(S.toScoutPair(null, gt, { mint: m, symbol: String(gt.name || '?').split(' / ')[0], src }));
     });
-    bot._scoutCache = { ts: now, records, gtOk, gtCalls: gtUrls.length, dsResolved: Object.keys(bestDs).length, mints: mints.length };
-    return bot._scoutCache;
+    const dsDown = window.srcState && ['limited', 'down'].includes(window.srcState('api.dexscreener.com'));
+    const gtDown = gtTried === 0 || gtOk === 0;
+    const health = {
+      gt: gtOk ? 'ok' : (gtPools.length ? 'cache' : 'down'),
+      ds: dsOk && !dsDown ? 'ok' : (dsAny || Object.keys(bestDs).length ? 'cache' : 'down'),
+      offline: navigator.onLine === false
+    };
+    let out = { ts: now, records, gtOk, gtCalls: gtTried, dsResolved: Object.keys(bestDs).length, mints: mints.length, health, limited: health.gt !== 'ok' || health.ds !== 'ok' };
+    if (!records.length && bot._scoutGood && now - bot._scoutGood.ts < SCOUT_KEEP) {
+      // Every source failed this round: keep scouting on the last good records instead of reporting 0 pairs.
+      out = Object.assign({}, bot._scoutGood, { ts: now, health, limited: true, fromCache: true, cacheAge: now - bot._scoutGood.ts });
+    } else if (records.length && !(health.gt === 'down' && health.ds === 'down')) {
+      bot._scoutGood = { ts: now, records, gtOk, gtCalls: gtTried, dsResolved: out.dsResolved, mints: mints.length };
+    }
+    out.unreachable = !out.records.length && health.gt === 'down' && health.ds === 'down';
+    noteSourceIssues(health, gtDown && dsDown);
+    // A degraded round is cached for only 45 s so recovery is picked up quickly (backoff still prevents hammering).
+    if (out.limited) out.ts = now - SCOUT_TTL + 45000;
+    bot._scoutCache = out;
+    return out;
+  }
+  const _srcLogAt = {};
+  function noteSourceIssues(h, both) {
+    const msgs = [];
+    if (h.offline) msgs.push('device offline — using last scout data');
+    else if (h.gt !== 'ok' && h.ds !== 'ok') msgs.push('GeckoTerminal and DexScreener not answering (rate limit on this network)' + (h.gt === 'cache' || h.ds === 'cache' ? ' — using cached data' : ''));
+    else if (h.gt !== 'ok') msgs.push('GeckoTerminal not answering (rate limit) — scouting via DexScreener' + (h.gt === 'cache' ? ' + cached Gecko lists' : ''));
+    else if (h.ds !== 'ok') msgs.push('DexScreener not answering (rate limit) — scouting via GeckoTerminal' + (h.ds === 'cache' ? ' + cached DexScreener data' : ''));
+    msgs.forEach(m => {
+      if (Date.now() - (_srcLogAt[m] || 0) < 5 * 60e3) return;
+      _srcLogAt[m] = Date.now();
+      logEvent({ stage: 'scout', kind: 'source', reason: m });
+    });
   }
 
   /** 1) SCOUT — finds Solana pairs 30m–72h old with mcap $300k–$20M. */
   async function agentScout() {
     const A = bot.agents.scout;
-    A.status = 'hot'; A.detail = 'scanning…';
+    if (!A.limited) { A.status = 'hot'; A.detail = 'scanning…'; }
     const now = Date.now();
     let fetched;
     try { fetched = await scoutFetch(); }
-    catch (e) { A.status = 'danger'; A.detail = 'data error'; return { stage: 'scout', t: now, pairs: [], skipped: {}, seen: 0 }; }
+    catch (e) { console.warn('scout', e); A.status = 'danger'; A.limited = true; A.detail = 'APIs unreachable'; A.note = 'Sources unreachable'; return { stage: 'scout', t: now, pairs: [], skipped: {}, seen: 0 }; }
+    A.status = 'hot'; A.limited = false;
     const out = S.scoutStage(fetched.records, now, bot.settings);
     bot._lastScout = out;
     bot.scanned += out.seen;
@@ -707,6 +764,17 @@
     bot.stats.scoutSkipLast = out.skipped;
     A.n = out.pairs.length;
     A.detail = out.pairs.length + ' pair' + (out.pairs.length === 1 ? '' : 's') + ' in range';
+    A.note = '';
+    if (fetched.unreachable) {
+      A.status = 'danger'; A.limited = true;
+      A.detail = navigator.onLine === false ? 'offline' : 'APIs unreachable';
+      A.note = navigator.onLine === false ? 'Device offline' : 'Sources unreachable — GeckoTerminal and DexScreener are not answering (rate limit on this network). Retrying with backoff.';
+    } else if (fetched.limited) {
+      const via = fetched.fromCache ? 'cache' : (fetched.health.gt === 'ok' ? 'GeckoTerminal' : fetched.health.ds === 'ok' ? 'DexScreener' : 'cache');
+      A.limited = true;
+      A.detail = (via === 'cache' ? 'cached · ' : 'limited · ') + out.pairs.length + ' pair' + (out.pairs.length === 1 ? '' : 's');
+      A.note = 'Data limited — using ' + via + ' · ' + out.pairs.length + ' pairs in range';
+    }
     bot._seenMint = bot._seenMint || {};
     out.pairs.forEach(p => {
       if (bot._seenMint[p.mint] && now - bot._seenMint[p.mint] < 30 * 60e3) return;
@@ -748,14 +816,20 @@
     return out;
   }
 
+  const gtMultiCache = {};   // pool address -> { ts, a }  (cuts analyst GT calls to ≤1/min)
   async function gtPoolsMulti(addrs) {
     const out = {};
     const list = addrs.filter(Boolean).slice(0, 30);
     if (!list.length) return out;
-    try {
-      const d = await gtGet(GT + '/networks/solana/pools/multi/' + list.join(','));
-      ((d && d.data) || []).forEach(x => { if (x && x.attributes) out[x.attributes.address] = x.attributes; });
-    } catch {}
+    const need = list.filter(a => !gtMultiCache[a] || Date.now() - gtMultiCache[a].ts > 60000);
+    if (need.length) {
+      try {
+        const d = await gtGet(GT + '/networks/solana/pools/multi/' + need.join(','));
+        ((d && d.data) || []).forEach(x => { if (x && x.attributes) gtMultiCache[x.attributes.address] = { ts: Date.now(), a: x.attributes }; });
+        need.forEach(a => { if (!gtMultiCache[a]) gtMultiCache[a] = { ts: Date.now(), a: null }; else if (Date.now() - gtMultiCache[a].ts > 60000) gtMultiCache[a].ts = Date.now(); });
+      } catch {}
+    }
+    list.forEach(a => { const c = gtMultiCache[a]; if (c && c.a && Date.now() - c.ts < 10 * 60e3) out[a] = c.a; });
     return out;
   }
   function validWallet(w) { return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(String(w || '').trim()); }
@@ -1362,7 +1436,7 @@
     };
     const tokLine = (tok, txt, cls) => (tok ? tokAv(tok.icon, tok.symbol, 'tav xs') : '') + '<span class="agline">' + (tok ? '<span class="agtok">' + esc(tok.symbol) + '</span> ' : '') + '<span class="' + (cls || 'ok') + '">' + esc(txt) + '</span></span>';
     const bottom = {
-      scout: ag => '<span class="agline"><span class="ok">' + esc(ag.detail) + '</span></span>',
+      scout: ag => '<span class="agline"><span class="' + (ag.status === 'danger' ? 'bad' : ag.limited ? 'warn' : 'ok') + '">' + esc(ag.detail) + '</span></span>',
       filter: ag => {
         const k = ag.n || 0;
         return '<span class="agline">' + (ag.status === 'idle' ? '<span class="ok">' + esc(ag.detail) + '</span>' : '<span class="bad">' + k + ' killed</span> <span class="ok">· ' + esc(String(bot.stats.filterPassLast || 0)) + ' pass</span>') + '</span>';
@@ -1374,7 +1448,7 @@
     };
     return '<div class="term-agents six">' + AG_ORDER.map(([key, title, src]) => {
       const ag = a[key] || { status: 'idle', detail: '' };
-      return '<button type="button" class="agcard ' + glow(key, ag) + '" data-ag="' + key + '">' + agentIcon(key, ag.status) +
+      return '<button type="button" class="agcard ' + glow(key, ag) + '" data-ag="' + key + '"' + (ag.note ? ' title="' + esc(ag.note) + '"' : '') + '>' + agentIcon(key, ag.status) +
         '<div class="agbody"><div class="agtitle">' + title + '</div><div class="agsrc">' + ghIcon() + '<span>' + esc(src) + '</span></div><div class="agbot">' + bottom[key](ag) + '</div></div></button>';
     }).join('') + '</div>';
   }
@@ -1390,7 +1464,7 @@
     const st = e.stage || 'logger';
     const verb = e.kind === 'kill' ? (st === 'analyst' ? 'rejected' : st === 'risk' ? 'blocked' : st === 'executor' ? 'aborted' : 'killed')
       : e.kind === 'pass' ? 'passed' : e.kind === 'found' ? 'found' : e.kind === 'plan' ? 'armed stop'
-      : e.kind === 'trade' ? (e.side === 'buy' ? 'bought' : e.side === 'stop' ? 'stopped' : 'sold') : e.kind === 'skip' ? 'skipped' : 'noted';
+      : e.kind === 'trade' ? (e.side === 'buy' ? 'bought' : e.side === 'stop' ? 'stopped' : 'sold') : e.kind === 'skip' ? 'skipped' : e.kind === 'source' ? 'data source issue' : 'noted';
     const right = e.kind === 'trade' && e.side !== 'buy' && e.pnlUsd != null
       ? '<div class="' + (e.pnlUsd >= 0 ? 'up' : 'dn') + '">' + (e.pnlUsd >= 0 ? '+' : '') + moneyTxt(e.pnlUsd) + '</div>'
       : e.score != null ? '<div class="' + (e.score >= bot.settings.passScore ? 'up' : '') + '">' + e.score + '</div>'

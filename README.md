@@ -13,6 +13,8 @@ Static installable web app (PWA) that scans memecoins. It has three views, and n
   6. **Logger**: every kill (stage + reason), score and trade, kept in localStorage (last 600 events). Tap an agent or **Log** to filter by agent.
 - **Live**: a feed in the style of J7Tracker that lists new DexScreener token profiles and boosts. It refreshes every 20 seconds and shows social links and copyable contract addresses. Live tweet tracking would need paid X/J7 API keys, so the feed links to each token's X account instead.
 
+**Data sources on mobile networks (v11).** Phones on LTE often share one public IP with many other users (carrier NAT), so GeckoTerminal (~30 calls/min per IP) and DexScreener rate-limit them. Their limit responses carry no CORS headers, so the browser reports a plain network error. The app paces requests per host (GeckoTerminal ≥2.5 s apart), backs off a host after a failure instead of retrying, and shares one cache between the Fast tab and the bot's Scout. Open positions are priced with one batched DexScreener call per tick. If one source fails, the other one is used, and the last good data is kept for up to 10 minutes. The status says which source is limited and only says "offline" when the device is offline.
+
 Every API it uses is public, keyless and CORS-enabled. There is no build step; GitHub Pages serves these files as-is. Bump `VERSION` in `sw.js` when you deploy changes so installed phones pick up the update.
 
 **Not financial advice.** Memecoins are extremely risky, and many fresh tokens are rugs.

@@ -1,4 +1,4 @@
-const VERSION = 'memesignals-v10';
+const VERSION = 'memesignals-v11';
 const SHELL = ['./', './index.html', './styles.css', './app.js', './bot-strategy.js', './bot.js',
   './vendor/lightweight-charts.standalone.production.js', './vendor/solana.bundle.js', './manifest.webmanifest',
   './icons/icon-192.png', './icons/icon-512.png', './icons/icon-maskable-512.png',

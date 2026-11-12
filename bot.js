@@ -1,4 +1,4 @@
-/* Meme Terminal v10 — 6-agent pipeline (Scout → Filter → Analyst → Executor → Risk → Logger). Solana burner wallet, Jupiter swaps. */
+/* Meme Terminal v12 — 6-agent pipeline (Scout → Filter → Analyst → Executor → Risk → Logger). Solana burner wallet, Jupiter swaps. */
 (function () {
   'use strict';
   const S = window.BotStrategy;
@@ -11,7 +11,7 @@
   const RUG = 'https://api.rugcheck.xyz/v1/tokens/';
   const STORE = 'bot:v1';
   const WAL = 'bot:wallet';
-  const SCAN_MS = 30000;
+  const SCAN_MS = 12000;            // v12: pipeline pass every 12 s (uses caches; never overlaps)
   const LOGKEY = 'bot:log';
   const LOG_CAP = 600;
   const GT = 'https://api.geckoterminal.com/api/v2';
@@ -357,10 +357,16 @@
       } catch (e) { /* per-position fallback below */ }
     }
   }
-  async function rugReport(mint) {
+  const rugInflight = {};
+  /** RugCheck report, cached (default 3 min; the Filter passes up to 10 min for coins that are not survivors). Concurrent callers share one request. */
+  async function rugReport(mint, maxAge) {
     const hit = bot.rugCache[mint];
-    if (hit && Date.now() - hit.ts < 180000) return hit.d;
-    const d = await getJSON(RUG + encodeURIComponent(mint) + '/report', 12000);
+    if (hit && Date.now() - hit.ts < (maxAge || 180000)) return hit.d;
+    if (rugInflight[mint]) return rugInflight[mint];
+    const pr = getJSON(RUG + encodeURIComponent(mint) + '/report', 12000);
+    rugInflight[mint] = pr;
+    let d;
+    try { d = await pr; } finally { delete rugInflight[mint]; }
     bot.rugCache[mint] = { ts: Date.now(), d };
     if (d && +d.totalHolders > 0) {
       const h = bot.holderHist[mint] || (bot.holderHist[mint] = []);
@@ -665,35 +671,55 @@
     '/networks/solana/pools?sort=h24_tx_count_desc&page=1', '/networks/solana/trending_pools?duration=1h&page=2',
     '/networks/solana/trending_pools?duration=6h&page=2', '/networks/solana/trending_pools?duration=24h&page=2'
   ];
-  const SCOUT_TTL = 120000;          // re-scout the market at most every 2 min
+  // v12: fresh discovery every ~40 s via DexScreener (high limits); GeckoTerminal stays slow (≤2 list calls/min,
+  // rotating) and runs in the background so it never delays a cycle.
+  const SCOUT_TTL = 35000;           // DexScreener lists + token batches every ~36 s (3 scan ticks)
+  const SCOUT_LIMITED_TTL = 20000;   // degraded round: retry sooner (host backoff still prevents hammering)
+  const GT_ROUND_MS = 60000;         // one GeckoTerminal round per minute…
+  const GT_PER_ROUND = 2;            // …of 2 calls (1 core list alternating 1h/6h + 1 rotating page)
   const SCOUT_KEEP = 10 * 60e3;      // keep last good source data up to 10 min
   const DS_LISTS = [DSAPI + '/token-profiles/latest/v1', DSAPI + '/token-boosts/latest/v1', DSAPI + '/token-boosts/top/v1'];
   bot._gtRes = {};                   // url -> { ts, d }
   bot._gtRot = 0;
+  bot._gtCore = 0;
+  bot._gtRound = { at: 0, ok: 0, tried: 0, p: null };
+  function gtRound() {
+    const R = bot._gtRound;
+    if (R.p || Date.now() - R.at < GT_ROUND_MS) return R.p;
+    R.at = Date.now();
+    const urls = [GT_CORE[bot._gtCore++ % GT_CORE.length], GT_ROTATE[bot._gtRot++ % GT_ROTATE.length]].slice(0, GT_PER_ROUND).map(x => GT + x + '&include=base_token');
+    R.p = (async () => {
+      let ok = 0, tried = 0;
+      for (const u of urls) {
+        if (Date.now() < gtGate.pauseUntil) break;
+        tried++;
+        try { const d = await gtGet(u); if (d && d.data) { bot._gtRes[u] = { ts: Date.now(), d }; ok++; } }
+        catch { if (Date.now() < gtGate.pauseUntil) break; }
+      }
+      R.ok = ok; R.tried = tried; R.done = Date.now();
+      // New GT lists landed after the last scout snapshot → rebuild it on the next 12 s tick (DS data comes from cache).
+      if (ok && bot._scoutCache && bot._scoutCache.ts < R.done) bot._scoutCache.gtStale = true;
+    })().finally(() => { R.p = null; });
+    return R.p;
+  }
   async function scoutFetch() {
     const c = bot._scoutCache;
-    if (c && Date.now() - c.ts < SCOUT_TTL) return c;
+    if (c && !c.gtStale && Date.now() - c.ts < (c.limited ? SCOUT_LIMITED_TTL : SCOUT_TTL)) return c;
     const now = Date.now();
-    // GeckoTerminal: 2 core lists + 1 rotating page per scout (3 calls / 2 min instead of 8 / 90 s).
-    const rot = GT_ROTATE[bot._gtRot++ % GT_ROTATE.length];
-    const gtUrls = GT_CORE.concat([rot]).map(x => GT + x + '&include=base_token');
-    let gtOk = 0, gtTried = 0;
-    for (const u of gtUrls) {
-      if (Date.now() < gtGate.pauseUntil) break;
-      gtTried++;
-      try { const d = await gtGet(u); if (d && d.data) { bot._gtRes[u] = { ts: Date.now(), d }; gtOk++; } }
-      catch { if (Date.now() < gtGate.pauseUntil) break; }
-    }
+    // GeckoTerminal in the background; the very first scout waits for it (bounded) so the first pass is complete.
+    const gp = gtRound();
+    if (gp && !bot._gtRound.done) await Promise.race([gp, sleep(3000)]);
+    const gtOk = bot._gtRound.ok, gtTried = bot._gtRound.tried;
     const gtPools = [];
     let gtCached = 0;
     Object.keys(bot._gtRes).forEach(u => {
       const e = bot._gtRes[u];
       if (Date.now() - e.ts > SCOUT_KEEP) { delete bot._gtRes[u]; return; }
-      if (now - e.ts > 1000 + SCOUT_TTL) gtCached++;
-      (e.d.data || []).forEach(x => gtPools.push(x));
+      if (now - e.ts > GT_ROUND_MS * 2) gtCached++;
+      (e.d.data || []).forEach(x => { if (x && x.attributes) x.attributes._ts = e.ts; gtPools.push(x); });
     });
     // DexScreener lists: shared cache with the Fast tab (one call serves both), last good kept up to 10 min.
-    const dsX = await Promise.all(DS_LISTS.map(u => cachedJSONx(u, 60000, 10000)));
+    const dsX = await Promise.all(DS_LISTS.map(u => cachedJSONx(u, SCOUT_TTL - 2000, 10000)));
     const dsRes = dsX.map(x => x.d);
     const dsOk = dsX.filter(x => x.ok && !x.stale).length, dsAny = dsX.filter(x => x.ok).length;
     const { gtByMint, dsMeta } = scoutCandidateRecords(gtPools, dsRes, null, now);
@@ -708,13 +734,17 @@
     mints.forEach(m => {
       const ds = bestDs[m], gt = gtByMint[m];
       const src = [gt ? 'gecko' : null, dsMeta[m] ? 'dexscreener' : null].filter(Boolean);
-      if (ds) records.push(S.toScoutPair(ds, gt && gt.address === ds.pairAddress ? gt : null, { mint: m, icon: (dsMeta[m] && dsMeta[m].icon) || '', src }));
-      else if (gt) records.push(S.toScoutPair(null, gt, { mint: m, symbol: String(gt.name || '?').split(' / ')[0], src }));
+      let r = null;
+      if (ds) r = S.toScoutPair(ds, gt && gt.address === ds.pairAddress ? gt : null, { mint: m, icon: (dsMeta[m] && dsMeta[m].icon) || '', src });
+      else if (gt) r = S.toScoutPair(null, gt, { mint: m, symbol: String(gt.name || '?').split(' / ')[0], src });
+      if (r) { if (r.gtTx && gt) r.gtTs = gt._ts || 0; records.push(r); }
     });
     const dsDown = window.srcState && ['limited', 'down'].includes(window.srcState('api.dexscreener.com'));
-    const gtDown = gtTried === 0 || gtOk === 0;
+    const gtFresh = Object.keys(bot._gtRes).some(u => now - bot._gtRes[u].ts < GT_ROUND_MS * 2 + 5000);
+    const gtDown = !gtFresh;
     const health = {
-      gt: gtOk ? 'ok' : (gtPools.length ? 'cache' : 'down'),
+      // First GeckoTerminal round still loading (not failed) counts as fine — it is merged on the next tick.
+      gt: (gtFresh && (gtOk || !gtTried)) || (bot._gtRound.p && !bot._gtRound.done && Date.now() >= gtGate.pauseUntil) ? 'ok' : (gtPools.length ? 'cache' : 'down'),
       ds: dsOk && !dsDown ? 'ok' : (dsAny || Object.keys(bestDs).length ? 'cache' : 'down'),
       offline: navigator.onLine === false
     };
@@ -727,8 +757,6 @@
     }
     out.unreachable = !out.records.length && health.gt === 'down' && health.ds === 'down';
     noteSourceIssues(health, gtDown && dsDown);
-    // A degraded round is cached for only 45 s so recovery is picked up quickly (backoff still prevents hammering).
-    if (out.limited) out.ts = now - SCOUT_TTL + 45000;
     bot._scoutCache = out;
     return out;
   }
@@ -791,10 +819,22 @@
     const A = bot.agents.filter;
     A.status = 'hot';
     const reports = {};
-    await pool(scoutOut.pairs, 3, async p => {
-      try { reports[p.mint] = await rugReport(p.mint); } catch { reports[p.mint] = null; }
+    // v12: coins killed in the last 5 min are not re-checked (their kill is reused, not re-logged);
+    // RugCheck runs 3 at a time, cached 10 min (survivors refresh every 3 min to keep holder-growth snapshots).
+    const KILL_SKIP_MS = 5 * 60e3;
+    bot._killMemo = bot._killMemo || {};
+    bot._survivor = bot._survivor || {};
+    const nowF = Date.now();
+    const reused = [], toCheck = [];
+    scoutOut.pairs.forEach(p => { const k = bot._killMemo[p.mint]; if (k && nowF - k.t < KILL_SKIP_MS) reused.push(k.rec); else toCheck.push(p); });
+    await pool(toCheck, 3, async p => {
+      try { reports[p.mint] = await rugReport(p.mint, bot._survivor[p.mint] && nowF - bot._survivor[p.mint] < 30 * 60e3 ? 180000 : 600000); } catch { reports[p.mint] = null; }
     });
-    const out = S.filterStage(scoutOut, reports, bot.settings, Date.now());
+    const out = S.filterStage(Object.assign({}, scoutOut, { pairs: toCheck }), reports, bot.settings, Date.now());
+    out.pairs.forEach(p => { bot._survivor[p.mint] = Date.now(); });
+    // A missing RugCheck report (network) is not memoised as a kill, so the coin is retried next cycle.
+    out.killed.forEach(k => { if (reports[k.mint]) bot._killMemo[k.mint] = { t: Date.now(), rec: k }; });
+    Object.keys(bot._killMemo).forEach(m => { if (nowF - bot._killMemo[m].t > KILL_SKIP_MS) delete bot._killMemo[m]; });
     bot._lastFilter = out;
     bot.stats.killUniq = bot.stats.killUniq || {};
     out.killed.forEach(k => {
@@ -808,6 +848,8 @@
       logEvent({ stage: 'filter', kind: 'kill', code: k.kills[0].code, mint: k.mint, symbol: k.symbol, icon: k.icon,
         reason: k.kills.map(x => x.reason).join('; '), codes: k.kills.map(x => x.code), facts: k.facts });
     });
+    out.killed = out.killed.concat(reused);
+    out.reused = reused.length;
     bot.stats.killLast = out.killed.length;
     bot.stats.filterPassLast = out.pairs.length;
     A.n = out.killed.length;
@@ -816,17 +858,20 @@
     return out;
   }
 
-  const gtMultiCache = {};   // pool address -> { ts, a }  (cuts analyst GT calls to ≤1/min)
+  const gtMultiCache = {};   // pool address -> { ts, a }
+  let gtMultiAt = 0;         // v12: at most one GT multi-pool call per minute, 2 min cache
   async function gtPoolsMulti(addrs) {
     const out = {};
     const list = addrs.filter(Boolean).slice(0, 30);
     if (!list.length) return out;
-    const need = list.filter(a => !gtMultiCache[a] || Date.now() - gtMultiCache[a].ts > 60000);
-    if (need.length) {
+    const need = list.filter(a => !gtMultiCache[a] || Date.now() - gtMultiCache[a].ts > 120000);
+    const unseen = need.some(a => !gtMultiCache[a]);   // brand-new survivors may go after 30 s, refreshes after 60 s
+    if (need.length && Date.now() - gtMultiAt >= (unseen ? 30000 : 60000) && Date.now() >= gtGate.pauseUntil) {
+      gtMultiAt = Date.now();
       try {
         const d = await gtGet(GT + '/networks/solana/pools/multi/' + need.join(','));
         ((d && d.data) || []).forEach(x => { if (x && x.attributes) gtMultiCache[x.attributes.address] = { ts: Date.now(), a: x.attributes }; });
-        need.forEach(a => { if (!gtMultiCache[a]) gtMultiCache[a] = { ts: Date.now(), a: null }; else if (Date.now() - gtMultiCache[a].ts > 60000) gtMultiCache[a].ts = Date.now(); });
+        need.forEach(a => { if (!gtMultiCache[a]) gtMultiCache[a] = { ts: Date.now(), a: null }; else if (Date.now() - gtMultiCache[a].ts > 120000) gtMultiCache[a].ts = Date.now(); });
       } catch {}
     }
     list.forEach(a => { const c = gtMultiCache[a]; if (c && c.a && Date.now() - c.ts < 10 * 60e3) out[a] = c.a; });
@@ -864,16 +909,24 @@
       return { stage: 'analyst', t: Date.now(), pairs: [], scored: [] };
     }
     A.status = 'hot';
-    const gt = await gtPoolsMulti(filterOut.pairs.map(p => p.pairAddress));
+    // v12: pairs that came with fresh GeckoTerminal data from the Scout lists (≤2 min old) need no extra GT call;
+    // the rest share one paced multi-pool call (≤1/min, cached 2 min). DexScreener data covers everything else.
+    const needGt = filterOut.pairs.filter(p => !(p.gtTx && p.gtTs && Date.now() - p.gtTs < 120000)).map(p => p.pairAddress);
+    const gt = needGt.length ? await gtPoolsMulti(needGt) : {};
+    const smAll = {};
+    await pool(filterOut.pairs, 3, async p => { smAll[p.mint] = await smartWalletHits(p.mint); });
     const scored = [];
     for (const p of filterOut.pairs) {
       const g = gt[p.pairAddress];
       const gpc = (g && g.price_change_percentage) || {};
       const snaps = (bot.holderHist[p.mint] || []).filter(x => Date.now() - x.t <= 60 * 60e3);
-      const sm = await smartWalletHits(p.mint);
+      const sm = smAll[p.mint] || { hits: null, n: 0 };
+      const pcx = {};
+      if (gpc.m15 != null) pcx.m15 = +gpc.m15;
+      if (gpc.m30 != null) pcx.m30 = +gpc.m30;
       const res = S.scorePair(p, {
         gtTx: (g && g.transactions) || p.gtTx,
-        priceChange: { m15: gpc.m15 != null ? +gpc.m15 : undefined, m30: gpc.m30 != null ? +gpc.m30 : undefined },
+        priceChange: pcx,
         holderSnaps: snaps, smartHits: sm.hits, smartWallets: sm.n
       }, s);
       bot.stats.scored++;
@@ -916,6 +969,9 @@
     for (const p of analystOut.pairs) {
       const now = Date.now();
       if (bot.positions.some(x => x.mint === p.mint)) continue;
+      // v12: cycles run every 12 s — a coin whose last ticket was blocked/aborted is re-quoted at most every 30 s (Jupiter pacing).
+      bot._execRetry = bot._execRetry || {};
+      if (bot._execRetry[p.mint] && now - bot._execRetry[p.mint] < 30000) continue;
       const gate = S.canOpenMore(bot, bot.settings, now, { solPx: bot.solPx, reserveUsd: reserveUsd() });
       if (!gate.ok) { E.detail = gate.reason; logEvent({ stage: 'executor', kind: 'skip', code: 'gate', mint: p.mint, symbol: p.symbol, icon: p.icon, reason: gate.reason }); break; }
       const solPx = await solPrice();
@@ -923,7 +979,7 @@
       const usd = S.executorSize(eq, bot.cashUsd, bot.settings, reserveUsd(), solPx);
       if (!(usd > 0)) { E.detail = 'size below floor'; logEvent({ stage: 'executor', kind: 'skip', code: 'size', mint: p.mint, symbol: p.symbol, reason: 'size below 0.02 SOL floor' }); break; }
       E.status = 'hot'; E.token = p; E.detail = 'quoting ' + p.symbol;
-      // Scout data can be ~90s old: re-read the live pair so the signal price is current.
+      // Scout data can be ~40s old: re-read the live pair so the signal price is current.
       let livePx = p.priceUsd, livePair = p.pair;
       try {
         const fresh = await dsBestPair(p.mint, p.pairAddress, true);
@@ -938,7 +994,7 @@
       const ticket = { mint: p.mint, symbol: p.symbol, icon: p.icon, usd, score: p.score, expectedPx: livePx, priceUsd: livePx, quoteBuy, quoteSell, scout: Object.assign({}, p, { pair: livePair || p.pair, liqUsd: (livePair && livePair.liquidity && +livePair.liquidity.usd) || p.liqUsd }) };
       tickets++;
       const ok = await agentRisk(ticket);
-      if (ok) fills++;
+      if (ok) { fills++; delete bot._execRetry[p.mint]; } else bot._execRetry[p.mint] = Date.now();
     }
     if (fills) E.detail = 'bought ' + fills + ' · ' + bot.positions.length + ' open';
     return { tickets, fills };
@@ -1048,11 +1104,12 @@
     bot.equityUsd = equityNow();
     pushEquity(bot.equityUsd);
     bot.stats.cycles++;
+    const t0 = Date.now();
     const scoutOut = await agentScout();
     const filterOut = await agentFilter(scoutOut);
     const analystOut = await agentAnalyst(filterOut);
     const execOut = await agentExecutor(analystOut);
-    bot._lastCycle = { t: Date.now(), scout: scoutOut.pairs.length, seen: scoutOut.seen, killed: filterOut.killed.length, survivors: filterOut.pairs.length, scored: analystOut.scored.length, passed: analystOut.pairs.length, tickets: execOut.tickets, fills: execOut.fills };
+    bot._lastCycle = { t: Date.now(), scout: scoutOut.pairs.length, seen: scoutOut.seen, killed: filterOut.killed.length, survivors: filterOut.pairs.length, scored: analystOut.scored.length, passed: analystOut.pairs.length, tickets: execOut.tickets, fills: execOut.fills, ms: Date.now() - t0 };
     saveLog();
     return bot._lastCycle;
   }

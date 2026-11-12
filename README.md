@@ -15,6 +15,8 @@ Static installable web app (PWA) that scans memecoins. It has three views, and n
 
 **Data sources on mobile networks (v11).** Phones on LTE often share one public IP with many other users (carrier NAT), so GeckoTerminal (~30 calls/min per IP) and DexScreener rate-limit them. Their limit responses carry no CORS headers, so the browser reports a plain network error. The app paces requests per host (GeckoTerminal ≥2.5 s apart), backs off a host after a failure instead of retrying, and shares one cache between the Fast tab and the bot's Scout. Open positions are priced with one batched DexScreener call per tick. If one source fails, the other one is used, and the last good data is kept for up to 10 minutes. The status says which source is limited and only says "offline" when the device is offline.
 
+**Faster bot (v12).** The pipeline runs every 12 s and never overlaps. The Scout pulls fresh DexScreener lists and token data about every 36 s; before v12 it was every 120 s. GeckoTerminal stays slow: one background round per minute of 2 calls, plus at most one Analyst lookup per 30–60 s. RugCheck runs 3 lookups at a time and caches reports for 10 minutes. Coins killed in the last 5 minutes are not re-checked. With no open positions the bot makes about 9 DexScreener and 2 GeckoTerminal calls per minute.
+
 Every API it uses is public, keyless and CORS-enabled. There is no build step; GitHub Pages serves these files as-is. Bump `VERSION` in `sw.js` when you deploy changes so installed phones pick up the update.
 
 **Not financial advice.** Memecoins are extremely risky, and many fresh tokens are rugs.

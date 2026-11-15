@@ -2,7 +2,7 @@
  * Goal: catch brand-new pump.fun tokens with real hype while they are fresh, take profit fast and get out BEFORE the dump. */
 (function () {
   'use strict';
-  const FRESH_DEFAULTS = {
+  const V13_DEFAULTS = {
     // Scout
     minAgeMin: 5, maxAgeH: 6, minMc: 30000, maxMc: 1000000,
     // Safety (kills)
@@ -30,8 +30,49 @@
     whaleSellSupplyPct: 1.5,// one sell of ≥ 1.5% of supply → exit
     devSellExit: true,      // creator sells anything after entry → exit
     m5SellFlip: 1.5,        // DexScreener 5-min sells > 1.5× buys (≥ 20 trades) and not in profit → exit
-    peakDropFastPct: 0.15   // −15% from peak within 60 s → exit even before trail arms
+    peakDropFastPct: 0.15,  // −15% from peak within 60 s → exit even before trail arms
+    stopGraceSec: 3         // no hard stop in the first 3 s after buy unless ≥ 2 price sources agree
   };
+  // v14 preset (tuned on recorded pump.fun data, see README) — FINAL 2026-11-15 (conservative: amm, age>=10m, <=1h, mc>=30k, tx5m>=120, score60, max 2 open; NO proven edge, PAPER only)
+  const FRESH_DEFAULTS = {
+    minAgeMin: 10,
+    maxAgeH: 1,
+    minMc: 30000,
+    maxMc: 1000000,
+    venue: "amm",
+    maxTop10Pct: 35,
+    maxDevPct: 10,
+    maxBundlePct: 20,
+    max1hChg: 1000000,
+    minTxM5: 120,
+    minBuyRatioM5: 0.55,
+    minM5Chg: 0,
+    maxM5Chg: null,
+    passScore: 60,
+    posPct: 0.08,
+    maxOpen: 2,
+    maxImpactPct: 6,
+    abortMovePct: 6,
+    slippageBps: 300,
+    slPct: 0.5,
+    tpPct: 1,
+    tpSellPct: 1,
+    trailArmPct: 0.3,
+    trailPct: 0.25,
+    trailAfterTpPct: 0.12,
+    maxHoldMin: 15,
+    staleMin: 4,
+    staleMinGain: 0.05,
+    dumpSellRatio: 2,
+    dumpMinSol: 1000000,
+    whaleSellSupplyPct: 1.5,
+    devSellExit: true,
+    m5SellFlip: 99,
+    peakDropFastPct: 0.15,
+    stopGraceSec: 3         // v14.1: no hard stop in the first 3 s after buy unless ≥ 2 price sources agree
+  };
+
+  const PRESET_V = 14;
   const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
   const num = v => (v == null || v === '' || !isFinite(+v)) ? null : +v;
   const cfg = s => Object.assign({}, FRESH_DEFAULTS, s || {});
@@ -50,6 +91,10 @@
     if (ageMin > c.maxAgeH * 60) return { ok: false, why: 'too old' };
     if (mc < c.minMc) return { ok: false, why: 'mcap < min' };
     if (mc > c.maxMc) return { ok: false, why: 'mcap > max' };
+    // v14: venue — 'bc' = still on the pump.fun bonding curve, 'amm' = graduated (PumpSwap/other AMM), 'any'
+    const onCurve = /^pump(fun)?$/.test(String(p.dexId || ''));
+    if (c.venue === 'bc' && !onCurve) return { ok: false, why: 'graduated' };
+    if (c.venue === 'amm' && onCurve) return { ok: false, why: 'on bonding curve' };
     return { ok: true, ageMin, mc };
   }
 
@@ -89,6 +134,8 @@
     const n5 = (+m5.buys || 0) + (+m5.sells || 0), br = n5 ? (+m5.buys || 0) / n5 : 0;
     facts.tx5 = n5; facts.buyShare5 = Math.round(br * 100);
     if (num(pc.h1) != null && +pc.h1 > c.max1hChg) kill('f_pumped', 'already +' + Math.round(+pc.h1) + '% in 1h (> ' + c.max1hChg + '%)');
+    if (c.minM5Chg != null && num(pc.m5) != null && +pc.m5 < c.minM5Chg) kill('f_m5', '5-min change ' + Math.round(+pc.m5) + '% (< ' + c.minM5Chg + '%)');
+    if (c.maxM5Chg != null && num(pc.m5) != null && +pc.m5 > c.maxM5Chg) kill('f_m5', '5-min change +' + Math.round(+pc.m5) + '% (> ' + c.maxM5Chg + '%)');
     if (n5 < c.minTxM5) kill('f_dead', 'only ' + n5 + ' trades in 5 min (< ' + c.minTxM5 + ')');
     else if (br < c.minBuyRatioM5) kill('f_selling', 'buys only ' + Math.round(br * 100) + '% of 5-min trades');
     if (!report) { kill('no_rugcheck', 'no RugCheck data yet'); return { pass: false, kills, facts }; }
@@ -159,7 +206,13 @@
     const out = (reason, why, partial) => partial ? { action: 'sell_partial', pct: partial, reason, why, pnl, peak } : { action: 'sell_all', reason, why, pnl, peak };
     if (x.rugged || x.pairGone) return out('liquidity', 'rugged / pair gone');
     const stopPx = +pos.stopPx > 0 ? +pos.stopPx : entry * (1 - c.slPct);
-    if (mark <= stopPx * (1 + 1e-9)) return out('stop', 'hard stop −' + Math.round(c.slPct * 100) + '%');
+    // v14.1: a single bad tick right after the buy (e.g. a mis-decoded stream price) must not stop us out.
+    // Inside the grace window the stop needs ≥ 2 independent sources at/below the stop (ctx.stopConfirm).
+    // Inside the grace window a price-based exit (stop / fast peak drop / trail) needs ≥ 2 independent sources at or
+    // below the trigger level: ctx.srcBelow(level) → number of live sources ≤ level.
+    const inGrace = (now - pos.openedAt) < (+c.stopGraceSec || 0) * 1000;
+    const confirmed = lvl => !inGrace || (typeof x.srcBelow === 'function' ? x.srcBelow(lvl) : 0) >= 2;
+    if (mark <= stopPx * (1 + 1e-9) && confirmed(stopPx * (1 + 1e-9))) return out('stop', 'hard stop −' + Math.round(c.slPct * 100) + '%');
     if (c.devSellExit && x.lastDevSellT && x.lastDevSellT >= pos.openedAt) return out('dev_sell', 'creator sold');
     if (x.bigSell && x.bigSell.t >= pos.openedAt && now - x.bigSell.t < 30000) return out('whale_sell', 'one wallet sold ' + x.bigSell.pct.toFixed(1) + '% of supply');
     const f30 = flowStats(x.trades, now, 30000);
@@ -167,12 +220,12 @@
     const m5 = x.pair && x.pair.txns && x.pair.txns.m5;
     const sb = m5 ? (+m5.sells || 0) : 0, bb = m5 ? (+m5.buys || 0) : 0;
     if (sb + bb >= 20 && sb > bb * c.m5SellFlip && pnl < c.tpPct) return out('dump', 'sells flipped: ' + sb + ' sells vs ' + bb + ' buys (5 min)');
-    if (pos.peakAt && now - pos.peakAt <= 60000 && peak > entry && mark <= peak * (1 - c.peakDropFastPct)) return out('dump', 'fell ' + Math.round((1 - mark / peak) * 100) + '% from peak within 60 s');
+    if (pos.peakAt && now - pos.peakAt <= 60000 && peak > entry && mark <= peak * (1 - c.peakDropFastPct) && confirmed(peak * (1 - c.peakDropFastPct))) return out('dump', 'fell ' + Math.round((1 - mark / peak) * 100) + '% from peak within 60 s');
     if (heldMin >= c.maxHoldMin) return out('time', 'max hold ' + c.maxHoldMin + ' min');
     if (!pos.tpTaken && c.tpPct > 0 && pnl >= c.tpPct) return out('tp', 'take profit +' + Math.round(pnl * 100) + '%', c.tpSellPct);
     const armed = pos.tpTaken || (peak / entry - 1) >= c.trailArmPct;
     const tp = pos.tpTaken ? c.trailAfterTpPct : c.trailPct;
-    if (armed && mark <= peak * (1 - tp)) return out('trail', 'trailing stop ' + Math.round(tp * 100) + '% off peak');
+    if (armed && mark <= peak * (1 - tp) && confirmed(peak * (1 - tp))) return out('trail', 'trailing stop ' + Math.round(tp * 100) + '% off peak');
     if (heldMin >= c.staleMin && pnl < c.staleMinGain) {
       const f2 = flowStats(x.trades, now, 120000);
       const fading = x.trades ? f2.n < 6 || f2.buySol < f2.sellSol : (m5 ? sb + bb < 10 : false);
@@ -181,6 +234,6 @@
     return { action: 'hold', pnl, peak };
   }
 
-  window.FreshStrategy = { FRESH_DEFAULTS, cfg, isPumpToken, scoutPair, safety, score, top10Pct, devPct, bundlePct, flowStats, decideExit };
+  window.FreshStrategy = { PRESET_V, V13_DEFAULTS, FRESH_DEFAULTS, cfg, isPumpToken, scoutPair, safety, score, top10Pct, devPct, bundlePct, flowStats, decideExit };
   if (typeof module !== 'undefined') module.exports = window.FreshStrategy;
 })();

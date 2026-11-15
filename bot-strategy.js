@@ -6,6 +6,7 @@
   const DEFAULTS = {
     mode: 'PAPER',
     pipelineV: 1,
+    freshPresetV: 14,   // v14: Fresh preset version (bot.js resets saved Fresh settings older than this once)
     // Scout
     scoutMinAgeMin: 30,
     scoutMaxAgeH: 72,

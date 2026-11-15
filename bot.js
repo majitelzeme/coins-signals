@@ -1,4 +1,4 @@
-/* Meme Terminal v12 — 6-agent pipeline (Scout → Filter → Analyst → Executor → Risk → Logger). Solana burner wallet, Jupiter swaps. */
+/* Meme Terminal v14 — 6-agent pipeline (Scout → Filter → Analyst → Executor → Risk → Logger). Solana burner wallet, Jupiter swaps. */
 (function () {
   'use strict';
   const S = window.BotStrategy;
@@ -106,6 +106,8 @@
     if (!s) return;
     Object.assign(bot, s);
     bot.settings = migrateSettings(s.settings || {});
+    // v14: Fresh settings saved by v13 were tuned blind; adopt the data-tuned preset once (user can edit afterwards).
+    if (F && (((s.settings || {}).freshPresetV) || 0) < F.PRESET_V) { bot.settings.fresh = {}; bot.settings.freshPresetV = F.PRESET_V; bot._presetMigrated = true; }
     bot.agents = idleAgents();
     bot.stats = Object.assign(freshStats(), s.stats || {});
     try { const lg = ls.get(LOGKEY); bot.log = Array.isArray(lg) ? lg : []; } catch { bot.log = []; }
@@ -724,6 +726,16 @@
     })().finally(() => { R.p = null; });
     return R.p;
   }
+  /** v14: cached Jupiter Tokens v2 list → { d, ok, stale } (never throws). */
+  const _jl = {};
+  async function jupList(path, ttl) {
+    const e = _jl[path] || (_jl[path] = { ts: 0, d: null, p: null });
+    if (e.d && Date.now() - e.ts < ttl) return { d: e.d, ok: true, stale: false };
+    if (!window.jupTok) return { d: e.d, ok: !!e.d, stale: true };
+    if (!e.p) e.p = window.jupTok(path).then(d => { if (Array.isArray(d)) { e.d = d; e.ts = Date.now(); } return true; }).catch(() => false).finally(() => { e.p = null; });
+    const ok = await Promise.race([e.p, sleep(4000).then(() => null)]);
+    return { d: e.d && Date.now() - e.ts < 10 * 60e3 ? e.d : null, ok: !!ok || (!!e.d && Date.now() - e.ts < ttl), stale: !ok };
+  }
   async function scoutFetch() {
     const c = bot._scoutCache;
     if (c && !c.gtStale && Date.now() - c.ts < (c.limited ? SCOUT_LIMITED_TTL : SCOUT_TTL)) return c;
@@ -742,10 +754,13 @@
     });
     // DexScreener lists: shared cache with the Fast tab (one call serves both), last good kept up to 10 min.
     const dsX = await Promise.all(DS_LISTS.map(u => cachedJSONx(u, SCOUT_TTL - 2000, 10000)));
+    // v14: Jupiter Tokens v2 trending list (CORS-enabled, separate rate limit) — keeps discovery alive when DS/GT block this IP.
+    const jx = await jupList('/toptrending/1h?limit=100', SCOUT_TTL * 2);
     const dsRes = dsX.map(x => x.d);
     const dsOk = dsX.filter(x => x.ok && !x.stale).length, dsAny = dsX.filter(x => x.ok).length;
     const { gtByMint, dsMeta } = scoutCandidateRecords(gtPools, dsRes, null, now);
     (solanaFastItems() || []).forEach(it => { if (it.addr && !dsMeta[it.addr]) dsMeta[it.addr] = { icon: it.icon || '' }; });
+    (jx.d || []).forEach(t => { if (t && t.id && !dsMeta[t.id]) dsMeta[t.id] = { icon: t.icon || '', jup: true }; });
     const mints = Array.from(new Set(Object.keys(gtByMint).concat(Object.keys(dsMeta)))).slice(0, 120);
     // Pair data via the shared DexScreener pair cache (app.js pairsFor): only stale tokens are re-fetched.
     let pmap = new Map();
@@ -768,16 +783,18 @@
       // First GeckoTerminal round still loading (not failed) counts as fine — it is merged on the next tick.
       gt: (gtFresh && (gtOk || !gtTried)) || (bot._gtRound.p && !bot._gtRound.done && Date.now() >= gtGate.pauseUntil) ? 'ok' : (gtPools.length ? 'cache' : 'down'),
       ds: dsOk && !dsDown ? 'ok' : (dsAny || Object.keys(bestDs).length ? 'cache' : 'down'),
+      jup: jx.ok && !jx.stale ? 'ok' : (jx.d ? 'cache' : 'down'),
       offline: navigator.onLine === false
     };
     let out = { ts: now, records, gtOk, gtCalls: gtTried, dsResolved: Object.keys(bestDs).length, mints: mints.length, health, limited: health.gt !== 'ok' || health.ds !== 'ok' };
+    if (out.limited && health.jup === 'ok' && records.length) out.viaJup = true;
     if (!records.length && bot._scoutGood && now - bot._scoutGood.ts < SCOUT_KEEP) {
       // Every source failed this round: keep scouting on the last good records instead of reporting 0 pairs.
       out = Object.assign({}, bot._scoutGood, { ts: now, health, limited: true, fromCache: true, cacheAge: now - bot._scoutGood.ts });
     } else if (records.length && !(health.gt === 'down' && health.ds === 'down')) {
       bot._scoutGood = { ts: now, records, gtOk, gtCalls: gtTried, dsResolved: out.dsResolved, mints: mints.length };
     }
-    out.unreachable = !out.records.length && health.gt === 'down' && health.ds === 'down';
+    out.unreachable = !out.records.length && health.gt === 'down' && health.ds === 'down' && health.jup === 'down' && TS.state !== 'live' && PP.state !== 'live';
     noteSourceIssues(health, gtDown && dsDown);
     bot._scoutCache = out;
     return out;
@@ -803,7 +820,7 @@
     const now = Date.now();
     let fetched;
     try { fetched = await scoutFetch(); }
-    catch (e) { console.warn('scout', e); A.status = 'danger'; A.limited = true; A.detail = 'APIs unreachable'; A.note = 'Sources unreachable'; return { stage: 'scout', t: now, pairs: [], skipped: {}, seen: 0 }; }
+    catch (e) { console.warn('scout', e); A.status = 'danger'; A.limited = true; A.detail = navigator.onLine === false ? 'offline' : 'retrying…'; A.note = 'Scout error — retrying with backoff'; return { stage: 'scout', t: now, pairs: [], skipped: {}, seen: 0 }; }
     A.status = 'hot'; A.limited = false;
     const out = S.scoutStage(fetched.records, now, bot.settings);
     bot._lastScout = out;
@@ -817,10 +834,10 @@
     A.note = '';
     if (fetched.unreachable) {
       A.status = 'danger'; A.limited = true;
-      A.detail = navigator.onLine === false ? 'offline' : 'APIs unreachable';
-      A.note = navigator.onLine === false ? 'Device offline' : 'Sources unreachable — GeckoTerminal and DexScreener are not answering (rate limit on this network). Retrying with backoff.';
+      A.detail = navigator.onLine === false ? 'offline' : 'sources limited · retrying';
+      A.note = navigator.onLine === false ? 'Device offline' : 'DexScreener, GeckoTerminal and Jupiter are not answering on this network (rate limit). Retrying with backoff — positions keep being watched.';
     } else if (fetched.limited) {
-      const via = fetched.fromCache ? 'cache' : (fetched.health.gt === 'ok' ? 'GeckoTerminal' : fetched.health.ds === 'ok' ? 'DexScreener' : 'cache');
+      const via = fetched.viaJup ? 'Jupiter' : fetched.fromCache ? 'cache' : (fetched.health.gt === 'ok' ? 'GeckoTerminal' : fetched.health.ds === 'ok' ? 'DexScreener' : fetched.health.jup === 'ok' ? 'Jupiter' : 'cache');
       A.limited = true;
       A.detail = (via === 'cache' ? 'cached · ' : 'limited · ') + out.pairs.length + ' pair' + (out.pairs.length === 1 ? '' : 's');
       A.note = 'Data limited — using ' + via + ' · ' + out.pairs.length + ' pairs in range';
@@ -1135,7 +1152,7 @@
   bot.agentsF = idleAgents();
 
   /* ---- PumpPortal websocket (free): new tokens, migrations, and live trades for held/considered mints ---- */
-  const PP = { ws: null, state: 'off', retry: 0, timer: null, lastMsg: 0, newTok: new Map(), migrated: new Map(), trades: {}, subs: new Set(), devSell: {}, bigSell: {}, creatorOf: {}, px: {} };
+  const PP = { ws: null, state: 'off', retry: 0, timer: null, lastMsg: 0, newTok: new Map(), migrated: new Map(), trades: {}, subs: new Set(), devSell: {}, bigSell: {}, creatorOf: {}, px: {}, pxOut: {} };
   PP.launches = (() => { try { return JSON.parse(localStorage.getItem('bot:devLaunches') || '{}') || {}; } catch { return {}; } })();
   function ppSaveLaunches() {
     const cut = Date.now() - 24 * 36e5; const out = {}; let n = 0;
@@ -1182,7 +1199,7 @@
     const tr = { t: now, buy: d.txType === 'buy', sol: +d.solAmount || 0, tokens: +d.tokenAmount || 0, trader: d.traderPublicKey };
     const L = PP.trades[d.mint] || (PP.trades[d.mint] = []);
     L.push(tr); while (L.length && now - L[0].t > 180000) L.shift(); if (L.length > 500) L.splice(0, L.length - 500);
-    if (+d.marketCapSol > 0 && bot.solPx > 0) PP.px[d.mint] = { px: (+d.marketCapSol * bot.solPx) / 1e9, t: now };
+    if (+d.marketCapSol > 0 && bot.solPx > 0) setStreamPx(d.mint, (+d.marketCapSol * bot.solPx) / 1e9, now, d.signature);
     const pos = bot.positions.find(p => p.mint === d.mint && p.strat === 'fresh');
     const creator = (pos && pos.creator) || PP.creatorOf[d.mint];
     if (!tr.buy && creator && tr.trader === creator) PP.devSell[d.mint] = now;
@@ -1190,16 +1207,181 @@
     if (!tr.buy && supPct >= fcfg().whaleSellSupplyPct) PP.bigSell[d.mint] = { t: now, pct: supPct };
     if (pos) freshExitCheck(pos, 'stream');   // react to the trade immediately, not on the next tick
   }
-  function ppSyncSubs() {
-    if (!PP.ws || PP.state !== 'live') return;
-    const want = new Set(bot.positions.filter(p => p.strat === 'fresh').map(p => p.mint).concat((bot._frWatch || []).slice(0, 12)));
-    const add = [...want].filter(m => !PP.subs.has(m)), del = [...PP.subs].filter(m => !want.has(m));
-    try {
-      if (add.length) PP.ws.send(JSON.stringify({ method: 'subscribeTokenTrade', keys: add }));
-      if (del.length) PP.ws.send(JSON.stringify({ method: 'unsubscribeTokenTrade', keys: del }));
-    } catch {}
-    add.forEach(m => PP.subs.add(m)); del.forEach(m => { PP.subs.delete(m); if (!bot.positions.some(p => p.mint === m)) delete PP.trades[m]; });
+  // v14: PumpPortal's per-token trade feed (subscribeTokenTrade) needs a paid API key, so v13 never got trades and its
+  // dump / dev-sell / whale exits could not fire. Trades now come from the Solana RPC websocket (TS below); PumpPortal is
+  // only used for new-token and migration events (still free).
+  function ppSyncSubs() { tsSync(); }
+
+  /* ---- v14 on-chain trade stream (free): Solana RPC websocket logsSubscribe per mint ----
+   * Decodes pump.fun TradeEvent and PumpSwap Buy/Sell events straight from transaction logs (~1 s after the trade). */
+  // Free endpoints that accept browser websockets (api.mainnet-beta rejects browser Origins with 403; publicnode accepts
+  // logsSubscribe but never delivers).
+  const TS_URLS = ['wss://public.rpc.solanavibestation.com', 'wss://api.mainnet-beta.solana.com'];
+  const TS = { ws: null, state: 'off', urlIx: 0, retry: 0, timer: null, subs: new Map(), pend: new Map(), byId: new Map(), since: {}, reqId: 1, lastMsg: 0, n: 0, poolInfo: {}, poolQ: new Set(), poolTimer: null, rej: 0, poolRej: 0 };
+  const B58A = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+  function b58(bytes) {
+    const d = [];
+    for (let i = 0; i < bytes.length; i++) { let c = bytes[i]; for (let j = 0; j < d.length; j++) { c += d[j] * 256; d[j] = c % 58; c = (c / 58) | 0; } while (c) { d.push(c % 58); c = (c / 58) | 0; } }
+    let s = ''; for (let i = 0; i < bytes.length && bytes[i] === 0; i++) s += '1';
+    for (let i = d.length - 1; i >= 0; i--) s += B58A[d[i]];
+    return s;
   }
+  const u64le = (dv, o) => dv.getUint32(o, true) + dv.getUint32(o + 4, true) * 4294967296;
+  const hex8 = u8 => { let h = ''; for (let i = 0; i < 8; i++) h += (u8[i] < 16 ? '0' : '') + u8[i].toString(16); return h; };
+  const EV_TRADE = 'bddb7fd34ee661ee', EV_BUY = '67f4521f2cf57777', EV_SELL = '3e2f370aa503dc2a';
+  function tsDecode(mint, logs) {
+    const out = [];
+    for (const l of logs || []) {
+      if (typeof l !== 'string' || l.indexOf('Program data: ') !== 0) continue;
+      let u8; try { u8 = b64ToBytes(l.slice(14)); } catch { continue; }
+      if (u8.length < 113) continue;
+      const d = hex8(u8), dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+      if (d === EV_TRADE) {
+        if (b58(u8.subarray(8, 40)) !== mint) continue;
+        const vs = u64le(dv, 97) / 1e9, vt = u64le(dv, 105) / 1e6;
+        out.push({ buy: u8[56] === 1, sol: u64le(dv, 40) / 1e9, tokens: u64le(dv, 48) / 1e6, trader: b58(u8.subarray(57, 89)), pxSol: vt > 0 ? vs / vt : 0 });
+      } else if ((d === EV_BUY || d === EV_SELL) && u8.length >= 184) {
+        const buy = d === EV_BUY, base = u64le(dv, 16), pb = u64le(dv, 48), pq = u64le(dv, 56), q = u64le(dv, 64);
+        const pool = b58(u8.subarray(120, 152));
+        const pbA = buy ? pb - base : pb + base, pqA = buy ? pq + q : pq - q;
+        out.push({ buy, sol: u64le(dv, 112) / 1e9, tokens: base / 1e6, trader: b58(u8.subarray(152, 184)), pxSol: pbA > 0 ? (pqA / 1e9) / (pbA / 1e6) : 0, pool });
+      }
+    }
+    return out;
+  }
+  function tsWanted() { return bot.running && (freshOn() || bot.positions.length > 0); }
+  function tsConnect() {
+    if (TS.ws || !tsWanted() || typeof WebSocket === 'undefined') return;
+    TS.state = 'connecting';
+    let ws; const url = TS_URLS[TS.urlIx % TS_URLS.length];
+    try { ws = new WebSocket(url); } catch (e) { tsRetry(); return; }
+    TS.ws = ws;
+    ws.onopen = () => { TS.state = 'live'; TS.retry = 0; TS.subs = new Map(); TS.pend = new Map(); TS.byId = new Map(); TS.since = {}; tsSync(); };
+    ws.onmessage = ev => {
+      TS.lastMsg = Date.now(); let d; try { d = JSON.parse(ev.data); } catch { return; }
+      if (d.id && TS.pend.has(d.id)) { const m = TS.pend.get(d.id); TS.pend.delete(d.id); if (d.result != null) { TS.subs.set(m, d.result); TS.byId.set(d.result, m); TS.since[m] = Date.now(); } return; }
+      if (d.method === 'logsNotification' && d.params) {
+        const m = TS.byId.get(d.params.subscription); const v = d.params.result && d.params.result.value;
+        if (m && v && !v.err) tsOnTrades(m, tsDecode(m, v.logs), v.signature);
+      }
+    };
+    ws.onerror = () => {};
+    ws.onclose = () => { TS.ws = null; TS.state = 'off'; TS.subs = new Map(); TS.byId = new Map(); TS.since = {}; if (tsWanted()) tsRetry(); };
+  }
+  function tsRetry() {
+    clearTimeout(TS.timer);
+    if (TS.retry >= 2) TS.urlIx++;   // after 2 failures try the next endpoint
+    const ms = Math.min(30000, 1500 * Math.pow(2, TS.retry++));
+    TS.state = 'retry in ' + Math.round(ms / 1000) + 's';
+    TS.timer = setTimeout(tsConnect, ms);
+  }
+  function tsStop() { clearTimeout(TS.timer); if (TS.ws) { try { TS.ws.onclose = null; TS.ws.close(); } catch {} } TS.ws = null; TS.state = 'off'; TS.subs = new Map(); TS.byId = new Map(); TS.since = {}; }
+  function tsSync() {
+    if (!tsWanted()) { if (TS.ws || TS.timer) tsStop(); return; }
+    if (!TS.ws) { if (!TS.timer || TS.state === 'off') tsConnect(); return; }
+    if (TS.state !== 'live') return;
+    const want = new Set(bot.positions.map(p => p.mint).concat(freshOn() ? (bot._frWatch || []).slice(0, 10) : []));
+    bot.positions.forEach(p => { if (p.pairAddress) tsPoolResolve(p.pairAddress); });
+    for (const m of want) {
+      if (TS.subs.has(m) || [...TS.pend.values()].includes(m)) continue;
+      const id = TS.reqId++; TS.pend.set(id, m);
+      try { TS.ws.send(JSON.stringify({ jsonrpc: '2.0', id, method: 'logsSubscribe', params: [{ mentions: [m] }, { commitment: 'confirmed' }] })); } catch {}
+    }
+    for (const [m, sid] of TS.subs) {
+      if (want.has(m)) continue;
+      try { TS.ws.send(JSON.stringify({ jsonrpc: '2.0', id: TS.reqId++, method: 'logsUnsubscribe', params: [sid] })); } catch {}
+      TS.subs.delete(m); TS.byId.delete(sid); delete TS.since[m];
+      if (!bot.positions.some(p => p.mint === m)) { delete PP.trades[m]; delete PP.px[m]; }
+    }
+  }
+  /** Stream is trustworthy for a mint once subscribed for a while on a live socket. */
+  const tsLive = m => TS.state === 'live' && TS.subs.has(m) && Date.now() - (TS.since[m] || Date.now()) >= 0;
+  /* v14.1 fix — false "hard stop −50% (stream)" ~0.5 s after a buy.
+   * Cause: logsSubscribe({mentions:[mint]}) also delivers PumpSwap events of OTHER pools in the same transaction
+   * (routed swaps such as X→SOL→mint, pools where our mint is the QUOTE, USDC-quoted pools, SOL-base pools). The old
+   * code picked the "canonical" pool as the most-seen pool for the mint; on the very first notification after
+   * subscribing (i.e. right after the buy) the DexScreener pool had not been seen yet, so the other pool's event won
+   * and its price (another token, or wrong decimals/orientation) became the stream price → mark = min(sources) hit the stop.
+   * Fix: (1) every PumpSwap pool is verified on-chain (pool account: base_mint == our mint, quote_mint == WSOL, owner =
+   * PumpSwap) before its events are used; until verified only the DexScreener pair address is provisionally trusted;
+   * (2) a stream price > 40% away from the latest DexScreener/Jupiter price (or the entry price right after a buy) is
+   * ignored unless 2+ consecutive trades in different txs confirm it; (3) fresh-strategy: no price-based exit within
+   * 3 s of the buy unless 2 sources agree. */
+  const PUMPSWAP_PROGRAM = 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA';
+  function tsPoolResolve(pool) {
+    const pi = TS.poolInfo[pool];
+    if ((pi && !(pi.err && Date.now() - pi.t > 30000)) || TS.poolQ.has(pool)) return;
+    TS.poolQ.add(pool);
+    if (!TS.poolTimer) TS.poolTimer = setTimeout(tsPoolFlush, 200);
+  }
+  async function tsPoolFlush() {
+    TS.poolTimer = null;
+    const keys = [...TS.poolQ].slice(0, 50); keys.forEach(k => TS.poolQ.delete(k));
+    if (TS.poolQ.size) TS.poolTimer = setTimeout(tsPoolFlush, 400);
+    if (!keys.length) return;
+    try {
+      const r = await rpc('getMultipleAccounts', [keys, { encoding: 'base64', dataSlice: { offset: 43, length: 64 } }], 8000);
+      const now = Date.now();
+      keys.forEach((k, i) => {
+        const v = r && r.value && r.value[i]; let info = { base: null, quote: null, t: now };   // null account → never trusted
+        if (v && v.data && (!v.owner || v.owner === PUMPSWAP_PROGRAM)) {
+          const u8 = b64ToBytes(v.data[0]);
+          if (u8.length >= 64) info = { base: b58(u8.subarray(0, 32)), quote: b58(u8.subarray(32, 64)), t: now };
+        }
+        TS.poolInfo[k] = info;
+      });
+    } catch { const now = Date.now(); keys.forEach(k => { TS.poolInfo[k] = { base: null, quote: null, t: now, err: true }; }); }
+  }
+  /** Is this PumpSwap pool the mint's own token/SOL pool? true / false (verified) — unverified: only the DS pair address. */
+  function tsPoolOk(mint, pool, pos) {
+    const pi = TS.poolInfo[pool];
+    if (pi && !pi.err) return !!pi.base && pi.base === mint && pi.quote === WSOL;
+    tsPoolResolve(pool);
+    const pa = (pos && pos.pairAddress) || ((bot._frScout && (bot._frScout.cands || []).find(c => c.mint === mint)) || {}).pairAddress;
+    return !!pa && pool === pa;
+  }
+  /** Reference price for the stream sanity check: DexScreener / Jupiter (≤ 60 s old), else the entry price right after a buy. */
+  function streamRefPx(mint, now) {
+    if (bot._px && bot._pxTs && bot._px[mint] > 0 && now - (bot._pxTs[mint] || 0) < 60000) return +bot._px[mint];
+    if (bot._jupPx && bot._jupTs && bot._jupPx[mint] > 0 && now - (bot._jupTs[mint] || 0) < 60000) return +bot._jupPx[mint];
+    const pos = bot.positions.find(p => p.mint === mint);
+    if (pos && pos.entryPx > 0 && now - (pos.openedAt || 0) < 120000) return +pos.entryPx;
+    return 0;
+  }
+  const STREAM_MAX_DEV = 0.4, STREAM_CONFIRM_N = 2;
+  /** Accept a streamed price only if it is sane (≤ 40% off the reference) or confirmed by 2+ consecutive trades. */
+  function setStreamPx(mint, px, now, sig) {
+    if (!(px > 0) || !isFinite(px)) return false;
+    const ref = streamRefPx(mint, now), prev = PP.px[mint];
+    const out = ref > 0 ? Math.abs(px / ref - 1) > STREAM_MAX_DEV
+      : !!(prev && now - prev.t <= 60000 && (px / prev.px >= 5 || px / prev.px <= 0.2));
+    if (!out) { delete PP.pxOut[mint]; PP.px[mint] = { px, t: now }; return true; }
+    const o = PP.pxOut[mint];
+    if (o && now - o.t < 30000 && Math.abs(px / o.px - 1) <= 0.15 && !(sig && o.sigs.includes(sig))) { o.n++; o.px = px; o.t = now; if (sig) o.sigs.push(sig); }
+    else PP.pxOut[mint] = { px, t: now, n: 1, sigs: sig ? [sig] : [] };
+    if (PP.pxOut[mint].n >= STREAM_CONFIRM_N) { delete PP.pxOut[mint]; PP.px[mint] = { px, t: now }; return true; }
+    TS.rej++;
+    return false;
+  }
+  function tsOnTrades(mint, list, sig) {
+    if (!list.length) return;
+    const now = Date.now(); const solPx = bot.solPx || 0;
+    const pos = bot.positions.find(p => p.mint === mint);
+    const L = PP.trades[mint] || (PP.trades[mint] = []);
+    for (const x of list) {
+      if (x.pool && !tsPoolOk(mint, x.pool, pos)) { TS.poolRej++; continue; }   // other token's / wrong-quote pool
+      const tr = { t: now, buy: x.buy, sol: x.sol, tokens: x.tokens, trader: x.trader };
+      L.push(tr); TS.n++;
+      if (x.pxSol > 0 && solPx > 0) setStreamPx(mint, x.pxSol * solPx, now, sig);
+      const creator = (pos && pos.creator) || PP.creatorOf[mint];
+      if (!tr.buy && creator && tr.trader === creator) PP.devSell[mint] = now;
+      const supPct = tr.tokens / 1e9 * 100;
+      if (!tr.buy && supPct >= fcfg().whaleSellSupplyPct) PP.bigSell[mint] = { t: now, pct: supPct };
+    }
+    while (L.length && now - L[0].t > 180000) L.shift(); if (L.length > 600) L.splice(0, L.length - 600);
+    if (pos && pos.strat === 'fresh') freshExitCheck(pos, 'stream');
+  }
+  window.__ts = { TS, PP, tsDecode, b58, tsOnTrades, setStreamPx, tsPoolOk, freshDecide: p => freshDecide(p) };
 
   /* ---- Dev history: RugCheck creator data + PumpPortal-observed launches + public-RPC sampling of the creator's txs ---- */
   const devCache = (() => { try { return JSON.parse(localStorage.getItem('bot:devCache') || '{}') || {}; } catch { return {}; } })();
@@ -1254,13 +1436,17 @@
   async function frScout() {
     const A = bot.agentsF.scout; const c = fcfg(); const now = Date.now();
     const cache = bot._frScout;
-    if (cache && now - cache.ts < 24000) return cache;
+    if (cache && now - cache.ts < 12000) return cache;   // v14: 12 s (was 24 s) — entries react faster
     A.status = 'hot'; A.detail = 'scanning…';
     const flags = {};
     const flag = (m, k) => { (flags[m] || (flags[m] = {}))[k] = true; };
     const lists = await Promise.all(Object.keys(FR_LISTS).map(async k => [k, await cachedJSONx(FR_LISTS[k], k === 'cto' || k === 'ad' ? 60000 : 33000, 10000)]));
     let dsOk = 0;
     lists.forEach(([k, x]) => { if (x.ok) dsOk++; (Array.isArray(x.d) ? x.d : []).forEach(it => { if (it && it.chainId === 'solana' && F.isPumpToken(it.tokenAddress)) flag(it.tokenAddress, k === 'boostTop' ? 'boost' : k); }); });
+    // v14: Jupiter Tokens v2 (CORS, own rate limit): pump.fun tokens trending in the last 5 min + just-created tokens.
+    let jOk = 0;
+    const jl = await Promise.all([jupList('/toptrending/5m?limit=100', 30000), jupList('/toptraded/5m?limit=100', 45000)]);
+    jl.forEach(x => { if (x.ok) jOk++; (x.d || []).forEach(t => { if (t && t.id && F.isPumpToken(t.id, t.launchpad === 'pump.fun' ? 'pumpfun' : '')) flag(t.id, 'jup'); }); });
     // GeckoTerminal pump.fun / PumpSwap busiest pools: one paced call every 2 min in the background.
     if (now - bot._frGtAt > 120000 && Date.now() >= gtGate.pauseUntil) {
       bot._frGtAt = now; const u = GT + FR_GT[bot._frGtRot++ % FR_GT.length] + '&include=base_token';
@@ -1296,12 +1482,20 @@
     bot._frScout = out;
     bot._frWatch = cands.slice(0, 8).map(x => x.mint); ppSyncSubs();
     A.n = cands.length;
-    A.status = dsOk || PP.state === 'live' ? 'hot' : 'danger';
-    A.detail = cands.length + ' fresh · ws ' + (PP.state === 'live' ? 'live' : PP.state);
+    const feedLive = PP.state === 'live' || TS.state === 'live';
+    A.status = dsOk || jOk || feedLive ? 'hot' : 'danger';
+    A.detail = cands.length + ' fresh · ' + (dsOk ? 'DS' : jOk ? 'Jupiter' : 'cache') + ' · ws ' + (PP.state === 'live' ? 'live' : PP.state) + (TS.state === 'live' ? ' · trades live' : '');
     bot._frSeen = bot._frSeen || {};
     cands.slice(0, 12).forEach(x => { if (bot._frSeen[x.mint] && now - bot._frSeen[x.mint] < 20 * 60e3) return; bot._frSeen[x.mint] = now;
       frLog({ stage: 'scout', kind: 'found', mint: x.mint, symbol: x.symbol, icon: x.icon, reason: 'age ' + fmtAge(x.ageMin) + ' · MC ' + fmtMc(x.mcap) + ' · ' + Object.keys(x.flags).join('+') }); });
     return out;
+  }
+  function jupReport(pair) {
+    const j = pair && pair._jup; if (!j || !j.audit) return null;
+    const a = j.audit;
+    return { token: { supply: 1e9 }, creator: j.dev || null, creatorBalance: (+a.devBalancePercentage || 0) / 100 * 1e9,
+      topHolders: [{ owner: 'jup-top10', pct: +a.topHoldersPercentage || 0 }], markets: [], knownAccounts: {}, risks: [], insiderNetworks: [],
+      mintAuthority: a.mintAuthorityDisabled === false ? 'enabled' : null, freezeAuthority: a.freezeAuthorityDisabled === false ? 'enabled' : null, _src: 'jupiter' };
   }
   async function frFilter(sc) {
     const A = bot.agentsF.filter; const c = fcfg(); const now = Date.now();
@@ -1310,6 +1504,7 @@
     const pass = []; let killed = 0;
     await pool(top, 3, async x => {
       let rep = null; try { rep = await rugReport(x.mint, 120000); } catch {}
+      if (!rep) rep = jupReport(x.pair);   // v14: RugCheck blocked/limited → Jupiter audit (top holders, dev %, authorities)
       const s = F.safety(x.pair, rep, c);
       if (s.pass) {
         const creator = (rep && rep.creator) || PP.creatorOf[x.mint];
@@ -1403,12 +1598,12 @@
     const ds = bot._px && bot._pxTs && now - (bot._pxTs[pos.mint] || 0) < 5000 ? bot._px[pos.mint] : 0;
     const j = bot._jupPx && bot._jupTs && now - (bot._jupTs[pos.mint] || 0) < 8000 ? bot._jupPx[pos.mint] : 0;
     const c = [ws, ds, j].filter(x => x > 0);
-    return { mark: c.length ? Math.min.apply(null, c) : 0, mid: ds || ws || j || 0, src: c.length };
+    return { mark: c.length ? Math.min.apply(null, c) : 0, mid: ds || ws || j || 0, src: c.length, srcs: c };
   }
   function freshDecide(pos) {
-    const now = Date.now(); const { mark, mid } = freshMark(pos);
+    const now = Date.now(); const { mark, mid, srcs } = freshMark(pos);
     if (mid > (pos.peakPx || 0)) { pos.peakPx = mid; pos.peakAt = now; }
-    return F.decideExit(pos, mark, now, fcfg(), { pair: pos._pair, trades: PP.subs.has(pos.mint) ? PP.trades[pos.mint] || [] : null, lastDevSellT: PP.devSell[pos.mint], bigSell: PP.bigSell[pos.mint], rugged: !!pos._rugged, pairGone: !!pos._pairGone && !pos._pair });
+    return F.decideExit(pos, mark, now, fcfg(), { pair: pos._pair, trades: tsLive(pos.mint) ? PP.trades[pos.mint] || [] : null, lastDevSellT: PP.devSell[pos.mint], bigSell: PP.bigSell[pos.mint], rugged: !!pos._rugged, pairGone: !!pos._pairGone && !pos._pair, srcBelow: lvl => srcs.filter(v => v <= lvl).length });
   }
   async function freshExitCheck(pos, via) {
     if (!pos || pos._selling || !bot.positions.includes(pos)) return;
@@ -1447,6 +1642,7 @@
       if (bot.settings.mode === 'LIVE') await loadLiveBalances().catch(() => {});
       await refreshPositionPrices();
       await checkExits();
+      if (!tickLoop._ts || Date.now() - tickLoop._ts > 5000) { tickLoop._ts = Date.now(); tsSync(); }
       const eq = equityNow();
       bot.equityUsd = eq;
       pushEquity(eq);
@@ -1502,7 +1698,7 @@
     bot.agents = idleAgents();
     save(); startTimers(); renderBot();
   }
-  function stopBot() { bot.running = false; stopTimers(); ppStop(); save(); renderBot(); }
+  function stopBot() { bot.running = false; stopTimers(); ppStop(); tsStop(); save(); renderBot(); }
   async function killSwitch() {
     bot.halted = 'kill switch';
     toast('Kill switch: selling all positions…');
@@ -2178,26 +2374,28 @@
           (s.mode === 'LIVE' ? '<div class="set-hint">Switch to PAPER to reset the paper account.</div>' : '');
       })()+'</div>'+
       (function () {
-        const st = strategyOf(); const f = fcfg();
+        const st = strategyOf(); const f = fcfg(); const D = F.FRESH_DEFAULTS;
         return '<div class="card"><h3>Strategy</h3><div class="seg" id="stratSeg">'+
           [['STRONG', 'Strong'], ['FRESH', 'Fresh (pump.fun)'], ['BOTH', 'Both']].map(([k, t]) => '<button type="button" data-strat="'+k+'" class="'+(st === k ? 'on' : '')+'">'+t+'</button>').join('')+'</div>'+
           '<div class="note">Strong = the 6-agent filter for established coins (30 min–72 h, $300K–$20M). Fresh = brand-new pump.fun coins with hype (5 min–6 h, $30K–$1M), small size, fast take-profit and dump exits. Both runs them side by side on the same balance.</div></div>'+
           '<div class="card"><h3>Fresh (pump.fun) settings</h3>'+
-          setNum('f_minAgeMin', 'Min age', f.minAgeMin, 'minutes (default 5)')+
-          setNum('f_maxAgeH', 'Max age', f.maxAgeH, 'hours (default 6)')+
-          setNum('f_minMc', 'Min market cap', Math.round(f.minMc / 1000), '$K (default 30)')+
-          setNum('f_maxMc', 'Max market cap', Math.round(f.maxMc / 1000), '$K (default 1000)')+
-          setNum('f_passScore', 'Hype pass score', f.passScore, '0–100 (default 60)')+
-          setNum('f_maxTop10Pct', 'Max top-10 holders', f.maxTop10Pct, '% excl. bonding curve (default 35)')+
-          setNum('f_maxDevPct', 'Max dev holdings', f.maxDevPct, '% (default 10)')+
-          setNum('f_maxBundlePct', 'Max bundled / insiders', f.maxBundlePct, '% (default 20)')+
-          setNum('f_posPct', 'Position size', +(f.posPct * 100).toFixed(1), '% of equity (default 3, max 8)')+
-          setNum('f_maxOpen', 'Max open Fresh positions', f.maxOpen, 'default 6')+
-          setNum('f_slPct', 'Hard stop', +(f.slPct * 100).toFixed(1), '% below entry (default 12)')+
-          setNum('f_tpPct', 'Take profit at', +(f.tpPct * 100).toFixed(1), '% gain, sells half (default 25)')+
-          setNum('f_trailPct', 'Trailing distance', +(f.trailPct * 100).toFixed(1), '% off peak, 7% after take-profit (default 10)')+
-          setNum('f_maxHoldMin', 'Max hold', f.maxHoldMin, 'minutes (default 20)')+
-          '<div class="set-hint">Also exits at once on: creator selling, one wallet dumping ≥1.5% of supply, 2× more SOL sold than bought in 30 s, sells flipping buys on DexScreener, −15% from peak within 60 s, or no momentum after 6 min. Dev history is checked before every entry (serial launchers and dead/rugged earlier launches are skipped).</div></div>';
+          setNum('f_minAgeMin', 'Min age', f.minAgeMin, 'minutes (default '+D.minAgeMin+')')+
+          setNum('f_maxAgeH', 'Max age', f.maxAgeH, 'hours (default '+D.maxAgeH+')')+
+          setNum('f_minMc', 'Min market cap', Math.round(f.minMc / 1000), '$K (default '+Math.round(D.minMc/1000)+')')+
+          setNum('f_maxMc', 'Max market cap', Math.round(f.maxMc / 1000), '$K (default '+Math.round(D.maxMc/1000)+')')+
+          setNum('f_passScore', 'Hype pass score', f.passScore, '0–100 (default '+D.passScore+')')+
+          setNum('f_maxTop10Pct', 'Max top-10 holders', f.maxTop10Pct, '% excl. bonding curve (default '+D.maxTop10Pct+')')+
+          setNum('f_maxDevPct', 'Max dev holdings', f.maxDevPct, '% (default '+D.maxDevPct+')')+
+          setNum('f_maxBundlePct', 'Max bundled / insiders', f.maxBundlePct, '% (default '+D.maxBundlePct+')')+
+          setNum('f_posPct', 'Position size', +(f.posPct * 100).toFixed(1), '% of equity (default '+(D.posPct*100)+', max 8)')+
+          setNum('f_maxOpen', 'Max open Fresh positions', f.maxOpen, 'default '+D.maxOpen)+
+          setNum('f_slPct', 'Hard stop', +(f.slPct * 100).toFixed(1), '% below entry (default '+Math.round(D.slPct*100)+')')+
+          setNum('f_tpPct', 'Take profit at', +(f.tpPct * 100).toFixed(1), '% gain, sells '+Math.round(D.tpSellPct*100)+'% (default '+Math.round(D.tpPct*100)+')')+
+          setNum('f_trailPct', 'Trailing distance', +(f.trailPct * 100).toFixed(1), '% off peak, '+Math.round(D.trailAfterTpPct*100)+'% after take-profit (default '+Math.round(D.trailPct*100)+')')+
+          setNum('f_maxHoldMin', 'Max hold', f.maxHoldMin, 'minutes (default '+D.maxHoldMin+')')+
+          '<div class="set-hint">Also exits at once on: creator selling, one wallet dumping ≥1.5% of supply, 2× more SOL sold than bought in 30 s, sells flipping buys on DexScreener, −15% from peak within 60 s, or no momentum after 6 min. Dev history is checked before every entry (serial launchers and dead/rugged earlier launches are skipped).</div></div>'+
+          '<button type="button" class="term-cta" id="freshPreset" style="margin-top:10px">Load optimized v'+F.PRESET_V+' preset</button>'+
+          '<div class="set-hint">Resets only the Fresh settings above to the values tuned on recorded pump.fun data.</div>';
       })()+
       '<div class="card"><h3>1 · Scout</h3>'+
       setNum('scoutMinAgeMin', 'Min pair age', s.scoutMinAgeMin, 'minutes (default 30)')+
@@ -2290,6 +2488,7 @@
       save(); renderSettings(); toast('Defaults restored');
     };
     $('#kill').onclick = () => { if (!confirm('Sell every open position now and stop the bot?')) return; killSwitch(); };
+    const fp = document.getElementById('freshPreset'); if (fp) fp.onclick = () => { bot.settings.fresh = {}; bot.settings.freshPresetV = F.PRESET_V; bot._frScout = null; save(); renderSettings(); toast('Fresh preset v' + F.PRESET_V + ' loaded'); };
     app.querySelectorAll('#stratSeg [data-strat]').forEach(b => b.onclick = () => { bot.settings.strategy = b.dataset.strat; bot._frScout = null; if (!freshOn()) ppStop(); save(); renderSettings(); });
   }
 

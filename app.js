@@ -96,7 +96,7 @@ function srcSummary() {
   if (navigator.onLine === false) return 'You are offline';
   const gt = srcState('api.geckoterminal.com'), ds = srcState('api.dexscreener.com');
   const bad = s => s === 'limited' || s === 'down';
-  if (bad(gt) && bad(ds)) return 'GeckoTerminal and DexScreener are rate-limiting this network';
+  if (bad(gt) && bad(ds)) return srcState(JT_HOST) === 'ok' ? 'DexScreener + GeckoTerminal limited on this network — using Jupiter' : 'GeckoTerminal and DexScreener are rate-limiting this network';
   if (bad(gt)) return 'GeckoTerminal limited — using DexScreener';
   if (bad(ds)) return 'DexScreener limited — using GeckoTerminal';
   return '';
@@ -398,6 +398,60 @@ async function dsTokens(chain, addrs) {
   }
   return out;
 }
+/* v14: Jupiter Tokens v2 — CORS-enabled, rate-limited separately from DexScreener/GeckoTerminal. Used as a fallback
+ * pair source (DexScreener-shaped objects) and as an extra discovery list, so a phone on a rate-limited mobile IP keeps
+ * scouting when DexScreener and GeckoTerminal both block it. */
+const JUPT = 'https://lite-api.jup.ag/tokens/v2';
+const JT_HOST = 'lite-api.jup.ag';
+const jtGate = { last: 0, until: 0, chain: Promise.resolve(), streak: 0 };
+HOST_NAME[JT_HOST] = 'Jupiter';
+async function jupTok(path, timeout = 10000) {
+  if (Date.now() < jtGate.until) throw new HttpError(429, path);
+  const turn = jtGate.chain.then(async () => { const w = jtGate.last + 1300 - Date.now(); if (w > 0) await new Promise(r => setTimeout(r, w)); jtGate.last = Date.now(); });
+  jtGate.chain = turn.catch(() => {}); await turn;
+  const ctl = new AbortController(); const id = setTimeout(() => ctl.abort(), timeout);
+  try {
+    let r;
+    try { r = await fetch(JUPT + path, { signal: ctl.signal, headers: { accept: 'application/json' } }); }
+    catch (e) { jtGate.streak++; jtGate.until = Date.now() + Math.min(60000, 5000 * Math.pow(1.6, jtGate.streak - 1)); noteSrc(JT_HOST, false, navigator.onLine === false ? 'offline' : 'blocked'); throw e; }
+    if (r.status === 429 || r.status >= 500) { jtGate.streak++; jtGate.until = Date.now() + Math.min(60000, 8000 * Math.pow(1.6, jtGate.streak - 1)); noteSrc(JT_HOST, false, 'limited'); throw new HttpError(r.status, path); }
+    if (!r.ok) throw new HttpError(r.status, path);
+    const j = await r.json(); jtGate.streak = 0; noteSrc(JT_HOST, true); return j;
+  } finally { clearTimeout(id); }
+}
+window.jupTok = jupTok;
+/** Jupiter token → DexScreener-shaped pair (only the fields the app reads). */
+function jupToPair(t) {
+  if (!t || !t.id || !(+t.usdPrice > 0)) return null;
+  const st = k => t[k] || {};
+  const tx = k => ({ buys: +st(k).numBuys || 0, sells: +st(k).numSells || 0 });
+  const vol = k => (+st(k).buyVolume || 0) + (+st(k).sellVolume || 0);
+  const created = Date.parse((t.firstPool && t.firstPool.createdAt) || t.createdAt || '') || null;
+  const socials = []; if (t.twitter) socials.push({ type: 'twitter', url: t.twitter }); if (t.telegram) socials.push({ type: 'telegram', url: t.telegram });
+  const pumpCurve = t.launchpad === 'pump.fun' && !t.graduatedPool && !t.graduatedAt;
+  return {
+    chainId: 'solana', dexId: pumpCurve ? 'pumpfun' : (t.launchpad === 'pump.fun' ? 'pumpswap' : 'jupiter'), url: 'https://jup.ag/tokens/' + t.id,
+    pairAddress: t.graduatedPool || (t.firstPool && t.firstPool.id) || t.id,
+    baseToken: { address: t.id, name: t.name || '', symbol: t.symbol || '?' }, quoteToken: { address: 'So11111111111111111111111111111111111111112', symbol: 'SOL' },
+    priceUsd: String(t.usdPrice), marketCap: +t.mcap || 0, fdv: +t.fdv || +t.mcap || 0, liquidity: { usd: +t.liquidity || 0 },
+    pairCreatedAt: created, txns: { m5: tx('stats5m'), h1: tx('stats1h'), h6: tx('stats6h'), h24: tx('stats24h') },
+    volume: { m5: vol('stats5m'), h1: vol('stats1h'), h6: vol('stats6h'), h24: vol('stats24h') },
+    priceChange: { m5: +st('stats5m').priceChange || 0, h1: +st('stats1h').priceChange || 0, h6: +st('stats6h').priceChange || 0, h24: +st('stats24h').priceChange || 0 },
+    info: { imageUrl: t.icon || '', socials, websites: t.website ? [{ url: t.website }] : [] },
+    _src: 'jupiter', _jup: { holders: t.holderCount, audit: t.audit || {}, organic: t.organicScore, dev: t.dev, launchpad: t.launchpad }
+  };
+}
+window.jupToPair = jupToPair;
+/** Pairs for Solana mints from Jupiter (≤100 per call). Returns Map tkey → pair. */
+async function jupPairs(mints) {
+  const out = new Map();
+  for (let i = 0; i < mints.length && i < 200; i += 100) {
+    try { const d = await jupTok('/search?query=' + mints.slice(i, i + 100).join(',')); (Array.isArray(d) ? d : []).forEach(t => { const p = jupToPair(t); if (p) out.set(tkey('solana', t.id), p); }); }
+    catch (e) { console.warn('jupiter tokens', e.message); break; }
+  }
+  return out;
+}
+window.jupPairs = jupPairs;
 const pairCache = new Map(); // key -> {pair, ts}
 /** Best (most liquid) pair for each requested token. tokens: [{chain, addr}] */
 async function pairsFor(tokens, maxAge = PAIR_TTL) {
@@ -411,6 +465,12 @@ async function pairsFor(tokens, maxAge = PAIR_TTL) {
     const q = best.get(k); if (!q || ((p.liquidity && p.liquidity.usd) || 0) > ((q.liquidity && q.liquidity.usd) || 0)) best.set(k, p);
   }
   best.forEach((p, k) => pairCache.set(k, { pair: p, ts: Date.now() }));
+  // v14: Solana tokens DexScreener did not answer for (rate limit / block / not indexed yet) → Jupiter Tokens v2.
+  const missSol = [...(by.solana || [])].filter(a => !best.has(tkey('solana', a)));
+  if (missSol.length) {
+    const jp = await jupPairs(missSol);
+    jp.forEach((p, k) => { if (want.has(k)) pairCache.set(k, { pair: p, ts: Date.now() }); });
+  }
   const out = new Map(); want.forEach(k => { const c = pairCache.get(k); if (c && Date.now() - c.ts < 10 * 60e3) out.set(k, c.pair); });
   return out;
 }

@@ -1,4 +1,4 @@
-const VERSION = 'memesignals-v13';
+const VERSION = 'memesignals-v14';
 const SHELL = ['./', './index.html', './styles.css', './app.js', './bot-strategy.js', './fresh-strategy.js', './fx.js', './bot.js',
   './vendor/lightweight-charts.standalone.production.js', './vendor/solana.bundle.js', './manifest.webmanifest',
   './icons/icon-192.png', './icons/icon-512.png', './icons/icon-maskable-512.png',
@@ -20,12 +20,14 @@ self.addEventListener('fetch', e => {
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
   if (url.origin === location.origin) {
-    // Stale-while-revalidate for the app shell
+    // v14: network-first (3 s timeout) for the app shell so a new version loads on the first open; cache when offline/slow.
     e.respondWith(caches.open(VERSION).then(async cache => {
-      const cached = await cache.match(req, { ignoreSearch: true }) ||
-        (req.mode === 'navigate' ? await cache.match('./index.html') : null);
-      const net = fetch(req).then(r => { if (r.ok) cache.put(req, r.clone()); return r; }).catch(() => cached);
-      return cached || net;
+      const cachedP = cache.match(req, { ignoreSearch: true }).then(c => c || (req.mode === 'navigate' ? cache.match('./index.html') : null));
+      const net = fetch(req, { cache: 'no-cache' }).then(r => { if (r.ok) cache.put(req, r.clone()); return r; });
+      const timeout = new Promise(res => setTimeout(() => res(null), 3000));
+      try { const r = await Promise.race([net, timeout]); if (r) return r; } catch {}
+      const cached = await cachedP;
+      return cached || net.catch(() => new Response('offline', { status: 503 }));
     }));
     return;
   }

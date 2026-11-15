@@ -1473,9 +1473,10 @@
       if (!F.isPumpToken(m, p.dexId)) { skip['not pump.fun'] = (skip['not pump.fun'] || 0) + 1; return; }
       const g = F.scoutPair(p, now, c);
       if (!g.ok) { skip[g.why] = (skip[g.why] || 0) + 1; return; }
+      if (c.entryMode === 'reclaim') { const rp = F.reclaimPre(p, c); if (!rp.ok) { skip['rc pre'] = (skip['rc pre'] || 0) + 1; return; } }
       const fl = flags[m];
-      const pre = F.score(p, fl);
-      cands.push({ mint: m, symbol: p.baseToken.symbol, icon: (p.info && p.info.imageUrl) || '', pair: p, pairAddress: p.pairAddress, flags: fl, ageMin: g.ageMin, mcap: g.mc, pre: pre.score, priceUsd: +p.priceUsd });
+      const pre = c.entryMode === 'reclaim' ? Math.round(+((p.priceChange || {}).m5) || 0) : F.score(p, fl).score;   // reclaim: rank by 5-min bounce
+      cands.push({ mint: m, symbol: p.baseToken.symbol, icon: (p.info && p.info.imageUrl) || '', pair: p, pairAddress: p.pairAddress, flags: fl, ageMin: g.ageMin, mcap: g.mc, pre, priceUsd: +p.priceUsd });
     });
     cands.sort((a, b) => b.pre - a.pre);
     const out = { ts: now, cands, seen: mints.length, skip, dsOk, pp: PP.state };
@@ -1497,12 +1498,38 @@
       topHolders: [{ owner: 'jup-top10', pct: +a.topHoldersPercentage || 0 }], markets: [], knownAccounts: {}, risks: [], insiderNetworks: [],
       mintAuthority: a.mintAuthorityDisabled === false ? 'enabled' : null, freezeAuthority: a.freezeAuthorityDisabled === false ? 'enabled' : null, _src: 'jupiter' };
   }
+  /* v15: GeckoTerminal 1-min candles for the dip-reclaim check. Cached 30 s per pool, at most 6 calls per minute so the
+   * shared GeckoTerminal limit (30/min) stays free for the rest of the app. Returns null when over budget / failed. */
+  bot._rcK = {}; bot._rcCalls = [];
+  async function rcCandles(pool) {
+    if (!pool) return null;
+    const now = Date.now(); const e = bot._rcK[pool];
+    if (e && now - e.t < 30000) return e.k;
+    bot._rcCalls = bot._rcCalls.filter(t => now - t < 60000);
+    if (bot._rcCalls.length >= 6 || now < gtGate.pauseUntil) return e ? e.k : null;
+    bot._rcCalls.push(now);
+    try {
+      const d = await gtGet(GT + '/networks/solana/pools/' + pool + '/ohlcv/minute?aggregate=1&limit=1000&currency=usd&token=base');
+      const k = d && d.data && d.data.attributes && d.data.attributes.ohlcv_list;
+      if (!Array.isArray(k)) return null;
+      bot._rcK[pool] = { t: Date.now(), k };
+      Object.keys(bot._rcK).forEach(p => { if (Date.now() - bot._rcK[p].t > 10 * 60e3) delete bot._rcK[p]; });
+      return k;
+    } catch { return null; }
+  }
   async function frFilter(sc) {
     const A = bot.agentsF.filter; const c = fcfg(); const now = Date.now();
     bot._frKill = bot._frKill || {};
-    const top = sc.cands.filter(x => !(bot._frKill[x.mint] && now - bot._frKill[x.mint] < 3 * 60e3)).slice(0, 8);
+    const rcMode = c.entryMode === 'reclaim';
+    const top = sc.cands.filter(x => !(bot._frKill[x.mint] && now - bot._frKill[x.mint] < (rcMode ? 60e3 : 3 * 60e3))).slice(0, rcMode ? 4 : 8);
     const pass = []; let killed = 0;
     await pool(top, 3, async x => {
+      if (rcMode) {   // v15 dip-reclaim: ATH / post-ATH low from GeckoTerminal 1-min candles
+        const k = await rcCandles(x.pairAddress);
+        if (!k) { A.detail = 'waiting for candles'; return; }
+        const r = F.reclaimCheck(k, x.priceUsd, Date.now(), c); x.rc = r;
+        if (!r.ok) { killed++; bot._frKill[x.mint] = now; frLog({ stage: 'filter', kind: 'kill', code: 'rc_shape', mint: x.mint, symbol: x.symbol, icon: x.icon, reason: r.why }); return; }
+      }
       let rep = null; try { rep = await rugReport(x.mint, 120000); } catch {}
       if (!rep) rep = jupReport(x.pair);   // v14: RugCheck blocked/limited → Jupiter audit (top holders, dev %, authorities)
       const s = F.safety(x.pair, rep, c);
@@ -1570,7 +1597,7 @@
       const ticket = { strat: 'fresh', mint: p.mint, symbol: p.symbol, icon: p.icon, usd, score: p.score, expectedPx: livePx, priceUsd: livePx, quoteBuy: qb, quoteSell: qs, creator: p.creator,
         risk: { stopPct: c.slPct, trailArmPct: c.trailArmPct, trailPct: c.trailPct, registeredAt: now },
         scout: { pair: livePair || p.pair, mcap: p.mcap, liqUsd: (livePair && livePair.liquidity && +livePair.liquidity.usd) || 0, pairAddress: p.pairAddress } };
-      frLog({ stage: 'risk', kind: 'plan', mint: p.mint, symbol: p.symbol, icon: p.icon, reason: 'stop −' + Math.round(c.slPct * 100) + '% · TP ' + Math.round(c.tpSellPct * 100) + '% at +' + Math.round(c.tpPct * 100) + '% · trail ' + Math.round(c.trailPct * 100) + '% · dump/dev-sell exits · max ' + c.maxHoldMin + ' min' });
+      frLog({ stage: 'risk', kind: 'plan', mint: p.mint, symbol: p.symbol, icon: p.icon, reason: (p.rc && p.rc.ok ? 'RECLAIM · ' + p.rc.why + ' · stop −' + Math.round(c.slPct * 100) + '% · TP +' + Math.round(c.tpPct * 100) + '% (sell all) · max ' + c.maxHoldMin + ' min' : 'stop −' + Math.round(c.slPct * 100) + '% · TP ' + Math.round(c.tpSellPct * 100) + '% at +' + Math.round(c.tpPct * 100) + '% · trail ' + Math.round(c.trailPct * 100) + '% · dump/dev-sell exits · max ' + c.maxHoldMin + ' min') });
       const pos = await executeBuy(ticket);
       if (pos) { fills++; delete bot._execRetry[p.mint]; ppSyncSubs(); } else bot._execRetry[p.mint] = Date.now();
     }
@@ -2379,6 +2406,7 @@
           [['STRONG', 'Strong'], ['FRESH', 'Fresh (pump.fun)'], ['BOTH', 'Both']].map(([k, t]) => '<button type="button" data-strat="'+k+'" class="'+(st === k ? 'on' : '')+'">'+t+'</button>').join('')+'</div>'+
           '<div class="note">Strong = the 6-agent filter for established coins (30 min–72 h, $300K–$20M). Fresh = brand-new pump.fun coins with hype (5 min–6 h, $30K–$1M), small size, fast take-profit and dump exits. Both runs them side by side on the same balance.</div></div>'+
           '<div class="card"><h3>Fresh (pump.fun) settings</h3>'+
+          '<div class="set-hint" id="freshModeNote">Entry mode: <b>'+(f.entryMode === 'reclaim' ? 'Dip-reclaim (v'+F.RECLAIM_V+', experimental)' : 'Momentum (v'+F.PRESET_V+')')+'</b>'+(f.entryMode === 'reclaim' ? ' — buys a coin that fell ≥'+Math.round(f.rcDdMin*100)+'% from its top (top ≥ $'+Math.round(f.rcAthMin/1000)+'K) when buyers come back: ≥'+f.rcBuysMin+' buys and '+f.rcBuyRatio+'× more buys than sells in 5 min, price +'+f.minM5Chg+'% in 5 min and +'+Math.round(f.rcRecMin*100)+'…'+Math.round(f.rcRecMax*100)+'% off the low. Sells at +'+Math.round(f.tpPct*100)+'%, −'+Math.round(f.slPct*100)+'% or after '+f.maxHoldMin+' min.' : '')+'</div>'+
           setNum('f_minAgeMin', 'Min age', f.minAgeMin, 'minutes (default '+D.minAgeMin+')')+
           setNum('f_maxAgeH', 'Max age', f.maxAgeH, 'hours (default '+D.maxAgeH+')')+
           setNum('f_minMc', 'Min market cap', Math.round(f.minMc / 1000), '$K (default '+Math.round(D.minMc/1000)+')')+
@@ -2393,9 +2421,12 @@
           setNum('f_tpPct', 'Take profit at', +(f.tpPct * 100).toFixed(1), '% gain, sells '+Math.round(D.tpSellPct*100)+'% (default '+Math.round(D.tpPct*100)+')')+
           setNum('f_trailPct', 'Trailing distance', +(f.trailPct * 100).toFixed(1), '% off peak, '+Math.round(D.trailAfterTpPct*100)+'% after take-profit (default '+Math.round(D.trailPct*100)+')')+
           setNum('f_maxHoldMin', 'Max hold', f.maxHoldMin, 'minutes (default '+D.maxHoldMin+')')+
-          '<div class="set-hint">Also exits at once on: creator selling, one wallet dumping ≥1.5% of supply, 2× more SOL sold than bought in 30 s, sells flipping buys on DexScreener, −15% from peak within 60 s, or no momentum after 6 min. Dev history is checked before every entry (serial launchers and dead/rugged earlier launches are skipped).</div></div>'+
+          (f.entryMode === 'reclaim' ? '<div class="set-hint">Dip-reclaim uses only take-profit, stop and max hold (no dump / dev-sell exits). Safety checks (top holders, dev holdings, bundles, authorities, dev history) still run before every entry.</div></div>' : '')+
+          (f.entryMode === 'reclaim' ? '' : '<div class="set-hint">Also exits at once on: creator selling, one wallet dumping ≥1.5% of supply, 2× more SOL sold than bought in 30 s, sells flipping buys on DexScreener, −15% from peak within 60 s, or no momentum after 6 min. Dev history is checked before every entry (serial launchers and dead/rugged earlier launches are skipped).</div></div>')+
           '<button type="button" class="term-cta" id="freshPreset" style="margin-top:10px">Load optimized v'+F.PRESET_V+' preset</button>'+
-          '<div class="set-hint">Resets only the Fresh settings above to the values tuned on recorded pump.fun data.</div>';
+          '<div class="set-hint">Momentum entries (v'+F.PRESET_V+'). Resets only the Fresh settings above to the values tuned on recorded pump.fun data.</div>'+
+          '<button type="button" class="term-cta" id="freshReclaim" style="margin-top:10px;background:#2c2c2e;color:#fff">Load v'+F.RECLAIM_V+' dip-reclaim preset (experimental)</button>'+
+          '<div class="set-hint">Dip-reclaim entries: coins that dumped hard and are bouncing with strong buying. Fixed +'+Math.round(F.RECLAIM_PRESET.tpPct*100)+'% take-profit, −'+Math.round(F.RECLAIM_PRESET.slPct*100)+'% stop, '+F.RECLAIM_PRESET.maxHoldMin+' min max hold. Paper only — not proven profitable.</div>';
       })()+
       '<div class="card"><h3>1 · Scout</h3>'+
       setNum('scoutMinAgeMin', 'Min pair age', s.scoutMinAgeMin, 'minutes (default 30)')+
@@ -2489,6 +2520,7 @@
     };
     $('#kill').onclick = () => { if (!confirm('Sell every open position now and stop the bot?')) return; killSwitch(); };
     const fp = document.getElementById('freshPreset'); if (fp) fp.onclick = () => { bot.settings.fresh = {}; bot.settings.freshPresetV = F.PRESET_V; bot._frScout = null; save(); renderSettings(); toast('Fresh preset v' + F.PRESET_V + ' loaded'); };
+    const fr15 = document.getElementById('freshReclaim'); if (fr15) fr15.onclick = () => { bot.settings.fresh = { entryMode: 'reclaim' }; bot.settings.freshPresetV = Math.max(F.PRESET_V, bot.settings.freshPresetV || 0); bot._frScout = null; bot._frKill = {}; save(); renderSettings(); toast('Dip-reclaim preset v' + F.RECLAIM_V + ' loaded'); };
     app.querySelectorAll('#stratSeg [data-strat]').forEach(b => b.onclick = () => { bot.settings.strategy = b.dataset.strat; bot._frScout = null; if (!freshOn()) ppStop(); save(); renderSettings(); });
   }
 

@@ -72,10 +72,60 @@
     stopGraceSec: 3         // v14.1: no hard stop in the first 3 s after buy unless ≥ 2 price sources agree
   };
 
+  FRESH_DEFAULTS.entryMode = 'momentum';   // v15: 'momentum' (v14 preset above) | 'reclaim' (dip-reclaim, RECLAIM_PRESET below)
+  /* v15 dip-reclaim ("dead-cat bounce") entry — opt-in via Settings → "Load v15 dip-reclaim preset".
+   * Buys a pump.fun coin that already dumped ≥ rcDdMin from its all-time high (ATH ≥ rcAthMin market cap) and now shows
+   * a burst of buying: 5-min buys ≥ rcBuysMin and ≥ rcBuyRatio × sells, 5-min price change minM5Chg…maxM5Chg %, and the
+   * price already rebounded rcRecMin…rcRecMax above the post-ATH low. ATH/low come from GeckoTerminal 1-min candles.
+   * Exits are deliberately simple: fixed take-profit, fixed stop, short time stop. Tested on recorded data — see README. */
+  const RECLAIM_PRESET = {
+    entryMode: 'reclaim',
+    minAgeMin: 5, maxAgeH: 15, minMc: 4000, maxMc: 1000000, venue: 'any',
+    maxTop10Pct: 35, maxDevPct: 10, maxBundlePct: 20, max1hChg: 1000000,
+    minTxM5: 0, minBuyRatioM5: 0, minM5Chg: 10, maxM5Chg: 300, passScore: 0,
+    rcAthMin: 12000, rcDdMin: 0.5, rcRecMin: 0.15, rcRecMax: 1.5, rcBuysMin: 8, rcBuyRatio: 2, rcSinceAthMin: 2,
+    posPct: 0.08, maxOpen: 3,
+    slPct: 0.2, tpPct: 0.4, tpSellPct: 1, trailArmPct: 99, trailPct: 0.25, trailAfterTpPct: 0.12, maxHoldMin: 5,
+    staleMin: 9999, staleMinGain: 0.05, dumpSellRatio: 2, dumpMinSol: 1000000, whaleSellSupplyPct: 100, devSellExit: false,
+    m5SellFlip: 99, peakDropFastPct: 0.99, stopGraceSec: 3
+  };
+
   const PRESET_V = 14;
+  const RECLAIM_V = 15;
   const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
   const num = v => (v == null || v === '' || !isFinite(+v)) ? null : +v;
-  const cfg = s => Object.assign({}, FRESH_DEFAULTS, s || {});
+  const cfg = s => Object.assign({}, FRESH_DEFAULTS, (s && s.entryMode === 'reclaim') ? RECLAIM_PRESET : {}, s || {});
+
+  /** v15 reclaim pre-check on a DexScreener pair (cheap, before any candle fetch). */
+  function reclaimPre(p, s) {
+    const c = cfg(s); const m5 = (p && p.txns && p.txns.m5) || {}; const pc = (p && p.priceChange) || {};
+    const b = +m5.buys || 0, se = +m5.sells || 0, ch = num(pc.m5);
+    if (b < c.rcBuysMin) return { ok: false, why: 'rc: ' + b + ' buys in 5 min (< ' + c.rcBuysMin + ')' };
+    if (b < c.rcBuyRatio * Math.max(1, se)) return { ok: false, why: 'rc: buys ' + b + ' < ' + c.rcBuyRatio + '× sells ' + se };
+    if (ch == null || ch < c.minM5Chg) return { ok: false, why: 'rc: 5-min change ' + (ch == null ? '?' : Math.round(ch) + '%') + ' (< ' + c.minM5Chg + '%)' };
+    if (c.maxM5Chg != null && ch > c.maxM5Chg) return { ok: false, why: 'rc: 5-min change +' + Math.round(ch) + '% (> ' + c.maxM5Chg + '%)' };
+    return { ok: true };
+  }
+  /** v15 reclaim check on 1-min candles [[tSec, o, h, l, c, v], …] (any order, USD per token; pump.fun supply 1B).
+   *  priceUsd = current price, nowMs = clock. Returns { ok, why, athMc, ddLow, rec, sinceAthMin }. */
+  function reclaimCheck(candles, priceUsd, nowMs, s) {
+    const c = cfg(s);
+    const k = (candles || []).filter(x => Array.isArray(x) && x.length >= 5 && +x[2] > 0 && +x[3] > 0).map(x => [+x[0], +x[1], +x[2], +x[3], +x[4]]).sort((a, b) => a[0] - b[0]);
+    if (k.length < 5) return { ok: false, why: 'rc: not enough candles (' + k.length + ')' };
+    let ai = 0; for (let i = 1; i < k.length; i++) if (k[i][2] > k[ai][2]) ai = i;
+    const ath = k[ai][2]; const px = +priceUsd > 0 ? +priceUsd : k[k.length - 1][4];
+    let low = Infinity; for (let i = ai + 1; i < k.length; i++) low = Math.min(low, k[i][3]);
+    low = Math.min(low, px);
+    const athMc = ath * 1e9, ddLow = 1 - low / ath, rec = px / low - 1, sinceAthMin = (nowMs / 1000 - k[ai][0]) / 60 - 1;
+    const r = { athMc, ddLow, rec, sinceAthMin, ath, low, px };
+    const f = (why) => Object.assign({ ok: false, why }, r);
+    if (athMc < c.rcAthMin) return f('rc: ATH mcap $' + Math.round(athMc / 1000) + 'K (< $' + Math.round(c.rcAthMin / 1000) + 'K)');
+    if (ddLow < c.rcDdMin) return f('rc: dipped only ' + Math.round(ddLow * 100) + '% from ATH (< ' + Math.round(c.rcDdMin * 100) + '%)');
+    if (sinceAthMin < c.rcSinceAthMin) return f('rc: ATH only ' + sinceAthMin.toFixed(1) + ' min ago');
+    if (rec < c.rcRecMin) return f('rc: bounced only +' + Math.round(rec * 100) + '% off the low (< ' + Math.round(c.rcRecMin * 100) + '%)');
+    if (rec > c.rcRecMax) return f('rc: already +' + Math.round(rec * 100) + '% off the low (> ' + Math.round(c.rcRecMax * 100) + '%)');
+    return Object.assign({ ok: true, why: 'dip −' + Math.round(ddLow * 100) + '% from ATH $' + Math.round(athMc / 1000) + 'K, bounced +' + Math.round(rec * 100) + '% off the low' }, r);
+  }
 
   /** pump.fun origin: mint ends in "pump" or pair on pump.fun bonding curve / PumpSwap. */
   function isPumpToken(mint, dexId) { return /pump$/.test(String(mint || '')) || /^pump(fun|swap)$/.test(String(dexId || '')); }
@@ -234,6 +284,6 @@
     return { action: 'hold', pnl, peak };
   }
 
-  window.FreshStrategy = { PRESET_V, V13_DEFAULTS, FRESH_DEFAULTS, cfg, isPumpToken, scoutPair, safety, score, top10Pct, devPct, bundlePct, flowStats, decideExit };
+  window.FreshStrategy = { PRESET_V, RECLAIM_V, V13_DEFAULTS, FRESH_DEFAULTS, RECLAIM_PRESET, reclaimPre, reclaimCheck, cfg, isPumpToken, scoutPair, safety, score, top10Pct, devPct, bundlePct, flowStats, decideExit };
   if (typeof module !== 'undefined') module.exports = window.FreshStrategy;
 })();
